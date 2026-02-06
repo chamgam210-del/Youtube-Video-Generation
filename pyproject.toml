@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "videogenerator-screenshots"
+version = "0.1.0"
+description = "MP3 -> transcript -> Wikimedia Commons images -> MP4 slideshow"
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+  "requests>=2.31",
+  "numpy>=1.24",
+  "pillow>=10.2",
+  "mutagen>=1.47",
+  "tqdm>=4.66",
+  "imageio-ffmpeg>=0.4.9",
+  "python-dotenv>=1.0",
+  "openai-whisper>=20231117",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+videogenerator = "videogenerator.__main__:main"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+
+[tool.hatch.build.targets.wheel]
+packages = ["videogenerator"]

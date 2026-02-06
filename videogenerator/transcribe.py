@@ -1,0 +1,161 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import imageio_ffmpeg
+import numpy as np
+import subprocess
+from dataclasses import asdict
+from datetime import datetime, timezone
+
+from .models import TranscriptSegment
+from .utils import ensure_dir, read_json, sanitize_filename, write_json
+
+
+def _decode_audio_to_float32_mono_16k(audio_path: str | Path) -> np.ndarray:
+    """Decode audio file to a 16kHz mono float32 waveform in [-1, 1].
+
+    Uses an absolute ffmpeg binary from imageio-ffmpeg so it works on Windows
+    without a system ffmpeg installation.
+    """
+
+    ffmpeg = str(Path(imageio_ffmpeg.get_ffmpeg_exe()).resolve())
+    cmd = [
+        ffmpeg,
+        "-nostdin",
+        "-i",
+        str(Path(audio_path).resolve()),
+        "-f",
+        "s16le",
+        "-acodec",
+        "pcm_s16le",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-",
+    ]
+
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
+        raise RuntimeError(f"ffmpeg decode failed ({proc.returncode}):\n{stderr}")
+
+    audio = np.frombuffer(proc.stdout, np.int16).astype(np.float32) / 32768.0
+    return audio
+
+
+def transcribe_with_whisper(audio_path: str | Path, model_name: str = "small") -> list[TranscriptSegment]:
+    """Transcribe using local Whisper (openai-whisper).
+
+    Returns segment-level timestamps (start/end) which are sufficient for image timing.
+    """
+
+    try:
+        import whisper  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError(
+            "Local transcription requires 'openai-whisper'. Install it with: pip install openai-whisper"
+        ) from e
+
+    model = whisper.load_model(model_name)
+
+    audio = _decode_audio_to_float32_mono_16k(audio_path)
+    result = model.transcribe(audio, fp16=False)
+    segments: list[TranscriptSegment] = []
+
+    for seg in result.get("segments", []) or []:
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", start))
+        text = str(seg.get("text", "")).strip()
+        if not text:
+            continue
+        if end <= start:
+            continue
+        segments.append(TranscriptSegment(start=start, end=end, text=text))
+
+    if not segments:
+        text = str(result.get("text", "")).strip()
+        if text:
+            # Fallback: single segment with unknown end (caller may expand)
+            segments.append(TranscriptSegment(start=0.0, end=0.0, text=text))
+
+    return segments
+
+
+def transcribe_cached(
+    audio_path: str | Path,
+    *,
+    model_name: str = "small",
+    cache_dir: str | Path = ".cache/transcripts",
+    use_cache: bool = True,
+) -> list[TranscriptSegment]:
+    audio_path = Path(audio_path)
+    cache_dir = ensure_dir(cache_dir)
+
+    st = audio_path.stat()
+    cache_key = sanitize_filename(f"{audio_path.stem}.{model_name}")
+    cache_path = cache_dir / f"{cache_key}.json"
+
+    if use_cache and cache_path.exists():
+        try:
+            data = read_json(cache_path)
+            meta = data.get("meta", {}) if isinstance(data, dict) else {}
+            if (
+                meta.get("audio_name") == audio_path.name
+                and int(meta.get("audio_size", -1)) == int(st.st_size)
+                and float(meta.get("audio_mtime", -1)) == float(st.st_mtime)
+                and meta.get("model") == model_name
+            ):
+                segs = data.get("segments") or []
+                out: list[TranscriptSegment] = []
+                for s in segs:
+                    out.append(
+                        TranscriptSegment(
+                            start=float(s["start"]),
+                            end=float(s["end"]),
+                            text=str(s["text"]),
+                        )
+                    )
+                if out:
+                    return out
+        except Exception:
+            # Cache read/parse errors fall back to fresh transcription.
+            pass
+
+    segments = transcribe_with_whisper(audio_path, model_name=model_name)
+
+    if use_cache:
+        payload = {
+            "meta": {
+                "audio_name": audio_path.name,
+                "audio_size": int(st.st_size),
+                "audio_mtime": float(st.st_mtime),
+                "model": model_name,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+            "segments": [asdict(s) for s in segments],
+        }
+        write_json(cache_path, payload)
+
+    return segments
+
+
+def write_transcript_files(
+    segments: list[TranscriptSegment],
+    *,
+    out_dir: str | Path,
+) -> tuple[Path, Path]:
+    out_dir = ensure_dir(out_dir)
+
+    json_path = out_dir / "transcript.json"
+    txt_path = out_dir / "transcript.txt"
+
+    write_json(json_path, [asdict(s) for s in segments])
+
+    lines: list[str] = []
+    for s in segments:
+        lines.append(f"[{s.start:7.2f} - {s.end:7.2f}] {s.text}")
+    txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    return json_path, txt_path

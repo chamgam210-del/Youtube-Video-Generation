@@ -1,0 +1,357 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import os
+import json
+
+from dotenv import load_dotenv
+
+from .pipeline import run
+from .render import render_slideshow
+from .models import Slide
+ 
+
+
+def main() -> None:
+    # Load local secrets/config (e.g. SERPAPI_API_KEY) from `.env` if present.
+    load_dotenv(override=False)
+
+    p = argparse.ArgumentParser(description="MP3 -> transcript -> Wikimedia images -> MP4 slideshow")
+    p.add_argument("--audio", required=True, help="Path to input audio (mp3/wav/etc)")
+    p.add_argument("--out", default="output", help="Output folder")
+    p.add_argument("--topic", default=None, help="Optional topic hint for image search, e.g. 'Severance TV series'")
+    p.add_argument(
+        "--image-provider",
+        default="wikimedia",
+        choices=["wikimedia", "serpapi", "google_images"],
+        help=(
+            "Where to search for images. "
+            "'serpapi' uses Google Images via SerpAPI but is restricted to Wikimedia Commons hosts (license-aware). "
+            "'google_images' uses SerpAPI Google Images results directly (no license validation)."
+        ),
+    )
+    p.add_argument(
+        "--serpapi-key",
+        default=None,
+        help="SerpAPI key (or set SERPAPI_API_KEY). Used when --image-provider serpapi/google_images.",
+    )
+    p.add_argument("--max-images", type=int, default=12, help="Max number of images to use")
+    p.add_argument("--min-seg-seconds", type=float, default=6.0, help="Minimum transcript segment duration per slide")
+    p.add_argument("--whisper-model", default="small", help="Whisper model name: tiny/base/small/medium/large")
+    p.add_argument(
+        "--storyboard",
+        default="llm",
+        choices=["auto", "llm", "heuristic"],
+        help="How to decide slide cut points + queries. 'llm' requires OPENAI_API_KEY. 'auto' uses LLM if available, else falls back.",
+    )
+    p.add_argument("--llm-model", default="gpt-4o-mini", help="LLM model for --storyboard llm/auto")
+    p.add_argument(
+        "--no-llm-pick-images",
+        action="store_true",
+        help="When using LLM storyboard, disable LLM-based selection among image candidates (deterministic pick instead).",
+    )
+    p.add_argument("--no-transcript-cache", action="store_true", help="Disable transcript caching")
+    p.add_argument(
+        "--transcript-cache-dir",
+        default=None,
+        help="Override transcript cache directory (default: <out>/.cache/transcripts)",
+    )
+    p.add_argument("--min-image-width", type=int, default=900, help="Minimum image width (pixels)")
+    p.add_argument("--width", type=int, default=1920, help="Video width")
+    p.add_argument("--height", type=int, default=1080, help="Video height")
+    p.add_argument("--fps", type=int, default=30, help="Video fps")
+
+    p.add_argument(
+        "--transition",
+        default="fade",
+        choices=["none", "fade"],
+        help="Simple slideshow transitions between images. 'fade' fades in/out each slide; 'none' disables transitions.",
+    )
+    p.add_argument(
+        "--transition-seconds",
+        type=float,
+        default=0.35,
+        help="Transition duration in seconds (used for fade).",
+    )
+    p.add_argument(
+        "--ken-burns",
+        action="store_true",
+        help="(Disabled) Previously applied a zoom effect; kept for compatibility but currently has no effect.",
+    )
+
+    p.add_argument(
+        "--bgm",
+        default=None,
+        help="Optional background music file (mp3/wav). Mixed quietly behind the narration.",
+    )
+    p.add_argument(
+        "--bgm-volume",
+        type=float,
+        default=0.10,
+        help="Background music volume multiplier (0.0-1.0). Default: 0.10.",
+    )
+    p.add_argument(
+        "--bgm-generate",
+        action="store_true",
+        help="Generate a simple ambient background bed (no external audio file).",
+    )
+    p.add_argument(
+        "--bgm-preset",
+        type=str,
+        default=None,
+        help="Built-in background music preset: 'ambient' or 'elevator'.",
+    )
+    p.add_argument(
+        "--no-bgm-duck",
+        action="store_true",
+        help="Disable narration-aware ducking (sidechain compression) on background music.",
+    )
+    p.add_argument(
+        "--verify-video",
+        action="store_true",
+        help="After render, verify audio presence and whether frames change",
+    )
+
+    p.add_argument(
+        "--no-branding",
+        action="store_true",
+        help="Disable intro/outro branding slates (channel name, title, logo).",
+    )
+    p.add_argument(
+        "--channel-name",
+        default="Brutally Honest Review",
+        help="Channel name to show on intro/outro slates.",
+    )
+    p.add_argument(
+        "--logo-scheme",
+        default="orange",
+        choices=[
+            "orange",
+            "teal",
+            "purple",
+            "red",
+            "slate",
+            "lime",
+            "mono",
+            "orange_black",
+            "black_orange",
+            "black_orange_outline",
+            "black_white_outline",
+            "black_orange_flat",
+        ],
+        help="Brand logo color scheme. All variants are saved; this selects which one is used in intro/outro.",
+    )
+    p.add_argument(
+        "--title",
+        default=None,
+        help="Override video title text (otherwise generated from transcript using the LLM when available).",
+    )
+    p.add_argument(
+        "--intro-seconds",
+        type=float,
+        default=2.5,
+        help="Seconds for the intro slate (narration is delayed by this amount).",
+    )
+    p.add_argument(
+        "--outro-seconds",
+        type=float,
+        default=3.0,
+        help="Seconds for the outro slate (pads with silence at end).",
+    )
+    p.add_argument(
+        "--transcribe-only",
+        action="store_true",
+        help="Only transcribe the audio and write transcript.json/transcript.txt into --out (no images, no video).",
+    )
+
+    args = p.parse_args()
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.transcribe_only:
+        from .transcribe import transcribe_cached, write_transcript_files
+
+        effective_cache_dir = (
+            Path(args.transcript_cache_dir)
+            if args.transcript_cache_dir
+            else (Path.cwd() / ".cache" / "transcripts")
+        )
+
+        segments = transcribe_cached(
+            args.audio,
+            model_name=args.whisper_model,
+            cache_dir=effective_cache_dir,
+            use_cache=(not args.no_transcript_cache),
+        )
+        write_transcript_files(segments, out_dir=out_dir)
+        print(str((out_dir / "transcript.txt").resolve()))
+        return
+
+    run(
+        audio_path=args.audio,
+        out_dir=out_dir,
+        topic=args.topic,
+        image_provider=args.image_provider,
+        serpapi_api_key=args.serpapi_key or os.getenv("SERPAPI_API_KEY"),
+        max_images=args.max_images,
+        min_seg_seconds=args.min_seg_seconds,
+        whisper_model=args.whisper_model,
+        min_image_width=args.min_image_width,
+        cache_transcript=(not args.no_transcript_cache),
+        cache_dir=args.transcript_cache_dir,
+        storyboard=args.storyboard,
+        llm_model=args.llm_model,
+        llm_pick_images=(not args.no_llm_pick_images),
+    )
+
+    # Load slides back from timeline.json for rendering
+    timeline_path = out_dir / "timeline.json"
+    data = json.loads(timeline_path.read_text(encoding="utf-8"))
+    slides = [Slide(**s) for s in data]
+
+    # Load transcript segments written by the pipeline (used for title generation).
+    segments = None
+    transcript_json = out_dir / "transcript.json"
+    if transcript_json.exists():
+        try:
+            from .models import TranscriptSegment
+
+            raw = json.loads(transcript_json.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                segments = [TranscriptSegment(start=float(s["start"]), end=float(s["end"]), text=str(s["text"])) for s in raw]
+        except Exception:
+            segments = None
+
+    intro_seconds = max(0.0, float(args.intro_seconds))
+    outro_seconds = max(0.0, float(args.outro_seconds))
+
+    if not args.no_branding and (intro_seconds > 0.0 or outro_seconds > 0.0):
+        # Generate a title based on the transcript (LLM when available).
+        channel_name = str(args.channel_name or "").strip() or "Brutally Honest Review"
+        title = str(args.title or "").strip()
+        if not title:
+            # Prefer a non-spoilery, non-revealing generic title when topic is provided.
+            if args.topic:
+                topic = str(args.topic)
+                # Light normalization for common patterns.
+                topic = topic.replace("(TV series)", "").replace("TV series", "").strip(" -|:")
+                title = f"Brutally Honest Review of {topic}".strip()
+
+            from .llm_storyboard import generate_video_title_with_llm, generate_video_title_fallback
+
+            if (not title) and segments:
+                try:
+                    title = generate_video_title_with_llm(
+                        segments,
+                        topic=args.topic,
+                        channel_name=channel_name,
+                        model=args.llm_model,
+                    )
+                except Exception:
+                    title = ""
+
+            if not title:
+                title = generate_video_title_fallback(args.audio, topic=args.topic)
+
+        try:
+            (out_dir / "title.txt").write_text(title + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
+        from .branding import create_branding_assets
+
+        assets = create_branding_assets(
+            out_dir=out_dir,
+            width=int(args.width),
+            height=int(args.height),
+            channel_name=channel_name,
+            title=title,
+            logo_scheme=args.logo_scheme,
+        )
+
+        branded: list[Slide] = []
+        t = 0.0
+        if intro_seconds > 0.0:
+            branded.append(
+                Slide(
+                    start=0.0,
+                    end=float(intro_seconds),
+                    image_path=str(assets["intro"].as_posix()),
+                    query="intro_slate",
+                )
+            )
+            t = float(intro_seconds)
+
+        # Shift existing slides forward to make room for intro slate.
+        for s in slides:
+            branded.append(
+                Slide(
+                    start=float(s.start) + t,
+                    end=float(s.end) + t,
+                    image_path=s.image_path,
+                    query=s.query,
+                    source_page=s.source_page,
+                    image_url=s.image_url,
+                    license_name=s.license_name,
+                    license_url=s.license_url,
+                    attribution=s.attribution,
+                )
+            )
+
+        if outro_seconds > 0.0:
+            end_t = float(branded[-1].end) if branded else t
+            branded.append(
+                Slide(
+                    start=end_t,
+                    end=end_t + float(outro_seconds),
+                    image_path=str(assets["outro"].as_posix()),
+                    query="outro_slate",
+                )
+            )
+
+        slides = branded
+
+    out_mp4 = out_dir / "video.mp4"
+
+    bgm_path = args.bgm
+    bgm_generate = bool(args.bgm_generate)
+    bgm_preset = args.bgm_preset
+    if bgm_path and (bgm_generate or bgm_preset):
+        raise SystemExit("Provide only one of --bgm, --bgm-generate, or --bgm-preset")
+    if bgm_preset and bgm_generate:
+        # Treat --bgm-preset as the explicit choice; --bgm-generate becomes redundant.
+        bgm_generate = False
+
+    render_slideshow(
+        slides,
+        args.audio,
+        out_mp4,
+        width=args.width,
+        height=args.height,
+        fps=args.fps,
+        bgm_path=bgm_path,
+        bgm_volume=args.bgm_volume,
+        bgm_duck=(not args.no_bgm_duck),
+        bgm_generate=bgm_generate,
+        bgm_preset=bgm_preset,
+        intro_seconds=intro_seconds if (not args.no_branding) else 0.0,
+        outro_seconds=outro_seconds if (not args.no_branding) else 0.0,
+        transition=None if args.transition == "none" else args.transition,
+        transition_seconds=float(args.transition_seconds),
+        ken_burns=bool(args.ken_burns),
+    )
+
+    if args.verify_video:
+        from .verify_video import verify_local
+
+        v = verify_local(out_mp4)
+        print(v.duration_line.strip())
+        print(f"has_audio={v.has_audio} audio_peak={v.audio_peak} frame_hashes={v.frame_hashes}")
+
+    print(str(out_mp4.resolve()))
+
+
+if __name__ == "__main__":
+    main()
