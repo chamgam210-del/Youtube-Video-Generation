@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import asdict
 from pathlib import Path
 import hashlib
+import os
+import shutil
+import time
 
 from tqdm import tqdm
 
@@ -10,7 +13,7 @@ from .audio import get_audio_duration_seconds
 from .segments import merge_short_segments, select_evenly_spaced
 from .transcribe import transcribe_cached, write_transcript_files
 from .models import Slide
-from .utils import ensure_dir, extract_keywords, write_json
+from .utils import ensure_dir, extract_keywords, read_json, write_json
 from .wikimedia import download_image, search_commons_image, search_commons_images
 
 
@@ -30,9 +33,12 @@ def run(
     storyboard: str = "auto",  # auto|llm|heuristic
     llm_model: str = "gpt-4o-mini",
     llm_pick_images: bool = True,
+    reuse_images: bool = True,
 ) -> Path:
     audio_path = Path(audio_path)
     out_dir = Path(out_dir)
+
+    audio_stat = audio_path.stat()
 
     assets_dir = ensure_dir(out_dir / "assets")
 
@@ -89,6 +95,97 @@ def run(
 
     slides: list[Slide] = []
     attribution_lines: list[str] = []
+
+    def _find_reuse_source_dir(*, audio_stem: str) -> Path | None:
+        if not reuse_images:
+            return None
+
+        stem = (audio_stem or "").strip().lower()
+        if not stem:
+            return None
+
+        candidates: list[tuple[float, Path]] = []
+        cwd = Path.cwd()
+        for d in cwd.iterdir():
+            if not d.is_dir():
+                continue
+            name = d.name.lower()
+            if not name.startswith("output"):
+                continue
+            if d.resolve() == out_dir.resolve():
+                continue
+            if not (d / "assets").is_dir():
+                continue
+            if not (d / "timeline.json").exists():
+                continue
+
+            # Prefer exact match using run_meta.json when present.
+            meta_ok = False
+            meta_path = d / "run_meta.json"
+            if meta_path.exists():
+                try:
+                    meta = read_json(meta_path)
+                    if isinstance(meta, dict):
+                        if (meta.get("audio_name") == audio_path.name) or (str(meta.get("audio_stem") or "").strip().lower() == stem):
+                            # If size/mtime were recorded, check them too.
+                            sz = meta.get("audio_size")
+                            mt = meta.get("audio_mtime")
+                            if sz is None or int(sz) == int(audio_stat.st_size):
+                                if mt is None or float(mt) == float(audio_stat.st_mtime):
+                                    meta_ok = True
+                except Exception:
+                    meta_ok = False
+
+            # Back-compat: older outputs without run_meta.json fall back to folder-name matching.
+            if not meta_ok:
+                if stem not in name:
+                    continue
+            try:
+                ts = (d / "timeline.json").stat().st_mtime
+            except Exception:
+                ts = 0.0
+            candidates.append((ts, d))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+
+    reuse_source_dir = _find_reuse_source_dir(audio_stem=audio_path.stem)
+    reuse_image_paths: list[Path] = []
+
+    if reuse_source_dir is not None:
+        src_assets = reuse_source_dir / "assets"
+        # Prefer slide assets (sXX_*.png) and seed assets; avoid logos/slates.
+        preferred = []
+        fallback = []
+        for p in sorted(src_assets.glob("*")):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+                continue
+            nm = p.name.lower()
+            if nm.startswith("s") or nm.startswith("seed"):
+                preferred.append(p)
+            else:
+                fallback.append(p)
+
+        pick = preferred if preferred else fallback
+        for p in pick:
+            dst = assets_dir / p.name
+            if not dst.exists():
+                try:
+                    shutil.copy2(p, dst)
+                except Exception:
+                    continue
+            reuse_image_paths.append(dst)
+
+        # If we successfully reused images, carry forward attribution when available.
+        if reuse_image_paths and (reuse_source_dir / "attribution.txt").exists():
+            try:
+                shutil.copy2(reuse_source_dir / "attribution.txt", out_dir / "attribution.txt")
+            except Exception:
+                pass
 
     last_image_path: str | None = None
     last_info: dict | None = None
@@ -174,7 +271,7 @@ def run(
         return str(p)
 
     # Seed image: try to download at least one image for the topic.
-    if topic:
+    if (reuse_source_dir is None) and topic:
         try:
             seed_candidates = _search_candidates(topic)
             seed = seed_candidates[0] if seed_candidates else None
@@ -229,7 +326,12 @@ def run(
         image_path = None
         winning_query = q_main
 
-        for q in queries:
+        # Reuse existing downloaded assets when possible (no SerpAPI calls).
+        if reuse_image_paths:
+            p = reuse_image_paths[i % len(reuse_image_paths)]
+            image_path = str(p)
+
+        for q in ([] if image_path else queries):
             try:
                 candidates = _search_candidates(q)
             except Exception:
@@ -368,6 +470,29 @@ def run(
         ] + slides
 
     write_json(out_dir / "timeline.json", [asdict(s) for s in slides])
-    (out_dir / "attribution.txt").write_text("\n".join(attribution_lines) + "\n", encoding="utf-8")
+
+    # Attribution: if reused, we may have already copied attribution.txt above.
+    if not (out_dir / "attribution.txt").exists():
+        (out_dir / "attribution.txt").write_text("\n".join(attribution_lines) + "\n", encoding="utf-8")
+
+    # Minimal run metadata to help future reuse/matching.
+    try:
+        write_json(
+            out_dir / "run_meta.json",
+            {
+                "audio_name": audio_path.name,
+                "audio_stem": audio_path.stem,
+                "audio_size": int(audio_stat.st_size),
+                "audio_mtime": float(audio_stat.st_mtime),
+                "image_provider": image_provider,
+                "max_images": int(max_images),
+                "min_image_width": int(min_image_width),
+                "reused_from": str(reuse_source_dir) if reuse_source_dir else None,
+                "created_at": time.time(),
+                "cwd": os.getcwd(),
+            },
+        )
+    except Exception:
+        pass
 
     return out_dir

@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 from .pipeline import run
 from .render import render_slideshow
 from .models import Slide
- 
 
 
 def main() -> None:
@@ -165,6 +164,17 @@ def main() -> None:
         help="Only transcribe the audio and write transcript.json/transcript.txt into --out (no images, no video).",
     )
 
+    p.add_argument(
+        "--no-youtube-metadata",
+        action="store_true",
+        help="Disable generating YouTube title/description/tags + thumbnail assets in the output folder.",
+    )
+    p.add_argument(
+        "--no-reuse-images",
+        action="store_true",
+        help="Disable reusing images from an existing output folder with the same audio stem.",
+    )
+
     args = p.parse_args()
 
     out_dir = Path(args.out)
@@ -204,6 +214,7 @@ def main() -> None:
         storyboard=args.storyboard,
         llm_model=args.llm_model,
         llm_pick_images=(not args.no_llm_pick_images),
+        reuse_images=(not args.no_reuse_images),
     )
 
     # Load slides back from timeline.json for rendering
@@ -227,38 +238,65 @@ def main() -> None:
     intro_seconds = max(0.0, float(args.intro_seconds))
     outro_seconds = max(0.0, float(args.outro_seconds))
 
-    if not args.no_branding and (intro_seconds > 0.0 or outro_seconds > 0.0):
-        # Generate a title based on the transcript (LLM when available).
-        channel_name = str(args.channel_name or "").strip() or "Brutally Honest Review"
-        title = str(args.title or "").strip()
+    # Generate a title based on the transcript (LLM when available).
+    channel_name = str(args.channel_name or "").strip() or "Brutally Honest Review"
+    title = str(args.title or "").strip()
+    if not title:
+        # Prefer a non-spoilery, non-revealing generic title when topic is provided.
+        if args.topic:
+            topic = str(args.topic)
+            # Light normalization for common patterns.
+            topic = topic.replace("(TV series)", "").replace("TV series", "").strip(" -|:")
+            title = f"Brutally Honest Review of {topic}".strip()
+
+        from .llm_storyboard import generate_video_title_with_llm, generate_video_title_fallback
+
+        if (not title) and segments:
+            try:
+                title = generate_video_title_with_llm(
+                    segments,
+                    topic=args.topic,
+                    channel_name=channel_name,
+                    model=args.llm_model,
+                )
+            except Exception:
+                title = ""
+
         if not title:
-            # Prefer a non-spoilery, non-revealing generic title when topic is provided.
-            if args.topic:
-                topic = str(args.topic)
-                # Light normalization for common patterns.
-                topic = topic.replace("(TV series)", "").replace("TV series", "").strip(" -|:")
-                title = f"Brutally Honest Review of {topic}".strip()
+            title = generate_video_title_fallback(args.audio, topic=args.topic)
 
-            from .llm_storyboard import generate_video_title_with_llm, generate_video_title_fallback
+    try:
+        (out_dir / "title.txt").write_text(title + "\n", encoding="utf-8")
+    except Exception:
+        pass
 
-            if (not title) and segments:
-                try:
-                    title = generate_video_title_with_llm(
-                        segments,
-                        topic=args.topic,
-                        channel_name=channel_name,
-                        model=args.llm_model,
-                    )
-                except Exception:
-                    title = ""
-
-            if not title:
-                title = generate_video_title_fallback(args.audio, topic=args.topic)
-
+    if not args.no_youtube_metadata:
         try:
-            (out_dir / "title.txt").write_text(title + "\n", encoding="utf-8")
+            from .youtube import create_thumbnail, generate_youtube_package, write_youtube_metadata_text
+
+            pkg = generate_youtube_package(
+                segments,
+                slides=slides,
+                topic=args.topic,
+                channel_name=channel_name,
+                title=title,
+                model=args.llm_model,
+            )
+            write_youtube_metadata_text(out_dir, pkg)
+
+            # Thumbnail background comes from a chosen slide asset.
+            thumb_slide = slides[max(0, min(len(slides) - 1, int(pkg.thumbnail_slide_index)))]
+            thumb_path = out_dir / "thumbnail.png"
+            create_thumbnail(
+                out_path=thumb_path,
+                background_image=thumb_slide.image_path,
+                text="Brutally Honest Review",
+                verdict_text=pkg.verdict_label,
+            )
         except Exception:
             pass
+
+    if not args.no_branding and (intro_seconds > 0.0 or outro_seconds > 0.0):
 
         from .branding import create_branding_assets
 

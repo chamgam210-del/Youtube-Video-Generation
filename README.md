@@ -38,6 +38,24 @@ uv run python -m videogenerator \
   --max-images 12
 ```
 
+## Simple UI (local)
+
+There is a small local web UI built with Streamlit that lets you upload an MP3 and run the pipeline.
+
+1) Install the UI extra:
+
+```bash
+uv sync --extra ui
+```
+
+2) Run the app:
+
+```bash
+uv run streamlit run videogenerator/ui_app.py
+```
+
+The app prints the output folder path and includes an **Open folder** button (Windows/macOS/Linux best-effort).
+
 ### Branding (intro/outro slates)
 
 By default, the tool generates a simple intro + outro slate with a BR logo and a title derived from the transcript.
@@ -121,6 +139,36 @@ You can also use the installed script:
 
 ```bash
 uv run videogenerator --audio "path/to/audio.mp3" --out "output" --topic "Severance TV series" --max-images 12
+```
+
+## YouTube metadata + thumbnail
+
+Each run also writes YouTube-ready assets into the output folder:
+
+- `youtube_metadata.txt` (title, spoiler-safe description, tags)
+- `thumbnail.png` (1280×720) with the channel title in black with orange outline, plus a sentiment stamp in green with black outline
+
+The thumbnail includes the channel title near the top and a sentiment stamp at the bottom:
+- `Masterpiece!` (strongly positive transcript)
+- `Mehhh!` (mixed/unclear)
+- `Garbage!` (strongly negative)
+
+This uses an LLM when `OPENAI_API_KEY` is set; otherwise it falls back to a safe template.
+
+Disable with:
+
+```bash
+uv run python -m videogenerator --no-youtube-metadata ...
+```
+
+## Reusing images across reruns
+
+If you rerun the tool for the same audio (same filename stem) into a new output folder, it will try to reuse images from an existing matching `output_*` folder so it can skip SerpAPI/Wikimedia downloads.
+
+Disable with:
+
+```bash
+uv run python -m videogenerator --no-reuse-images ...
 ```
 
 ## Important licensing note
