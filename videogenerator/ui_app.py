@@ -90,6 +90,13 @@ with col_left:
         help="google_images uses SerpAPI Google Images results directly (no license validation).",
     )
 
+    video_type = st.selectbox(
+        "Video type",
+        options=["review (images only)", "explainer (text + images)", "shorts (9:16)", "auto"],
+        index=0,
+        help="Explainer/shorts use LLM-planned text-on-slide storyboards when available.",
+    )
+
     max_images = st.slider("Max images", min_value=4, max_value=24, value=12, step=1)
     min_seg_seconds = st.slider("Min seconds per slide", min_value=3.0, max_value=12.0, value=6.0, step=0.5)
 
@@ -194,6 +201,19 @@ with col_right:
     if run_clicked:
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        vt = "review"
+        if video_type.startswith("explainer"):
+            vt = "explainer"
+        elif video_type.startswith("shorts"):
+            vt = "shorts"
+        elif video_type == "auto":
+            vt = "auto"
+
+        # Render sizing preset.
+        vid_w, vid_h = (1920, 1080)
+        if vt == "shorts":
+            vid_w, vid_h = (1080, 1920)
+
         # Pipeline
         with st.status("Running pipeline…", expanded=True) as status:
             st.write("Planning slides, searching images, writing timeline…")
@@ -201,12 +221,15 @@ with col_right:
                 audio_path=str(saved_audio),
                 out_dir=out_dir,
                 topic=topic or None,
+                video_type=vt,
                 image_provider=image_provider,
                 serpapi_api_key=os.getenv("SERPAPI_API_KEY"),
                 max_images=int(max_images),
                 min_seg_seconds=float(min_seg_seconds),
                 whisper_model="small",
                 min_image_width=900,
+                video_width=int(vid_w),
+                video_height=int(vid_h),
                 cache_transcript=True,
                 cache_dir=None,
                 storyboard="auto",
@@ -355,8 +378,8 @@ with col_right:
                 slides_to_render,
                 str(saved_audio),
                 out_mp4,
-                width=1920,
-                height=1080,
+                width=int(vid_w),
+                height=int(vid_h),
                 fps=30,
                 bgm_path=None,
                 bgm_volume=float(bgm_volume),
@@ -378,10 +401,17 @@ with col_right:
                     topic=topic or None,
                     channel_name=channel_name,
                     title=title_txt,
+                    video_type=vt,
                 )
                 write_youtube_metadata_text(out_dir, pkg)
 
-                st.write({"thumbnail_slide_index": int(pkg.thumbnail_slide_index), "verdict": pkg.verdict_label})
+                st.write(
+                    {
+                        "thumbnail_slide_index": int(pkg.thumbnail_slide_index),
+                        "verdict": pkg.verdict_label,
+                        "stamp": pkg.thumbnail_stamp_text,
+                    }
+                )
 
                 idx = max(0, min(len(slides) - 1, int(pkg.thumbnail_slide_index)))
                 bg = Path(slides[idx].image_path)
@@ -393,6 +423,7 @@ with col_right:
                     background_image=bg,
                     text=str(channel_name or "").strip() or "Brutally Honest Review",
                     verdict_text=pkg.verdict_label,
+                    stamp_text=pkg.thumbnail_stamp_text,
                 )
 
             if verify_video:

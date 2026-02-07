@@ -19,6 +19,7 @@ class YouTubePackage:
     tags: list[str]
     thumbnail_slide_index: int
     verdict_label: str
+    thumbnail_stamp_text: str | None = None
 
 
 def _openai_chat_completions(*, api_key: str, model: str, messages: list[dict[str, Any]], timeout_s: int = 60) -> str:
@@ -45,6 +46,7 @@ def generate_youtube_package(
     topic: str | None,
     channel_name: str,
     title: str,
+    video_type: str = "review",
     model: str = "gpt-4o-mini",
 ) -> YouTubePackage:
     """Generate a YouTube title/description/tags plus thumbnail choice.
@@ -65,6 +67,7 @@ def generate_youtube_package(
                 topic=topic,
                 channel_name=channel_name,
                 title=title,
+                video_type=video_type,
                 model=model,
             )
         except Exception:
@@ -73,8 +76,17 @@ def generate_youtube_package(
     description = _fallback_description(segments=segments, topic=topic, channel_name=channel_name, title=title)
     tags = _fallback_tags(topic=topic)
     thumb_idx = _fallback_thumbnail_index(slides)
-    verdict = _fallback_verdict_label(segments=segments)
-    return YouTubePackage(title=title, description=description, tags=tags, thumbnail_slide_index=thumb_idx, verdict_label=verdict)
+    vt = (video_type or "review").strip().lower()
+    verdict = _fallback_verdict_label(segments=segments) if vt == "review" else ""
+    stamp = _fallback_stamp_text(topic=topic, title=title) if vt in {"explainer", "shorts"} else None
+    return YouTubePackage(
+        title=title,
+        description=description,
+        tags=tags,
+        thumbnail_slide_index=thumb_idx,
+        verdict_label=verdict,
+        thumbnail_stamp_text=stamp,
+    )
 
 
 def _generate_with_llm(
@@ -85,6 +97,7 @@ def _generate_with_llm(
     topic: str | None,
     channel_name: str,
     title: str,
+    video_type: str,
     model: str,
 ) -> YouTubePackage:
     transcript = [
@@ -97,8 +110,7 @@ def _generate_with_llm(
         slide_choices.append({"i": i, "query": (s.query or ""), "filename": Path(s.image_path).name})
 
     system = (
-        "You are a YouTube producer for a review channel. "
-        "Create metadata for a review video based on the transcript. "
+        "You are a YouTube producer. Create metadata based on the transcript. "
         "If the provided topic hint conflicts with the transcript, ignore the topic hint. "
         "Do NOT spoil the final verdict, rating, or conclusion. "
         "Avoid wording like 'I loved it'/'I hated it' or 'the verdict is'. "
@@ -108,22 +120,25 @@ def _generate_with_llm(
         "\"description\": <string>, "
         "\"tags\": <array of strings>, "
         "\"thumbnail_slide_index\": <int>, "
-        "\"verdict_label\": <string>"
+        "\"verdict_label\": <string>, "
+        "\"thumbnail_stamp_text\": <string|null>"
         "}. "
         "Description should be 2-4 short paragraphs, include a brief hook, and a subtle CTA. "
         "Tags: 10-18 items, no hashtags, keep them short. "
         "thumbnail_slide_index must be one of the provided slide choice i values; "
         "prefer a slide that is likely to show a character/actor (stills, cast) based on its query. "
-        "verdict_label MUST be exactly one of: 'Masterpiece!', 'Mehhh!', 'Garbage!'. "
-        "Decide verdict_label based on the overall sentiment in the transcript: "
-        "Masterpiece! for strongly positive, Mehhh! for mixed/unclear, Garbage! for strongly negative. "
-        "This verdict_label is ONLY for the thumbnail overlay (not for the description)."
+        "verdict_label MUST be exactly one of: 'Masterpiece!', 'Mehhh!', 'Garbage!' OR empty string ''. "
+        "thumbnail_stamp_text MUST be null OR exactly one of: 'TOP THEORIES', 'EXPLAINED', 'BREAKDOWN', 'DEEP DIVE'. "
+        "If this is a review video: set verdict_label to one of the three labels and set thumbnail_stamp_text=null. "
+        "If this is an explainer/list/theories video: set verdict_label='' and set thumbnail_stamp_text to the best stamp label. "
+        "Decide based on the transcript and the provided video_type hint."
     )
 
     user = {
         "channel_name": channel_name,
         "topic": topic or "",
         "title": title,
+        "video_type": (video_type or "review"),
         "transcript": transcript,
         "slide_choices": slide_choices,
     }
@@ -146,6 +161,8 @@ def _generate_with_llm(
     tags = parsed.get("tags") or []
     idx = int(parsed.get("thumbnail_slide_index"))
     verdict = str(parsed.get("verdict_label") or "").strip()
+    stamp = parsed.get("thumbnail_stamp_text")
+    stamp_text = None if stamp is None else str(stamp).strip()
 
     if not desc:
         raise RuntimeError("LLM returned empty description")
@@ -155,10 +172,25 @@ def _generate_with_llm(
     if idx < 0 or idx >= len(slides):
         idx = _fallback_thumbnail_index(slides)
 
-    if verdict not in {"Masterpiece!", "Mehhh!", "Garbage!"}:
-        verdict = _fallback_verdict_label(segments=segments)
+    vt = (video_type or "review").strip().lower()
+    if vt == "review":
+        if verdict not in {"Masterpiece!", "Mehhh!", "Garbage!"}:
+            verdict = _fallback_verdict_label(segments=segments)
+        stamp_text = None
+    else:
+        verdict = ""
+        allowed = {"TOP THEORIES", "EXPLAINED", "BREAKDOWN", "DEEP DIVE"}
+        if stamp_text not in allowed:
+            stamp_text = _fallback_stamp_text(topic=topic, title=title)
 
-    return YouTubePackage(title=title, description=desc, tags=tags, thumbnail_slide_index=idx, verdict_label=verdict)
+    return YouTubePackage(
+        title=title,
+        description=desc,
+        tags=tags,
+        thumbnail_slide_index=idx,
+        verdict_label=verdict,
+        thumbnail_stamp_text=stamp_text,
+    )
 
 
 def write_youtube_metadata_text(out_dir: str | Path, pkg: YouTubePackage) -> Path:
@@ -174,6 +206,7 @@ def write_youtube_metadata_text(out_dir: str | Path, pkg: YouTubePackage) -> Pat
         f"Tags:\n{tags_csv}\n\n"
         f"Thumbnail slide index:\n{pkg.thumbnail_slide_index}\n\n"
         f"Thumbnail verdict label:\n{pkg.verdict_label}\n"
+        f"Thumbnail stamp text:\n{pkg.thumbnail_stamp_text or ''}\n"
     )
     p.write_text(text, encoding="utf-8")
     return p
@@ -185,6 +218,7 @@ def create_thumbnail(
     background_image: str | Path,
     text: str = "Brutally Honest Review",
     verdict_text: str | None = None,
+    stamp_text: str | None = None,
     width: int = 1280,
     height: int = 720,
 ) -> Path:
@@ -241,13 +275,20 @@ def create_thumbnail(
             stroke_fill=title_stroke,
         )
 
-        if verdict_text:
-            vt = str(verdict_text).strip()
+        # Stamp: either verdict (reviews) or a generic explainer stamp.
+        chosen_stamp = (str(verdict_text).strip() if verdict_text else "")
+        if not chosen_stamp and stamp_text:
+            chosen_stamp = str(stamp_text).strip()
+
+        if chosen_stamp:
+            vt = chosen_stamp
             if vt:
-                # Verdict stamp at bottom.
+                # Stamp.
                 verdict_font = _pick_font(vt, width, size_hint=int(width * 0.165), max_size=280)
                 verdict_stroke_w = max(8, width // 75)
-                verdict_fill = (0, 200, 83, 255)  # green
+                # Green for verdict, warm yellow for explainer.
+                is_verdict = vt in {"Masterpiece!", "Mehhh!", "Garbage!"}
+                verdict_fill = (0, 200, 83, 255) if is_verdict else (255, 215, 0, 255)
                 verdict_stroke = (0, 0, 0, 255)  # black outline
 
                 verdict_cx = int(width * 0.5)
@@ -394,3 +435,14 @@ def _fallback_verdict_label(*, segments: list[TranscriptSegment] | None) -> str:
     if neg and not pos:
         return "Garbage!"
     return "Mehhh!"
+
+
+def _fallback_stamp_text(*, topic: str | None, title: str) -> str:
+    t = (title or "").lower()
+    if "theor" in t:
+        return "TOP THEORIES"
+    if "top" in t or "rank" in t:
+        return "BREAKDOWN"
+    if topic and "theor" in (topic or "").lower():
+        return "TOP THEORIES"
+    return "EXPLAINED"

@@ -18,6 +18,15 @@ class StorySlide:
     query: str
 
 
+@dataclass(frozen=True)
+class RichStorySlide:
+    start: float
+    end: float
+    query: str
+    headline: str
+    subhead: str | None = None
+
+
 def _topic_in_query(topic: str, query: str) -> bool:
     t = (topic or "").strip().lower()
     q = (query or "").strip().lower()
@@ -241,6 +250,172 @@ def plan_slides_with_llm(
         cur = end
 
     return cleaned[:max_images]
+
+
+def classify_transcript_kind_with_llm(
+    segments: list[TranscriptSegment],
+    *,
+    topic: str | None,
+    model: str = "gpt-4o-mini",
+) -> str:
+    """Classify whether this transcript is a 'review' or an 'explainer'.
+
+    Returns one of: 'review', 'explainer'.
+    """
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    transcript = "\n".join(s.text.strip() for s in segments[-40:] if s.text.strip())[:4000]
+    system = (
+        "You classify video transcripts. Return ONLY valid JSON (no markdown). "
+        "Schema: {\"kind\": \"review\"|\"explainer\"}. "
+        "A review focuses on opinions/verdicts about a piece of media/product. "
+        "An explainer is informational (theories, analysis topics, lists, guides) without a verdict."
+    )
+    user = {"topic": topic or "", "transcript": transcript}
+    content = _openai_chat_completions(
+        api_key=api_key,
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+        ],
+    )
+    parsed = json.loads(content)
+    kind = str((parsed or {}).get("kind") or "").strip().lower()
+    if kind not in {"review", "explainer"}:
+        return "review"
+    return kind
+
+
+def classify_transcript_kind_fallback(segments: list[TranscriptSegment] | None) -> str:
+    """Heuristic classifier used when LLM isn't available."""
+
+    if not segments:
+        return "review"
+    text = " ".join(s.text for s in segments[-30:]).lower()
+    reviewish = any(
+        w in text
+        for w in (
+            "review",
+            "my review",
+            "verdict",
+            "rating",
+            "stars",
+            "i loved",
+            "i hated",
+            "overall",
+            "recommend",
+        )
+    )
+    explainerish = any(w in text for w in ("theory", "theories", "top", "rank", "explained", "breakdown", "here are"))
+    if explainerish and not reviewish:
+        return "explainer"
+    return "review"
+
+
+def plan_rich_slides_with_llm(
+    segments: list[TranscriptSegment],
+    *,
+    audio_duration: float,
+    topic: str | None,
+    max_slides: int,
+    kind: str,  # explainer|shorts
+    model: str = "gpt-4o-mini",
+) -> list[RichStorySlide]:
+    """Plan a storyboard that includes on-screen text + image queries."""
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    transcript = [
+        {
+            "start": round(s.start, 2),
+            "end": round(s.end, 2),
+            "text": s.text,
+        }
+        for s in segments
+    ]
+
+    k = (kind or "").strip().lower()
+    if k not in {"explainer", "shorts"}:
+        k = "explainer"
+
+    system = (
+        "You are a video editor creating a storyboard plan for a narrated slideshow video. "
+        "Return ONLY valid JSON (no markdown). "
+        "JSON must be an array of objects with keys: start, end, query, headline. "
+        "Optional: subhead. "
+        "Times are seconds; 0 <= start < end <= audio_duration. "
+        "Use at most max_slides slides. "
+        "query must be short search keywords for finding real photos/stills suitable as background visuals. "
+        "headline must be a short on-screen caption (max 8 words) that matches what is being said in that time window. "
+        "If the content is list-like (e.g. theories), each slide can represent one item. "
+        "If the provided topic hint conflicts with transcript, ignore the topic hint. "
+        "Avoid spoilers if this is media-related."
+    )
+    if k == "shorts":
+        system += (
+            " This is for a YouTube Short: keep slides punchy; prefer 4-10 slides; "
+            "headline should be very short (max 6 words) and hooky."
+        )
+
+    user = {
+        "kind": k,
+        "audio_duration": round(float(audio_duration), 2),
+        "topic": topic or "",
+        "max_slides": int(max_slides),
+        "transcript": transcript,
+    }
+
+    content = _openai_chat_completions(
+        api_key=api_key,
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+        ],
+    )
+
+    parsed = json.loads(content)
+    if not isinstance(parsed, list):
+        raise RuntimeError("LLM JSON must be an array")
+
+    slides: list[RichStorySlide] = []
+    for item in parsed[: max_slides]:
+        if not isinstance(item, dict):
+            continue
+        start = float(item.get("start"))
+        end = float(item.get("end"))
+        query = str(item.get("query") or "").strip()
+        headline = str(item.get("headline") or "").strip()
+        subhead = str(item.get("subhead") or "").strip() if item.get("subhead") else None
+        if not query or not headline:
+            continue
+        if start < 0:
+            start = 0.0
+        if end > audio_duration:
+            end = audio_duration
+        if end <= start:
+            continue
+        slides.append(RichStorySlide(start=start, end=end, query=query, headline=headline, subhead=subhead))
+
+    slides.sort(key=lambda s: s.start)
+    cleaned: list[RichStorySlide] = []
+    cur = 0.0
+    for s in slides:
+        start = max(cur, s.start)
+        end = max(start + 0.1, s.end)
+        if start >= audio_duration:
+            break
+        end = min(end, audio_duration)
+        cleaned.append(RichStorySlide(start=start, end=end, query=s.query, headline=s.headline, subhead=s.subhead))
+        cur = end
+
+    return cleaned[:max_slides]
 
 
 def generate_video_title_with_llm(

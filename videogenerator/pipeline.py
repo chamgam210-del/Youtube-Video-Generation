@@ -22,12 +22,15 @@ def run(
     audio_path: str | Path,
     out_dir: str | Path,
     topic: str | None = None,
+    video_type: str = "review",  # review|explainer|shorts|auto
     image_provider: str = "wikimedia",
     serpapi_api_key: str | None = None,
     max_images: int = 12,
     min_seg_seconds: float = 6.0,
     whisper_model: str = "small",
     min_image_width: int = 900,
+    video_width: int = 1920,
+    video_height: int = 1080,
     cache_transcript: bool = True,
     cache_dir: str | Path | None = None,
     storyboard: str = "auto",  # auto|llm|heuristic
@@ -65,22 +68,55 @@ def run(
 
     merged = merge_short_segments(segments, min_seconds=min_seg_seconds)
 
+    vt = (video_type or "review").strip().lower()
+    if vt not in {"review", "explainer", "shorts", "auto"}:
+        vt = "review"
+
     use_llm = storyboard in {"llm", "auto"}
-    planned: list[tuple[float, float, str]] = []
+    # planned items: (start, end, query, headline, subhead)
+    planned: list[tuple[float, float, str, str, str | None]] = []
+
+    if vt == "auto":
+        if use_llm:
+            try:
+                from .llm_storyboard import classify_transcript_kind_with_llm
+
+                vt = classify_transcript_kind_with_llm(merged, topic=topic, model=llm_model)
+            except Exception:
+                from .llm_storyboard import classify_transcript_kind_fallback
+
+                vt = classify_transcript_kind_fallback(merged)
+        else:
+            from .llm_storyboard import classify_transcript_kind_fallback
+
+            vt = classify_transcript_kind_fallback(merged)
 
     if use_llm:
-        from .llm_storyboard import plan_slides_with_llm
-
         try:
-            # Give the LLM a condensed transcript (merged segments) so it can pick good cut points.
-            story = plan_slides_with_llm(
-                merged,
-                audio_duration=audio_duration,
-                topic=topic,
-                max_images=max_images,
-                model=llm_model,
-            )
-            planned = [(s.start, s.end, s.query) for s in story]
+            if vt in {"explainer", "shorts"}:
+                from .llm_storyboard import plan_rich_slides_with_llm
+
+                rich = plan_rich_slides_with_llm(
+                    merged,
+                    audio_duration=audio_duration,
+                    topic=topic,
+                    max_slides=max_images,
+                    kind=("shorts" if vt == "shorts" else "explainer"),
+                    model=llm_model,
+                )
+                planned = [(s.start, s.end, s.query, s.headline, s.subhead) for s in rich]
+            else:
+                from .llm_storyboard import plan_slides_with_llm
+
+                # Give the LLM a condensed transcript (merged segments) so it can pick good cut points.
+                story = plan_slides_with_llm(
+                    merged,
+                    audio_duration=audio_duration,
+                    topic=topic,
+                    max_images=max_images,
+                    model=llm_model,
+                )
+                planned = [(s.start, s.end, s.query, "", None) for s in story]
         except Exception:
             if storyboard == "llm":
                 raise
@@ -91,7 +127,7 @@ def run(
 
     if not planned:
         picked = select_evenly_spaced(merged, max_items=max_images, audio_duration=audio_duration)
-        planned = [(s.start, s.end, "") for s in picked]
+        planned = [(s.start, s.end, "", "", None) for s in picked]
 
     slides: list[Slide] = []
     attribution_lines: list[str] = []
@@ -289,7 +325,7 @@ def run(
             last_image_path = None
             last_info = None
 
-    for i, (start, end, llm_query) in enumerate(tqdm(planned, desc="Finding images")):
+    for i, (start, end, llm_query, headline, subhead) in enumerate(tqdm(planned, desc="Finding images")):
         # If LLM provided an explicit query, trust it. Otherwise derive from local keywords.
         q_main = (llm_query or "").strip()
         wtext = _window_text(float(start), float(end))
@@ -391,6 +427,36 @@ def run(
             license_url=(info or {}).get("license_url"),
             attribution=(info or {}).get("attribution"),
         )
+
+        # For explainer/shorts, render a slide card with on-screen text.
+        if vt in {"explainer", "shorts"}:
+            ht = (headline or "").strip()
+            sh = (subhead or "").strip() if subhead else None
+            if ht:
+                try:
+                    from .slide_cards import SlideCardSpec, render_slide_card
+
+                    card_path = assets_dir / f"card_{i:02d}.png"
+                    rendered = render_slide_card(
+                        background_image=image_path,
+                        out_path=card_path,
+                        spec=SlideCardSpec(headline=ht, subhead=sh),
+                        width=int(video_width),
+                        height=int(video_height),
+                    )
+                    slide = Slide(
+                        start=slide.start,
+                        end=slide.end,
+                        image_path=str(rendered),
+                        query=slide.query,
+                        source_page=slide.source_page,
+                        image_url=slide.image_url,
+                        license_name=slide.license_name,
+                        license_url=slide.license_url,
+                        attribution=slide.attribution,
+                    )
+                except Exception:
+                    pass
         slides.append(slide)
 
         if slide.source_page or slide.license_name:
@@ -484,6 +550,9 @@ def run(
                 "audio_stem": audio_path.stem,
                 "audio_size": int(audio_stat.st_size),
                 "audio_mtime": float(audio_stat.st_mtime),
+                "video_type": vt,
+                "video_width": int(video_width),
+                "video_height": int(video_height),
                 "image_provider": image_provider,
                 "max_images": int(max_images),
                 "min_image_width": int(min_image_width),

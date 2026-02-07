@@ -62,6 +62,18 @@ def main() -> None:
     p.add_argument("--fps", type=int, default=30, help="Video fps")
 
     p.add_argument(
+        "--video-type",
+        default="review",
+        choices=["review", "explainer", "shorts", "auto"],
+        help="Video style. 'review' uses image-only slides; 'explainer' uses text-on-slide cards; 'auto' tries to infer.",
+    )
+    p.add_argument(
+        "--shorts",
+        action="store_true",
+        help="Preset for YouTube Shorts (9:16) with LLM-planned text slides.",
+    )
+
+    p.add_argument(
         "--transition",
         default="fade",
         choices=["none", "fade"],
@@ -177,6 +189,14 @@ def main() -> None:
 
     args = p.parse_args()
 
+    # Shorts preset overrides.
+    if args.shorts:
+        args.video_type = "shorts"
+        # If user didn't explicitly override width/height, switch to 9:16.
+        if int(args.width) == 1920 and int(args.height) == 1080:
+            args.width = 1080
+            args.height = 1920
+
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -203,12 +223,15 @@ def main() -> None:
         audio_path=args.audio,
         out_dir=out_dir,
         topic=args.topic,
+        video_type=str(args.video_type),
         image_provider=args.image_provider,
         serpapi_api_key=args.serpapi_key or os.getenv("SERPAPI_API_KEY"),
         max_images=args.max_images,
         min_seg_seconds=args.min_seg_seconds,
         whisper_model=args.whisper_model,
         min_image_width=args.min_image_width,
+        video_width=int(args.width),
+        video_height=int(args.height),
         cache_transcript=(not args.no_transcript_cache),
         cache_dir=args.transcript_cache_dir,
         storyboard=args.storyboard,
@@ -280,6 +303,7 @@ def main() -> None:
                 topic=args.topic,
                 channel_name=channel_name,
                 title=title,
+                video_type=str(args.video_type),
                 model=args.llm_model,
             )
             write_youtube_metadata_text(out_dir, pkg)
@@ -292,6 +316,7 @@ def main() -> None:
                 background_image=thumb_slide.image_path,
                 text="Brutally Honest Review",
                 verdict_text=pkg.verdict_label,
+                stamp_text=pkg.thumbnail_stamp_text,
             )
         except Exception:
             pass

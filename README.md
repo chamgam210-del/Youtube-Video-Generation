@@ -36,6 +36,30 @@ uv run python -m videogenerator \
   --out "output" \
   --topic "Severance TV series" \
   --max-images 12
+
+### Explainers (text + images)
+
+For non-review videos (e.g. "Top Severance Theories"), you can ask the LLM to plan a storyboard with on-screen text captions (headline per slide):
+
+```bash
+uv run python -m videogenerator \
+  --audio "path/to/audio.mp3" \
+  --out "output_explainer" \
+  --topic "Severance TV series" \
+  --video-type explainer \
+  --max-images 10
+```
+
+### Shorts (9:16)
+
+```bash
+uv run python -m videogenerator \
+  --audio "path/to/audio_clip.mp3" \
+  --out "output_short" \
+  --topic "Severance TV series" \
+  --shorts \
+  --max-images 8
+```
 ```
 
 ## Simple UI (local)
@@ -45,7 +69,7 @@ There is a small local web UI built with Streamlit that lets you upload an MP3 a
 1) Install the UI extra:
 
 ```bash
-uv sync --extra ui
+uv sync --extra dev --extra ui
 ```
 
 2) Run the app:
