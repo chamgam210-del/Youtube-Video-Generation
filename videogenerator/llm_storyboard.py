@@ -27,6 +27,12 @@ class RichStorySlide:
     subhead: str | None = None
 
 
+@dataclass(frozen=True)
+class InferredTopic:
+    topic: str
+    topic_type: str  # tv_show|movie|product|other
+
+
 def _topic_in_query(topic: str, query: str) -> bool:
     t = (topic or "").strip().lower()
     q = (query or "").strip().lower()
@@ -316,6 +322,51 @@ def classify_transcript_kind_fallback(segments: list[TranscriptSegment] | None) 
     return "review"
 
 
+def infer_topic_with_llm(
+    segments: list[TranscriptSegment],
+    *,
+    model: str = "gpt-4o-mini",
+) -> InferredTopic:
+    """Infer the primary subject (e.g. TV show name) from transcript."""
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    transcript = "\n".join(s.text.strip() for s in segments[-50:] if s.text.strip())[:5000]
+    system = (
+        "You infer the primary topic of a narration. Return ONLY valid JSON (no markdown). "
+        "Schema: {\"topic\": <string>, \"topic_type\": \"tv_show\"|\"movie\"|\"product\"|\"other\"}. "
+        "topic must be short (2-6 words), just the name (no quotes), e.g. 'Severance'."
+    )
+    user = {"transcript": transcript}
+    content = _openai_chat_completions(
+        api_key=api_key,
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+        ],
+    )
+    parsed = json.loads(content)
+    topic = str((parsed or {}).get("topic") or "").strip()
+    topic_type = str((parsed or {}).get("topic_type") or "").strip().lower()
+    if not topic:
+        topic = ""
+    if topic_type not in {"tv_show", "movie", "product", "other"}:
+        topic_type = "other"
+    return InferredTopic(topic=topic, topic_type=topic_type)
+
+
+def infer_topic_fallback(*, audio_stem: str) -> InferredTopic:
+    stem = (audio_stem or "").replace("_", " ").replace("-", " ").strip()
+    stem = " ".join(stem.split())
+    # Very lightweight: last 1-2 words are often the actual subject.
+    parts = stem.split()
+    guess = " ".join(parts[-2:]) if len(parts) >= 2 else (parts[0] if parts else "")
+    return InferredTopic(topic=guess, topic_type="other")
+
+
 def plan_rich_slides_with_llm(
     segments: list[TranscriptSegment],
     *,
@@ -354,6 +405,8 @@ def plan_rich_slides_with_llm(
         "query must be short search keywords for finding real photos/stills suitable as background visuals. "
         "headline must be a short on-screen caption (max 8 words) that matches what is being said in that time window. "
         "If the content is list-like (e.g. theories), each slide can represent one item. "
+        "If topic is empty, infer the primary topic (show/product) from transcript and use it consistently in queries. "
+        "If the transcript is about a TV series, queries MUST be about that TV series and should include keywords like 'TV series still', 'cast', or 'scene still'. "
         "If the provided topic hint conflicts with transcript, ignore the topic hint. "
         "Avoid spoilers if this is media-related."
     )

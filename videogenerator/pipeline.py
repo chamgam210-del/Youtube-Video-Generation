@@ -72,6 +72,47 @@ def run(
     if vt not in {"review", "explainer", "shorts", "auto"}:
         vt = "review"
 
+    # For non-review videos, we want a stable topic hint to keep image searches on the right subject.
+    effective_topic: str | None = (topic or "").strip() or None
+    topic_type: str | None = None
+    if vt in {"explainer", "shorts", "auto"} and not effective_topic:
+        if use_llm:
+            try:
+                from .llm_storyboard import infer_topic_with_llm
+
+                inferred = infer_topic_with_llm(merged, model=llm_model)
+                effective_topic = inferred.topic.strip() or None
+                topic_type = inferred.topic_type
+            except Exception:
+                effective_topic = None
+        if not effective_topic:
+            from .llm_storyboard import infer_topic_fallback
+
+            inferred = infer_topic_fallback(audio_stem=audio_path.stem)
+            effective_topic = inferred.topic.strip() or None
+            topic_type = inferred.topic_type
+
+    # Heuristic: if transcript strongly suggests TV content, treat as tv_show.
+    if vt in {"explainer", "shorts"} and (topic_type is None or topic_type == "other"):
+        try:
+            tail = " ".join(s.text for s in merged[-25:]).lower()
+        except Exception:
+            tail = ""
+        tv_hints = (
+            "tv",
+            "tv show",
+            "series",
+            "episode",
+            "season",
+            "cast",
+            "character",
+            "apple tv",
+            "netflix",
+            "hbo",
+        )
+        if any(h in tail for h in tv_hints):
+            topic_type = "tv_show"
+
     use_llm = storyboard in {"llm", "auto"}
     # planned items: (start, end, query, headline, subhead)
     planned: list[tuple[float, float, str, str, str | None]] = []
@@ -99,7 +140,7 @@ def run(
                 rich = plan_rich_slides_with_llm(
                     merged,
                     audio_duration=audio_duration,
-                    topic=topic,
+                    topic=effective_topic,
                     max_slides=max_images,
                     kind=("shorts" if vt == "shorts" else "explainer"),
                     model=llm_model,
@@ -112,7 +153,7 @@ def run(
                 story = plan_slides_with_llm(
                     merged,
                     audio_duration=audio_duration,
-                    topic=topic,
+                    topic=effective_topic,
                     max_images=max_images,
                     model=llm_model,
                 )
@@ -328,6 +369,13 @@ def run(
     for i, (start, end, llm_query, headline, subhead) in enumerate(tqdm(planned, desc="Finding images")):
         # If LLM provided an explicit query, trust it. Otherwise derive from local keywords.
         q_main = (llm_query or "").strip()
+        # Keep explainer/shorts queries anchored on the topic.
+        if vt in {"explainer", "shorts"} and effective_topic:
+            if effective_topic.lower() not in q_main.lower():
+                q_main = f"{effective_topic} {q_main}".strip()
+            # If this looks like TV content, bias toward stills/cast.
+            if (topic_type == "tv_show") and not any(k in q_main.lower() for k in ("still", "stills", "cast", "scene")):
+                q_main = f"{q_main} TV series still".strip()
         wtext = _window_text(float(start), float(end))
 
         keywords: list[str] = []
@@ -553,6 +601,8 @@ def run(
                 "video_type": vt,
                 "video_width": int(video_width),
                 "video_height": int(video_height),
+                "topic": effective_topic,
+                "topic_type": topic_type,
                 "image_provider": image_provider,
                 "max_images": int(max_images),
                 "min_image_width": int(min_image_width),
