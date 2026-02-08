@@ -305,16 +305,31 @@ def extract_review_highlights_with_llm(
         max_clip_seconds=float(max_clip_seconds),
     )
 
-    # Soft cap total length: trim from the end if we overshoot.
+    # Hard cap total length: never exceed 60s.
     total = 0.0
     capped: list[HighlightClip] = []
     cap = min(60.0, max(10.0, float(target_total_seconds) + 6.0))
     for c in cleaned:
-        length = float(c.end - c.start)
-        if (total + length) > cap and capped:
+        remaining = float(cap) - float(total)
+        if remaining <= 0.0:
             break
+
+        start = float(c.start)
+        end = float(c.end)
+        length = end - start
+        if length <= 0.0:
+            continue
+
+        if length > remaining:
+            # Truncate this clip to fit remaining budget.
+            end = start + remaining
+            length = end - start
+
+        if length <= 0.05:
+            break
+
+        capped.append(HighlightClip(start=start, end=end, reason=c.reason))
         total += length
-        capped.append(c)
 
     return capped
 
