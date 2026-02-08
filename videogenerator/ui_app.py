@@ -473,6 +473,30 @@ with col_right:
                 ken_burns=False,
             )
 
+            if vt == "review":
+                st.write("Generating Shorts highlights…")
+                try:
+                    from videogenerator.review_highlights_shorts import make_shorts_from_review_highlights
+
+                    shorts_dir = make_shorts_from_review_highlights(
+                        review_audio_path=saved_audio,
+                        review_out_dir=out_dir,
+                        topic=(topic or None),
+                        image_provider=image_provider,
+                        serpapi_api_key=os.getenv("SERPAPI_API_KEY"),
+                        whisper_model="small",
+                        min_image_width=900,
+                        llm_model="gpt-4o-mini",
+                        llm_pick_images=True,
+                        reuse_images=bool(reuse_images),
+                    )
+                    if shorts_dir is not None:
+                        st.success(f"Shorts created: {str(Path(shorts_dir) / 'video.mp4')}")
+                    else:
+                        st.caption("Shorts not created (missing transcript or no highlight clips).")
+                except Exception:
+                    st.caption("Shorts not created (requires OPENAI_API_KEY and a successful transcript).")
+
             if youtube_metadata:
                 st.write("Generating YouTube metadata + thumbnail…")
                 if pkg is None:

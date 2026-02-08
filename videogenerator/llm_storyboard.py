@@ -28,6 +28,13 @@ class RichStorySlide:
 
 
 @dataclass(frozen=True)
+class HighlightClip:
+    start: float
+    end: float
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class InferredTopic:
     topic: str
     topic_type: str  # tv_show|movie|product|other
@@ -150,6 +157,166 @@ def _openai_chat_completions(
     resp.raise_for_status()
     data = resp.json()
     return data["choices"][0]["message"]["content"]
+
+
+def _clean_highlight_clips(
+    clips: list[HighlightClip],
+    *,
+    audio_duration: float,
+    max_clips: int,
+    min_clip_seconds: float,
+    max_clip_seconds: float,
+) -> list[HighlightClip]:
+    if not clips:
+        return []
+
+    dur = max(0.0, float(audio_duration))
+    out: list[HighlightClip] = []
+    for c in clips:
+        try:
+            s = max(0.0, min(dur, float(c.start)))
+            e = max(0.0, min(dur, float(c.end)))
+        except Exception:
+            continue
+        if e <= s:
+            continue
+
+        # Clamp length.
+        length = e - s
+        if length < float(min_clip_seconds):
+            e = min(dur, s + float(min_clip_seconds))
+        elif length > float(max_clip_seconds):
+            e = s + float(max_clip_seconds)
+
+        if e <= s:
+            continue
+        out.append(HighlightClip(start=s, end=e, reason=str(c.reason or "").strip()))
+
+    out.sort(key=lambda x: float(x.start))
+
+    # Remove overlaps by trimming later clips.
+    cleaned: list[HighlightClip] = []
+    cur = 0.0
+    for c in out:
+        s = max(cur, float(c.start))
+        e = float(c.end)
+        if e <= s:
+            continue
+        cleaned.append(HighlightClip(start=s, end=e, reason=c.reason))
+        cur = float(e)
+        if len(cleaned) >= int(max_clips):
+            break
+
+    return cleaned
+
+
+def extract_review_highlights_with_llm(
+    segments: list[TranscriptSegment],
+    *,
+    audio_duration: float,
+    max_clips: int = 4,
+    target_total_seconds: float = 55.0,
+    min_clip_seconds: float = 7.0,
+    max_clip_seconds: float = 18.0,
+    model: str = "gpt-4o-mini",
+) -> list[HighlightClip]:
+    """Pick the most important moments from a review transcript.
+
+    Returns a small set of timestamped clips (start/end in original audio seconds)
+    intended to be concatenated into a Shorts-length highlight cut.
+    """
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    if not segments:
+        return []
+
+    dur = max(0.0, float(audio_duration))
+    if dur <= 0.0:
+        return []
+
+    # Keep prompt compact: use a limited window of segments (usually merged by caller).
+    transcript = [
+        {
+            "start": round(float(s.start), 2),
+            "end": round(float(s.end), 2),
+            "text": str(s.text or "")[:280],
+        }
+        for s in segments[:250]
+    ]
+
+    system = (
+        "You are a video editor creating a YouTube Shorts highlight cut from a FULL-LENGTH review. "
+        "Pick the MOST IMPORTANT and MOST INTERESTING moments that represent the core points and verdict. "
+        "Return ONLY valid JSON (no markdown). "
+        "Output schema: an array of objects {start: number, end: number, reason: string}. "
+        "Rules: 0 <= start < end <= audio_duration. "
+        "Return at most max_clips clips, in chronological order, with NO overlaps. "
+        "Each clip length should be between min_clip_seconds and max_clip_seconds. "
+        "Try to keep the total combined length close to target_total_seconds (not over 60 seconds). "
+        "Choose moments that contain the key opinions, comparisons, and final takeaway."
+    )
+
+    user = {
+        "audio_duration": round(dur, 2),
+        "max_clips": int(max_clips),
+        "target_total_seconds": float(target_total_seconds),
+        "min_clip_seconds": float(min_clip_seconds),
+        "max_clip_seconds": float(max_clip_seconds),
+        "transcript": transcript,
+    }
+
+    content = _openai_chat_completions(
+        api_key=api_key,
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+        ],
+    )
+
+    try:
+        parsed = json.loads(content)
+    except Exception as e:
+        raise RuntimeError(f"LLM did not return valid JSON. Got: {content[:400]}") from e
+
+    if not isinstance(parsed, list):
+        raise RuntimeError("LLM JSON must be an array")
+
+    clips: list[HighlightClip] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start = float(item.get("start"))
+            end = float(item.get("end"))
+        except Exception:
+            continue
+        reason = str(item.get("reason") or "").strip()
+        clips.append(HighlightClip(start=start, end=end, reason=reason))
+
+    cleaned = _clean_highlight_clips(
+        clips,
+        audio_duration=dur,
+        max_clips=int(max_clips),
+        min_clip_seconds=float(min_clip_seconds),
+        max_clip_seconds=float(max_clip_seconds),
+    )
+
+    # Soft cap total length: trim from the end if we overshoot.
+    total = 0.0
+    capped: list[HighlightClip] = []
+    cap = min(60.0, max(10.0, float(target_total_seconds) + 6.0))
+    for c in cleaned:
+        length = float(c.end - c.start)
+        if (total + length) > cap and capped:
+            break
+        total += length
+        capped.append(c)
+
+    return capped
 
 
 def plan_slides_with_llm(

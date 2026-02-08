@@ -372,14 +372,14 @@ def main() -> None:
             from .youtube import overlay_shorts_title_and_stamp
 
             overlay_title = cleaned_topic_title or title
-        slides = overlay_shorts_title_and_stamp(
+            slides = overlay_shorts_title_and_stamp(
                 slides,
                 out_dir=out_dir / "slides_overlay",
                 title=overlay_title,
                 stamp_text=shorts_overlay_stamp,
                 width=int(args.width),
                 height=int(args.height),
-            show_title=False,
+                show_title=False,
             )
         except Exception:
             pass
@@ -475,6 +475,33 @@ def main() -> None:
         v = verify_local(out_mp4)
         print(v.duration_line.strip())
         print(f"has_audio={v.has_audio} audio_peak={v.audio_peak} frame_hashes={v.frame_hashes}")
+
+    # Review -> auto-generate a Shorts highlights cut.
+    try:
+        vt_now = (str(args.video_type) or "review").strip().lower()
+    except Exception:
+        vt_now = "review"
+
+    if vt_now == "review":
+        try:
+            from .review_highlights_shorts import make_shorts_from_review_highlights
+
+            shorts_dir = make_shorts_from_review_highlights(
+                review_audio_path=args.audio,
+                review_out_dir=out_dir,
+                topic=(args.topic or None),
+                image_provider=str(args.image_provider),
+                serpapi_api_key=(args.serpapi_key or os.getenv("SERPAPI_API_KEY")),
+                whisper_model=str(args.whisper_model),
+                min_image_width=int(args.min_image_width),
+                llm_model=str(args.llm_model),
+                llm_pick_images=(not args.no_llm_pick_images),
+                reuse_images=(not args.no_reuse_images),
+            )
+            if shorts_dir is not None:
+                print(str((Path(shorts_dir) / "video.mp4").resolve()))
+        except Exception:
+            pass
 
     print(str(out_mp4.resolve()))
 
