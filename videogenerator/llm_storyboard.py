@@ -215,9 +215,9 @@ def extract_review_highlights_with_llm(
     *,
     audio_duration: float,
     max_clips: int = 4,
-    target_total_seconds: float = 55.0,
-    min_clip_seconds: float = 7.0,
-    max_clip_seconds: float = 18.0,
+    target_total_seconds: float = 35.0,
+    min_clip_seconds: float = 6.0,
+    max_clip_seconds: float = 14.0,
     model: str = "gpt-4o-mini",
 ) -> list[HighlightClip]:
     """Pick the most important moments from a review transcript.
@@ -255,7 +255,7 @@ def extract_review_highlights_with_llm(
         "Rules: 0 <= start < end <= audio_duration. "
         "Return at most max_clips clips, in chronological order, with NO overlaps. "
         "Each clip length should be between min_clip_seconds and max_clip_seconds. "
-        "Try to keep the total combined length close to target_total_seconds (not over 60 seconds). "
+        "Try to keep the total combined length <= target_total_seconds (never exceed 60 seconds). "
         "Choose moments that contain the key opinions, comparisons, and final takeaway."
     )
 
@@ -305,10 +305,10 @@ def extract_review_highlights_with_llm(
         max_clip_seconds=float(max_clip_seconds),
     )
 
-    # Hard cap total length: never exceed 60s.
+    # Hard cap total length: keep <= target_total_seconds (and never exceed 60s).
     total = 0.0
     capped: list[HighlightClip] = []
-    cap = min(60.0, max(10.0, float(target_total_seconds) + 6.0))
+    cap = min(60.0, max(10.0, float(target_total_seconds)))
     for c in cleaned:
         remaining = float(cap) - float(total)
         if remaining <= 0.0:
@@ -325,7 +325,8 @@ def extract_review_highlights_with_llm(
             end = start + remaining
             length = end - start
 
-        if length <= 0.05:
+        # If we can't fit at least the minimum meaningful clip length, stop.
+        if length < max(0.05, float(min_clip_seconds) * 0.65):
             break
 
         capped.append(HighlightClip(start=start, end=end, reason=c.reason))

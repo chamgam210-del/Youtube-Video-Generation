@@ -50,7 +50,7 @@ def make_shorts_from_review_highlights(
     llm_pick_images: bool,
     reuse_images: bool,
     max_slides: int = 4,
-    target_total_seconds: float = 55.0,
+    target_total_seconds: float = 35.0,
 ) -> Path | None:
     """For a full-length review output, auto-generate a Shorts highlight video.
 
