@@ -72,6 +72,8 @@ def run(
     if vt not in {"review", "explainer", "shorts", "auto"}:
         vt = "review"
 
+    use_llm = storyboard in {"llm", "auto"}
+
     # For non-review videos, we want a stable topic hint to keep image searches on the right subject.
     effective_topic: str | None = (topic or "").strip() or None
     topic_type: str | None = None
@@ -113,7 +115,6 @@ def run(
         if any(h in tail for h in tv_hints):
             topic_type = "tv_show"
 
-    use_llm = storyboard in {"llm", "auto"}
     # planned items: (start, end, query, headline, subhead)
     planned: list[tuple[float, float, str, str, str | None]] = []
 
@@ -158,6 +159,22 @@ def run(
                     model=llm_model,
                 )
                 planned = [(s.start, s.end, s.query, "", None) for s in story]
+
+            # Guardrail: if the LLM plan front-loads slide changes and leaves a very long final hold,
+            # re-space the slide boundaries across the full audio duration while keeping the LLM's
+            # topic-ordered queries/headlines. This avoids the "hits max images then freezes" behavior.
+            if planned and audio_duration > 0:
+                n = len(planned)
+                avg = float(audio_duration) / float(n)
+                last_start = float(planned[-1][0])
+                last_dur = float(audio_duration) - last_start
+                if last_dur > (1.75 * avg):
+                    buckets = select_evenly_spaced(merged, max_items=n, audio_duration=audio_duration)
+                    respaced: list[tuple[float, float, str, str, str | None]] = []
+                    for i, b in enumerate(buckets):
+                        q, h, sh = planned[i][2], planned[i][3], planned[i][4]
+                        respaced.append((float(b.start), float(b.end), q, h, sh))
+                    planned = respaced
         except Exception:
             if storyboard == "llm":
                 raise
@@ -491,6 +508,7 @@ def run(
                         spec=SlideCardSpec(headline=ht, subhead=sh),
                         width=int(video_width),
                         height=int(video_height),
+                        layout=("shorts" if vt == "shorts" else "default"),
                     )
                     slide = Slide(
                         start=slide.start,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+import re
 
 import imageio_ffmpeg
 import numpy as np
@@ -49,10 +50,25 @@ def extract_frames(video_path: str | Path, times_s: list[float], out_dir: str | 
             "1",
             str(out),
         ]
-        subprocess.run(cmd, check=True)
-        frames.append(out)
+        try:
+            subprocess.run(cmd, check=False)
+        except Exception:
+            continue
+        if out.exists():
+            frames.append(out)
 
     return frames
+
+
+def _parse_duration_seconds(stderr: str) -> float | None:
+    # Typical line: Duration: 00:01:23.45, start: 0.000000, bitrate: ...
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
+    if not m:
+        return None
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    ss = float(m.group(3))
+    return hh * 3600.0 + mm * 60.0 + ss
 
 
 def audio_peak_first_seconds(video_path: str | Path, seconds: float = 3.0) -> int | None:
@@ -94,10 +110,23 @@ def verify_local(video_path: str | Path) -> VideoVerification:
 
     tmp = Path(video_path).with_suffix("")
     frame_dir = tmp.parent / (tmp.name + "_frames")
-    frames = extract_frames(video_path, [0.0, 10.0, 25.0, 40.0, 55.0], frame_dir)
+
+    dur_s = _parse_duration_seconds(stderr)
+    if dur_s and dur_s > 0.5:
+        # Sample across the video duration, avoiding the exact end.
+        end = max(0.0, float(dur_s) - 0.25)
+        times = [0.0, end * 0.25, end * 0.50, end * 0.75, end]
+    else:
+        # Fallback to a conservative set.
+        times = [0.0, 2.0, 5.0, 8.0, 10.0]
+
+    frames = extract_frames(video_path, times, frame_dir)
     hashes: list[str] = []
     for f in frames:
-        h = hashlib.sha256(f.read_bytes()).hexdigest()[:16]
-        hashes.append(h)
+        try:
+            h = hashlib.sha256(f.read_bytes()).hexdigest()[:16]
+            hashes.append(h)
+        except FileNotFoundError:
+            continue
 
     return VideoVerification(duration_line=duration_line, has_audio=has_audio, audio_peak=peak, frame_hashes=hashes)

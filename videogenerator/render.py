@@ -128,6 +128,92 @@ def _generate_elevator_music_wav(*, out_wav: Path, seconds: float, sample_rate: 
         wf.writeframes(b"")
 
 
+def _generate_creepy_music_wav(*, out_wav: Path, seconds: float, sample_rate: int = 44100) -> None:
+    """Generate a loop-friendly creepy drone bed.
+
+    Intentionally simple + deterministic (no external deps): minor intervals, slight detune,
+    slow tremolo, and a tiny bit of filtered noise.
+    """
+
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+
+    total_seconds = max(1.0, float(seconds))
+    total_frames = int(total_seconds * sample_rate)
+
+    def soft_clip(x: float) -> float:
+        return math.tanh(x)
+
+    # Seeded pseudo-random for deterministic noise.
+    state = 1337
+
+    def rnd() -> float:
+        nonlocal state
+        state = (1103515245 * state + 12345) & 0x7FFFFFFF
+        return (state / 0x7FFFFFFF) * 2.0 - 1.0
+
+    # Drone chord: D minor-ish cluster with detune.
+    base = 73.42  # D2
+    freqs = [
+        base,
+        base * 1.005,
+        base * (6.0 / 5.0),  # minor third
+        base * (3.0 / 2.0),  # fifth
+        2.0 * base * 1.01,
+    ]
+
+    with wave.open(str(out_wav), "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+
+        # Simple one-pole lowpass for noise.
+        lp_l = 0.0
+        lp_r = 0.0
+        alpha = 0.02
+
+        for frame in range(total_frames):
+            t = frame / sample_rate
+
+            # Slow tremolo + subtle swell.
+            trem = 0.55 + 0.45 * math.sin(2.0 * math.pi * 0.12 * t)
+            swell = 0.70 + 0.30 * math.sin(2.0 * math.pi * 0.03 * t + 1.2)
+            amp = 0.16 * trem * swell
+
+            drone = 0.0
+            for i, f in enumerate(freqs):
+                # Spread phases a bit.
+                ph = 0.4 * i
+                drone += math.sin(2.0 * math.pi * f * t + ph)
+            drone /= float(len(freqs))
+
+            # Add a faint high harmonic for tension.
+            hiss_tone = 0.03 * math.sin(2.0 * math.pi * (base * 8.0) * t)
+
+            # Light noise, lowpassed.
+            n_l = rnd() * 0.08
+            n_r = rnd() * 0.08
+            lp_l = lp_l + alpha * (n_l - lp_l)
+            lp_r = lp_r + alpha * (n_r - lp_r)
+
+            mix_l = amp * (drone + hiss_tone) + (0.04 * lp_l)
+            mix_r = amp * (drone + 0.9 * hiss_tone) + (0.04 * lp_r)
+
+            # Very slight stereo movement.
+            mix_r += 0.01 * math.sin(2.0 * math.pi * 0.07 * t)
+
+            mix_l = soft_clip(mix_l)
+            mix_r = soft_clip(mix_r)
+
+            s_l = int(max(-1.0, min(1.0, mix_l)) * 32767)
+            s_r = int(max(-1.0, min(1.0, mix_r)) * 32767)
+            wf.writeframesraw(
+                int.to_bytes(s_l & 0xFFFF, 2, "little", signed=False)
+                + int.to_bytes(s_r & 0xFFFF, 2, "little", signed=False)
+            )
+
+        wf.writeframes(b"")
+
+
 def render_slideshow(
     slides: list[Slide],
     audio_path: str | Path,
@@ -185,6 +271,10 @@ def render_slideshow(
             # otherwise generating a full-length WAV in Python is extremely slow.
             bgm_wav = out_mp4.parent / "bgm_elevator.wav"
             _generate_elevator_music_wav(out_wav=bgm_wav, seconds=32.0)
+            bgm_path = bgm_wav
+        elif preset in ("creepy", "horror", "spooky"):
+            bgm_wav = out_mp4.parent / "bgm_creepy.wav"
+            _generate_creepy_music_wav(out_wav=bgm_wav, seconds=32.0)
             bgm_path = bgm_wav
         else:
             raise ValueError(f"Unknown bgm_preset: {bgm_preset!r}")

@@ -111,7 +111,7 @@ def main() -> None:
         "--bgm-preset",
         type=str,
         default=None,
-        help="Built-in background music preset: 'ambient' or 'elevator'.",
+        help="Built-in background music preset: 'ambient', 'elevator', or 'creepy'.",
     )
     p.add_argument(
         "--no-bgm-duck",
@@ -190,12 +190,31 @@ def main() -> None:
     args = p.parse_args()
 
     # Shorts preset overrides.
-    if args.shorts:
+    if args.shorts or str(getattr(args, "video_type", "")).strip().lower() == "shorts":
         args.video_type = "shorts"
         # If user didn't explicitly override width/height, switch to 9:16.
         if int(args.width) == 1920 and int(args.height) == 1080:
             args.width = 1080
             args.height = 1920
+
+        # Shorts should be punchy: cap slides.
+        try:
+            args.max_images = min(int(args.max_images), 4)
+        except Exception:
+            args.max_images = 4
+
+        # Default: no transitions for shorts unless explicitly requested.
+        import sys
+
+        if "--transition" not in sys.argv:
+            args.transition = "none"
+        if "--transition-seconds" not in sys.argv:
+            args.transition_seconds = 0.0
+
+        # Shorts should start immediately on content: disable intro/outro branding slates.
+        args.no_branding = True
+        args.intro_seconds = 0.0
+        args.outro_seconds = 0.0
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -264,13 +283,18 @@ def main() -> None:
     # Generate a title based on the transcript (LLM when available).
     channel_name = str(args.channel_name or "").strip() or "Brutally Honest Review"
     title = str(args.title or "").strip()
+    vt = (str(args.video_type) or "review").strip().lower()
+    cleaned_topic_title = ""
+    shorts_overlay_stamp: str | None = None
     if not title:
         # Prefer a non-spoilery, non-revealing generic title when topic is provided.
         if args.topic:
             topic = str(args.topic)
             # Light normalization for common patterns.
             topic = topic.replace("(TV series)", "").replace("TV series", "").strip(" -|:")
-            title = f"Brutally Honest Review of {topic}".strip()
+            cleaned_topic_title = topic
+            # If the user provides a topic hint, use it as the title (clean + consistent).
+            title = cleaned_topic_title
 
         from .llm_storyboard import generate_video_title_with_llm, generate_video_title_fallback
 
@@ -280,13 +304,14 @@ def main() -> None:
                     segments,
                     topic=args.topic,
                     channel_name=channel_name,
+                    video_type=vt,
                     model=args.llm_model,
                 )
             except Exception:
                 title = ""
 
         if not title:
-            title = generate_video_title_fallback(args.audio, topic=args.topic)
+            title = generate_video_title_fallback(args.audio, topic=args.topic, video_type=vt)
 
     try:
         (out_dir / "title.txt").write_text(title + "\n", encoding="utf-8")
@@ -307,16 +332,54 @@ def main() -> None:
                 model=args.llm_model,
             )
             write_youtube_metadata_text(out_dir, pkg)
+            shorts_overlay_stamp = pkg.thumbnail_stamp_text
 
             # Thumbnail background comes from a chosen slide asset.
             thumb_slide = slides[max(0, min(len(slides) - 1, int(pkg.thumbnail_slide_index)))]
             thumb_path = out_dir / "thumbnail.png"
+
+            bg_img = thumb_slide.image_path
+            # For explainer/shorts, slides may be rendered card_XX.png with LLM text.
+            # For Shorts thumbnails, prefer the raw downloaded image (sXX_*.png).
+            if vt == "shorts":
+                try:
+                    from .youtube import _try_find_raw_for_card
+                    from pathlib import Path as _P
+
+                    raw = _try_find_raw_for_card(_P(bg_img))
+                    if raw is not None:
+                        bg_img = str(raw)
+                except Exception:
+                    pass
             create_thumbnail(
                 out_path=thumb_path,
-                background_image=thumb_slide.image_path,
-                text="Brutally Honest Review",
+                background_image=bg_img,
+                text=(cleaned_topic_title or ("Brutally Honest Review" if vt == "review" else str(pkg.title or title))),
                 verdict_text=pkg.verdict_label,
                 stamp_text=pkg.thumbnail_stamp_text,
+                match_video_frame=False,
+                width=(int(args.width) if vt == "shorts" else 1280),
+                height=(int(args.height) if vt == "shorts" else 720),
+                theme=("highlight" if vt == "shorts" else "default"),
+                show_title=(vt != "shorts"),
+            )
+        except Exception:
+            pass
+
+    # Shorts: keep a persistent title+stamp overlay throughout the entire video.
+    if vt == "shorts" and slides:
+        try:
+            from .youtube import overlay_shorts_title_and_stamp
+
+            overlay_title = cleaned_topic_title or title
+        slides = overlay_shorts_title_and_stamp(
+                slides,
+                out_dir=out_dir / "slides_overlay",
+                title=overlay_title,
+                stamp_text=shorts_overlay_stamp,
+                width=int(args.width),
+                height=int(args.height),
+            show_title=False,
             )
         except Exception:
             pass

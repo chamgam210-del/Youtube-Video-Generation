@@ -104,7 +104,7 @@ with col_left:
     transition_seconds = st.slider("Transition seconds", min_value=0.0, max_value=1.0, value=0.35, step=0.05)
 
     st.subheader("3) Audio mix")
-    bgm_preset = st.selectbox("BGM preset", options=["elevator", "ambient", "(none)"], index=0)
+    bgm_preset = st.selectbox("BGM preset", options=["elevator", "ambient", "creepy", "(none)"], index=0)
     bgm_volume = st.slider("BGM volume", min_value=0.0, max_value=0.30, value=0.16, step=0.01)
     bgm_duck = st.checkbox("Ducking (reduce BGM under narration)", value=True)
 
@@ -214,6 +214,15 @@ with col_right:
         if vt == "shorts":
             vid_w, vid_h = (1080, 1920)
 
+        # Shorts defaults: max 4 slides, no transitions.
+        run_max_images = int(max_images)
+        run_transition = transition
+        run_transition_seconds = float(transition_seconds)
+        if vt == "shorts":
+            run_max_images = min(run_max_images, 4)
+            run_transition = "none"
+            run_transition_seconds = 0.0
+
         # Pipeline
         with st.status("Running pipeline…", expanded=True) as status:
             st.write("Planning slides, searching images, writing timeline…")
@@ -224,7 +233,7 @@ with col_right:
                 video_type=vt,
                 image_provider=image_provider,
                 serpapi_api_key=os.getenv("SERPAPI_API_KEY"),
-                max_images=int(max_images),
+                max_images=int(run_max_images),
                 min_seg_seconds=float(min_seg_seconds),
                 whisper_model="small",
                 min_image_width=900,
@@ -281,7 +290,8 @@ with col_right:
             if not title_txt and (topic or "").strip():
                 cleaned = _clean_topic_for_title(str(topic))
                 if cleaned:
-                    title_txt = f"Brutally Honest Review of {cleaned}".strip()
+                    # If user provides a topic hint, use it as the title (clean + consistent).
+                    title_txt = cleaned
 
             if not title_txt and segments:
                 try:
@@ -291,6 +301,7 @@ with col_right:
                         segments,
                         topic=topic or None,
                         channel_name=str(channel_name or "").strip() or "Brutally Honest Review",
+                        video_type=vt,
                         model="gpt-4o-mini",
                     )
                 except Exception:
@@ -300,9 +311,12 @@ with col_right:
                 try:
                     from videogenerator.llm_storyboard import generate_video_title_fallback
 
-                    title_txt = generate_video_title_fallback(str(saved_audio), topic=topic or None)
+                    title_txt = generate_video_title_fallback(str(saved_audio), topic=topic or None, video_type=vt)
                 except Exception:
-                    title_txt = f"Brutally Honest Review of {saved_audio.stem}".strip()
+                    if vt == "review":
+                        title_txt = f"Brutally Honest Review of {saved_audio.stem}".strip()
+                    else:
+                        title_txt = saved_audio.stem.replace("_", " ").strip()
 
             try:
                 (out_dir / "title.txt").write_text(title_txt + "\n", encoding="utf-8")
@@ -313,7 +327,13 @@ with col_right:
             slides_to_render = slides
             intro_s = max(0.0, float(intro_seconds))
             outro_s = max(0.0, float(outro_seconds))
-            if intro_s > 0.0 or outro_s > 0.0:
+
+            # Shorts: no channel intro/outro. Start immediately on slide 0.
+            if vt == "shorts":
+                intro_s = 0.0
+                outro_s = 0.0
+
+            if (vt != "shorts") and (intro_s > 0.0 or outro_s > 0.0):
                 try:
                     from videogenerator.branding import create_branding_assets
 
@@ -372,6 +392,66 @@ with col_right:
             st.write(f"Channel: {str(channel_name or '').strip() or 'Brutally Honest Review'}")
             st.write(f"Title: {title_txt}")
 
+            # For Shorts we keep a persistent title+stamp overlay throughout the video.
+            pkg = None
+            # Always generate a thumbnail for Shorts (no LLM unless YouTube metadata is enabled).
+            if vt == "shorts" or youtube_metadata:
+                try:
+                    # Avoid LLM calls unless user explicitly asked for youtube metadata.
+                    segs_for_pkg = segments if youtube_metadata else None
+                    pkg = generate_youtube_package(
+                        segs_for_pkg,
+                        slides=slides,
+                        topic=topic or None,
+                        channel_name=channel_name,
+                        title=title_txt,
+                        video_type=vt,
+                    )
+                    idx = max(0, min(len(slides) - 1, int(pkg.thumbnail_slide_index))) if pkg else 0
+                    bg = Path(slides[idx].image_path)
+                    if not bg.is_absolute():
+                        bg = (workspace / bg).resolve()
+
+                    if vt == "shorts":
+                        try:
+                            from videogenerator.youtube import _try_find_raw_for_card
+
+                            raw = _try_find_raw_for_card(bg)
+                            if raw is not None:
+                                bg = raw
+                        except Exception:
+                            pass
+                    create_thumbnail(
+                        out_path=out_dir / "thumbnail.png",
+                        background_image=bg,
+                        text=title_txt,
+                        verdict_text=(pkg.verdict_label if pkg else None),
+                        stamp_text=(pkg.thumbnail_stamp_text if pkg else None),
+                        match_video_frame=False,
+                        width=int(vid_w),
+                        height=int(vid_h),
+                        theme=("highlight" if vt == "shorts" else "default"),
+                        show_title=(vt != "shorts"),
+                    )
+                except Exception:
+                    pkg = None
+
+            if vt == "shorts":
+                try:
+                    from videogenerator.youtube import overlay_shorts_title_and_stamp
+
+                    slides_to_render = overlay_shorts_title_and_stamp(
+                        slides_to_render,
+                        out_dir=out_dir / "slides_overlay",
+                        title=title_txt,
+                        stamp_text=(pkg.thumbnail_stamp_text if pkg else None),
+                        width=int(vid_w),
+                        height=int(vid_h),
+                           show_title=False,
+                    )
+                except Exception:
+                    pass
+
             st.write("Rendering MP4…")
             out_mp4 = out_dir / "video.mp4"
             render_slideshow(
@@ -388,21 +468,22 @@ with col_right:
                 bgm_preset=None if bgm_preset == "(none)" else bgm_preset,
                 intro_seconds=float(intro_s),
                 outro_seconds=float(outro_s),
-                transition=None if transition == "none" else transition,
-                transition_seconds=float(transition_seconds),
+                transition=None if run_transition == "none" else run_transition,
+                transition_seconds=float(run_transition_seconds),
                 ken_burns=False,
             )
 
             if youtube_metadata:
                 st.write("Generating YouTube metadata + thumbnail…")
-                pkg = generate_youtube_package(
-                    segments,
-                    slides=slides,
-                    topic=topic or None,
-                    channel_name=channel_name,
-                    title=title_txt,
-                    video_type=vt,
-                )
+                if pkg is None:
+                    pkg = generate_youtube_package(
+                        segments,
+                        slides=slides,
+                        topic=topic or None,
+                        channel_name=channel_name,
+                        title=title_txt,
+                        video_type=vt,
+                    )
                 write_youtube_metadata_text(out_dir, pkg)
 
                 st.write(
@@ -413,18 +494,21 @@ with col_right:
                     }
                 )
 
-                idx = max(0, min(len(slides) - 1, int(pkg.thumbnail_slide_index)))
-                bg = Path(slides[idx].image_path)
-                if not bg.is_absolute():
-                    bg = (workspace / bg).resolve()
+                # Thumbnail already created above for Shorts; for non-shorts regenerate here.
+                if vt != "shorts":
+                    idx = max(0, min(len(slides) - 1, int(pkg.thumbnail_slide_index)))
+                    bg = Path(slides[idx].image_path)
+                    if not bg.is_absolute():
+                        bg = (workspace / bg).resolve()
 
-                create_thumbnail(
-                    out_path=out_dir / "thumbnail.png",
-                    background_image=bg,
-                    text=str(channel_name or "").strip() or "Brutally Honest Review",
-                    verdict_text=pkg.verdict_label,
-                    stamp_text=pkg.thumbnail_stamp_text,
-                )
+                    create_thumbnail(
+                        out_path=out_dir / "thumbnail.png",
+                        background_image=bg,
+                        text=title_txt,
+                        verdict_text=pkg.verdict_label,
+                        stamp_text=pkg.thumbnail_stamp_text,
+                        match_video_frame=False,
+                    )
 
             if verify_video:
                 st.write("Verifying MP4…")

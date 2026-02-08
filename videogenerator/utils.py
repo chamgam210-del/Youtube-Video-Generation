@@ -4,7 +4,10 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .models import Slide
 
 
 _STOPWORDS = {
@@ -111,3 +114,97 @@ def env_truthy(name: str, default: bool = False) -> bool:
     if val is None:
         return default
     return val.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def enforce_first_slide_seconds(
+    slides: list["Slide"],
+    *,
+    first_s: float,
+) -> list["Slide"]:
+    """Force slide[0] duration to first_s seconds.
+
+    Recomputes slide start/end times sequentially and keeps the final end time unchanged.
+    If first_s is too large to fit, it is capped to leave at least 0.1s for each remaining slide.
+    """
+
+    if not slides:
+        return slides
+
+    try:
+        from .models import Slide  # local import to avoid cycles
+    except Exception:
+        return slides
+
+    ordered = sorted(slides, key=lambda s: float(s.start))
+    if len(ordered) == 1:
+        s0 = ordered[0]
+        end = float(s0.start) + max(0.1, float(first_s))
+        return [
+            Slide(
+                start=float(s0.start),
+                end=end,
+                image_path=s0.image_path,
+                query=s0.query,
+                source_page=s0.source_page,
+                image_url=s0.image_url,
+                license_name=s0.license_name,
+                license_url=s0.license_url,
+                attribution=s0.attribution,
+            )
+        ]
+
+    total_end = float(ordered[-1].end)
+    n = len(ordered)
+    target_first = max(0.1, float(first_s))
+
+    # Original per-slide durations.
+    durs = [max(0.1, float(s.end) - float(s.start)) for s in ordered]
+    # Cap target to fit remaining minimum durations.
+    max_first = max(0.1, total_end - (0.1 * float(n - 1)))
+    durs[0] = min(max_first, target_first)
+
+    out: list[Slide] = []
+    cur = 0.0
+    # Rebuild all but last; last is stretched/compressed to hit total_end.
+    for i in range(n - 1):
+        dur = max(0.1, float(durs[i]))
+        # Leave room for the remaining slides (at least 0.1s each).
+        remaining_min = 0.1 * float((n - 1) - i)
+        end = cur + dur
+        if end > (total_end - remaining_min):
+            end = max(cur + 0.1, total_end - remaining_min)
+
+        s = ordered[i]
+        out.append(
+            Slide(
+                start=float(cur),
+                end=float(end),
+                image_path=s.image_path,
+                query=s.query,
+                source_page=s.source_page,
+                image_url=s.image_url,
+                license_name=s.license_name,
+                license_url=s.license_url,
+                attribution=s.attribution,
+            )
+        )
+        cur = float(end)
+
+    last = ordered[-1]
+    last_start = cur
+    last_end = max(last_start + 0.1, total_end)
+    out.append(
+        Slide(
+            start=float(last_start),
+            end=float(last_end),
+            image_path=last.image_path,
+            query=last.query,
+            source_page=last.source_page,
+            image_url=last.image_url,
+            license_name=last.license_name,
+            license_url=last.license_url,
+            attribution=last.attribution,
+        )
+    )
+
+    return out

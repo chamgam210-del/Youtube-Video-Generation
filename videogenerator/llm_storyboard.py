@@ -175,27 +175,19 @@ def plan_slides_with_llm(
     ]
 
     system = (
-        "You are a video editor creating a slideshow plan for a YouTube review channel. "
-        "Your job: break the transcript into a small number of background image segments, each with (start,end) and a search query. "
+        "You are a video editor creating a slideshow plan. "
+        "Your job: identify the MAIN TOPICS discussed and distribute slides across those topics. "
         "Return ONLY valid JSON (no markdown). "
         "The JSON must be an array of objects with keys: start, end, query. "
-        "Optionally, objects may include: topic_shift (boolean). "
+        "Optionally, objects may include: topic (string), topic_shift (boolean). "
         "Times are seconds; 0 <= start < end <= audio_duration. "
-        "Use at most max_images slides. "
+        "Use AT MOST max_images slides, but you may use fewer if the transcript has fewer major topic shifts. "
+        "Hard rule: your slides MUST cover the full audio: first start=0 and the final end=audio_duration (within 0.2s). "
         "Queries must be short, concrete search keywords for finding real photos/stills suitable as background visuals. "
         "The query MUST reflect what is being discussed in that exact time window (characters/actors/scenes/setting/themes), not meta commentary. "
         "Avoid channel/creator names and avoid generic queries like 'best TV shows 2025' unless the transcript is explicitly about that. "
+        "If the transcript is about a TV series, queries should include keywords like 'TV series still', 'cast', or 'scene still'. "
         "Hard rule: each query MUST include the topic name unless the segment clearly shifts topics; in that case set topic_shift=true and you may omit the topic. "
-        "Hard rule: query must follow one of these templates (fill placeholders as needed): "
-        "1) '<TOPIC> TV series stills' "
-        "2) '<TOPIC> Apple TV still' "
-        "3) '<TOPIC> cast <ACTOR NAME> still' "
-        "4) '<TOPIC> <CHARACTER NAME> still' "
-        "5) '<TOPIC> office cubicles corporate dystopia' "
-        "6) '<TOPIC> fluorescent hallway office' "
-        "7) '<TOPIC> corporate office b-roll' "
-        "8) '<TOPIC> retro computer terminal office' "
-        "If exact stills are scarce on Commons, prefer on-theme b-roll templates (5-8) but keep the topic included. "
         "It's OK to reuse the same image for a while; don't switch too frequently."
     )
 
@@ -224,7 +216,7 @@ def plan_slides_with_llm(
         raise RuntimeError("LLM JSON must be an array")
 
     slides: list[StorySlide] = []
-    for item in parsed[: max_images]:
+    for item in parsed:
         if not isinstance(item, dict):
             continue
         start = float(item.get("start"))
@@ -255,7 +247,13 @@ def plan_slides_with_llm(
         cleaned.append(StorySlide(start=start, end=end, query=s.query))
         cur = end
 
-    return cleaned[:max_images]
+    cleaned = cleaned[:max_images]
+    # Ensure full coverage: stretch last slide to audio end.
+    if cleaned:
+        last = cleaned[-1]
+        cleaned[-1] = StorySlide(start=last.start, end=float(audio_duration), query=last.query)
+
+    return cleaned
 
 
 def classify_transcript_kind_with_llm(
@@ -401,7 +399,8 @@ def plan_rich_slides_with_llm(
         "JSON must be an array of objects with keys: start, end, query, headline. "
         "Optional: subhead. "
         "Times are seconds; 0 <= start < end <= audio_duration. "
-        "Use at most max_slides slides. "
+        "Use AT MOST max_slides slides, but you may use fewer if the narration has fewer major topic shifts. "
+        "Hard rule: your slides MUST cover the full audio: first start=0 and the final end=audio_duration (within 0.2s). "
         "query must be short search keywords for finding real photos/stills suitable as background visuals. "
         "headline must be a short on-screen caption (max 8 words) that matches what is being said in that time window. "
         "If the content is list-like (e.g. theories), each slide can represent one item. "
@@ -438,7 +437,7 @@ def plan_rich_slides_with_llm(
         raise RuntimeError("LLM JSON must be an array")
 
     slides: list[RichStorySlide] = []
-    for item in parsed[: max_slides]:
+    for item in parsed:
         if not isinstance(item, dict):
             continue
         start = float(item.get("start"))
@@ -468,7 +467,18 @@ def plan_rich_slides_with_llm(
         cleaned.append(RichStorySlide(start=start, end=end, query=s.query, headline=s.headline, subhead=s.subhead))
         cur = end
 
-    return cleaned[:max_slides]
+    cleaned = cleaned[:max_slides]
+    if cleaned:
+        last = cleaned[-1]
+        cleaned[-1] = RichStorySlide(
+            start=last.start,
+            end=float(audio_duration),
+            query=last.query,
+            headline=last.headline,
+            subhead=last.subhead,
+        )
+
+    return cleaned
 
 
 def generate_video_title_with_llm(
@@ -476,6 +486,7 @@ def generate_video_title_with_llm(
     *,
     topic: str | None,
     channel_name: str,
+    video_type: str = "review",
     model: str = "gpt-4o-mini",
 ) -> str:
     """Generate a YouTube-friendly title based on the transcript.
@@ -491,8 +502,9 @@ def generate_video_title_with_llm(
     joined = " ".join((s.text or "").strip() for s in segments if (s.text or "").strip())
     transcript_snippet = joined[:4000]
 
+    vt = (video_type or "review").strip().lower()
     system = (
-        "You are a YouTube video producer for a review channel. "
+        "You are a YouTube video producer. "
         "Write ONE punchy, click-worthy title based on the provided transcript snippet. "
         "Return ONLY valid JSON (no markdown). Schema: {\"title\": <string>}. "
         "Hard rules: "
@@ -500,12 +512,15 @@ def generate_video_title_with_llm(
         "- Do NOT include the channel name. "
         "- Avoid profanity; keep it advertiser-safe. "
         "- No hashtags, no quotes around the whole title, no emojis. "
-        "- It must reflect the transcript's actual stance/themes." 
+        "- It must reflect the transcript's actual stance/themes. "
+        "- If this is NOT a review, do NOT include words like 'review' or 'verdict'. "
+        "- Do NOT merely echo the topic_hint verbatim; rewrite into a human-friendly title." 
     )
 
     user = {
         "channel_name": channel_name,
         "topic_hint": topic or "",
+        "video_type": vt,
         "transcript_snippet": transcript_snippet,
     }
 
@@ -534,11 +549,54 @@ def generate_video_title_with_llm(
     return title
 
 
-def generate_video_title_fallback(audio_path: str | Path, *, topic: str | None) -> str:
+def generate_video_title_fallback(audio_path: str | Path, *, topic: str | None, video_type: str = "review") -> str:
+    vt = (video_type or "review").strip().lower()
+
     t = (topic or "").strip()
     if t:
-        return f"{t} Review"
+        cleaned = (
+            t.replace("(TV series)", "")
+            .replace("TV series", "")
+            .replace("tv series", "")
+            .replace("_", " ")
+            .replace("-", " ")
+            .strip(" -|:")
+        )
+        # Fix common keyword clumps.
+        cleaned_l = cleaned.lower()
+        cleaned_l = cleaned_l.replace("conspiracytheories", "conspiracy theories")
+        cleaned_l = cleaned_l.replace("toptheories", "top theories")
+        cleaned = cleaned_l
+
+        import re
+
+        tokens = [x for x in re.split(r"[^a-z0-9]+", cleaned.lower()) if x]
+        stem = Path(audio_path).stem.lower().replace("_", " ")
+
+        # If we can detect a main proper topic word (like a show name), build a nicer title.
+        # Keep this intentionally small + heuristic.
+        show = None
+        if "severance" in tokens or "severance" in stem:
+            show = "Severance"
+
+        has_theory = any(k in tokens for k in ("theory", "theories", "conspiracy")) or ("theor" in stem) or ("conspiracy" in stem)
+        if vt != "review" and show and has_theory:
+            return f"{show} Conspiracy Theories"
+
+        # Otherwise, title-case the cleaned hint.
+        cleaned_title = " ".join(w.capitalize() if w else "" for w in cleaned.split()).strip()
+        if vt == "review":
+            return f"{cleaned_title} Review".strip()
+
+        if ("conspiracy" in stem) or ("theor" in stem) or has_theory:
+            # Prefer "<Topic> Conspiracy Theories" structure for non-review.
+            return f"{cleaned_title} Conspiracy Theories".strip()
+        if ("explained" in stem) or ("explainer" in stem) or ("breakdown" in stem) or ("deep" in stem):
+            return f"{cleaned_title} Explained".strip()
+        return cleaned_title.strip() or cleaned_title
 
     p = Path(audio_path)
     stem = p.stem.replace("_", " ").strip()
-    return stem[:80] if stem else "Brutally Honest Review"
+    if vt == "review":
+        return f"{stem[:80]} Review".strip() if stem else "Brutally Honest Review"
+    return stem[:80] if stem else "Video"
