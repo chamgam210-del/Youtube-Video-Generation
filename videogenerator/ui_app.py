@@ -33,8 +33,15 @@ def _load_slides(out_dir: Path) -> list[Slide]:
 def _open_folder(path: Path) -> None:
     # Best-effort local convenience.
     try:
+        path = Path(path).resolve()
         if sys.platform.startswith("win"):
-            os.startfile(str(path))  # type: ignore[attr-defined]
+            # explorer.exe tends to be the most reliable for folders.
+            try:
+                import subprocess
+
+                subprocess.Popen(["explorer", str(path)])
+            except Exception:
+                os.startfile(str(path))  # type: ignore[attr-defined]
         elif sys.platform == "darwin":
             import subprocess
 
