@@ -332,16 +332,23 @@ def create_thumbnail(
                 vt = chosen_stamp
                 if vt:
                     # Stamp.
-                    verdict_font = _pick_font(vt, width, size_hint=int(width * 0.165), max_size=280)
-                    verdict_stroke_w = max(8, width // 75)
                     # Green for verdict, warm yellow for explainer.
                     is_verdict = vt in {"Masterpiece!", "Mehhh!", "Garbage!"}
+
+                    # Reviews: stamp should sit near the bottom, no tilt, smaller but higher contrast.
+                    if is_verdict:
+                        verdict_font = _pick_font(vt, width, size_hint=int(width * 0.115), max_size=220)
+                        verdict_stroke_w = max(10, width // 85)
+                    else:
+                        verdict_font = _pick_font(vt, width, size_hint=int(width * 0.165), max_size=280)
+                        verdict_stroke_w = max(8, width // 75)
+
                     verdict_fill = (0, 200, 83, 255) if is_verdict else (255, 215, 0, 255)
                     verdict_stroke = (0, 0, 0, 255)  # black outline
 
                     verdict_cx = int(width * 0.5)
-                    verdict_cy = int(height * 0.54)
-                    angle_deg = 12  # slight stamp tilt (opposite direction)
+                    verdict_cy = int(height * (0.86 if is_verdict else 0.54))
+                    angle_deg = 0 if is_verdict else 12  # reviews: no tilt; others keep stamped feel
 
                     # Draw on a separate transparent layer, rotate, then composite.
                     stamp_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
@@ -359,6 +366,19 @@ def create_thumbnail(
                     stamp_h = stamp_bbox[3] - stamp_bbox[1]
                     stamp_x = int(verdict_cx - stamp_w / 2)
                     stamp_y = int(verdict_cy - stamp_h / 2)
+
+                    # Backing plate for better contrast (especially on busy backgrounds).
+                    if is_verdict:
+                        pad_x = max(22, int(getattr(verdict_font, "size", 140) * 0.55))
+                        pad_y = max(14, int(getattr(verdict_font, "size", 140) * 0.25))
+                        bx0 = max(0, stamp_x - pad_x)
+                        by0 = max(0, stamp_y - pad_y)
+                        bx1 = min(width, stamp_x + int(stamp_w) + pad_x)
+                        by1 = min(height, stamp_y + int(stamp_h) + pad_y)
+                        rr = max(18, int((by1 - by0) * 0.35))
+                        # subtle shadow
+                        stamp_draw.rounded_rectangle((bx0 + 6, by0 + 7, bx1 + 6, by1 + 7), radius=rr, fill=(0, 0, 0, 140))
+                        stamp_draw.rounded_rectangle((bx0, by0, bx1, by1), radius=rr, fill=(0, 0, 0, 170))
                     stamp_draw.multiline_text(
                         (stamp_x, stamp_y),
                         vt,
@@ -388,7 +408,8 @@ def create_thumbnail(
                     if stamp_rot.mode != "RGBA":
                         stamp_rot = stamp_rot.convert("RGBA")
                     alpha = stamp_rot.split()[-1]
-                    alpha = alpha.point(lambda a: int(a * 0.92))
+                    alpha_scale = 1.0 if is_verdict else 0.92
+                    alpha = alpha.point(lambda a: int(a * alpha_scale))
                     stamp_rot.putalpha(alpha)
 
                     # Paste rotated stamp centered at (verdict_cx, verdict_cy).

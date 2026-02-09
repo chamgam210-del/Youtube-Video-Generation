@@ -70,6 +70,32 @@ def make_shorts_from_review_highlights(
 
     audio_duration = get_audio_duration_seconds(review_audio_path)
 
+    # Determine the review verdict label to use as the Shorts stamp.
+    verdict_stamp: str | None = None
+    try:
+        from .youtube import generate_youtube_package
+
+        review_slides = _load_slides(review_out_dir / "timeline.json")
+        title_txt = ""
+        try:
+            title_txt = (review_out_dir / "title.txt").read_text(encoding="utf-8").strip()
+        except Exception:
+            title_txt = ""
+
+        if review_slides:
+            pkg = generate_youtube_package(
+                segments,
+                slides=review_slides,
+                topic=topic,
+                channel_name="Brutally Honest Review",
+                title=(title_txt or review_out_dir.name),
+                video_type="review",
+                model=str(llm_model or "gpt-4o-mini"),
+            )
+            verdict_stamp = str(pkg.verdict_label or "").strip() or None
+    except Exception:
+        verdict_stamp = None
+
     # 1) Pick highlight windows (LLM)
     clips = extract_review_highlights_with_llm(
         segments,
@@ -134,8 +160,8 @@ def make_shorts_from_review_highlights(
             out_path=shorts_dir / "thumbnail.png",
             background_image=bg,
             text="",
-            verdict_text=None,
-            stamp_text=None,
+            verdict_text=verdict_stamp,
+            stamp_text=verdict_stamp,
             match_video_frame=False,
             width=1080,
             height=1920,
@@ -147,7 +173,7 @@ def make_shorts_from_review_highlights(
             slides,
             out_dir=shorts_dir / "slides_overlay",
             title="",
-            stamp_text=None,
+            stamp_text=verdict_stamp,
             width=1080,
             height=1920,
             show_title=False,
