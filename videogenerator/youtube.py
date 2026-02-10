@@ -127,9 +127,9 @@ def _generate_with_llm(
         "Tags: 10-18 items, no hashtags, keep them short. "
         "thumbnail_slide_index must be one of the provided slide choice i values; "
         "prefer a slide that is likely to show a character/actor (stills, cast) based on its query. "
-        "verdict_label MUST be exactly one of: 'Masterpiece!', 'Mehhh!', 'Garbage!' OR empty string ''. "
+        "verdict_label MUST be exactly one of: 'Masterpiece!', 'Decent', 'Mehhh!', 'Garbage!' OR empty string ''. "
         "thumbnail_stamp_text MUST be null OR exactly one of: 'TOP THEORIES', 'EXPLAINED', 'BREAKDOWN', 'DEEP DIVE'. "
-        "If this is a review video: set verdict_label to one of the three labels and set thumbnail_stamp_text=null. "
+        "If this is a review video: set verdict_label to one of the review labels and set thumbnail_stamp_text=null. "
         "If this is an explainer/list/theories video: set verdict_label='' and set thumbnail_stamp_text to the best stamp label. "
         "Decide based on the transcript and the provided video_type hint."
     )
@@ -174,7 +174,7 @@ def _generate_with_llm(
 
     vt = (video_type or "review").strip().lower()
     if vt == "review":
-        if verdict not in {"Masterpiece!", "Mehhh!", "Garbage!"}:
+        if verdict not in {"Masterpiece!", "Decent", "Mehhh!", "Garbage!"}:
             verdict = _fallback_verdict_label(segments=segments)
         stamp_text = None
     else:
@@ -333,7 +333,7 @@ def create_thumbnail(
                 if vt:
                     # Stamp.
                     # Green for verdict, warm yellow for explainer.
-                    is_verdict = vt in {"Masterpiece!", "Mehhh!", "Garbage!"}
+                    is_verdict = vt in {"Masterpiece!", "Decent", "Mehhh!", "Garbage!"}
 
                     # Reviews: stamp should sit near the bottom, no tilt, smaller but higher contrast.
                     if is_verdict:
@@ -913,7 +913,8 @@ def _fallback_verdict_label(*, segments: list[TranscriptSegment] | None) -> str:
         return "Masterpiece!"
     if neg and not pos:
         return "Garbage!"
-    return "Mehhh!"
+    # Neutral/mixed: treat as "Decent" (explicitly requested).
+    return "Decent"
 
 
 def _fallback_stamp_text(*, topic: str | None, title: str) -> str:
