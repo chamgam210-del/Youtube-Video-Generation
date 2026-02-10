@@ -271,6 +271,10 @@ def create_thumbnail(
         draw = ImageDraw.Draw(im)
 
         theme_norm = (theme or "default").strip().lower()
+
+        # Visual rule: if a review is merely "Decent", show no stamp at all.
+        if verdict_text is not None and str(verdict_text).strip().lower() == "decent":
+            verdict_text = None
         if theme_norm in {"shorts", "highlight", "highlight_pills"}:
             # Reference-style: highlighted title + stamp boxes.
             _draw_highlight_title_and_stamp(
@@ -333,7 +337,7 @@ def create_thumbnail(
                 if vt:
                     # Stamp.
                     # Green for verdict, warm yellow for explainer.
-                    is_verdict = vt in {"Masterpiece!", "Decent", "Mehhh!", "Garbage!"}
+                    is_verdict = vt in {"Masterpiece!", "Mehhh!", "Garbage!"}
 
                     # Reviews: stamp should sit near the bottom, no tilt, smaller but higher contrast.
                     if is_verdict:
@@ -431,16 +435,23 @@ def overlay_shorts_title_and_stamp(
     out_dir: str | Path,
     title: str,
     stamp_text: str | None,
+    footer_text: str | None = None,
     width: int,
     height: int,
     show_title: bool = True,
+    prefer_raw_first_scene: bool = True,
 ) -> list[Slide]:
     """For Shorts: bake a persistent overlay (stamp, optionally title) onto each slide image."""
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    label = (stamp_text or "").strip() or "TOP THEORIES"
+    raw_label = (stamp_text or "").strip()
+    # Visual rule: if a review verdict is "Decent", show no stamp.
+    if raw_label.lower() == "decent":
+        label = ""
+    else:
+        label = raw_label or "TOP THEORIES"
     base_title = " ".join((title or "").split()).strip() if show_title else ""
 
     out: list[Slide] = []
@@ -449,7 +460,7 @@ def overlay_shorts_title_and_stamp(
             src = Path(s.image_path)
             # Special case: for the first scene, prefer the raw downloaded image (s00_*.png)
             # instead of the card_00.png (which contains LLM scene text).
-            if i == 0:
+            if i == 0 and bool(prefer_raw_first_scene):
                 raw0 = _try_find_raw_for_card(src)
                 if raw0 is not None:
                     src = raw0
@@ -463,6 +474,7 @@ def overlay_shorts_title_and_stamp(
                 height=height,
                 title=cur_title,
                 stamp=label,
+                footer=str(footer_text or "").strip(),
             )
             out.append(
                 Slide(
@@ -514,6 +526,7 @@ def _overlay_highlight_pills(
     height: int,
     title: str,
     stamp: str,
+    footer: str = "",
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -540,7 +553,7 @@ def _overlay_highlight_pills(
             im = im.resize((int(width), int(height)), Image.Resampling.LANCZOS)
 
         base = im.convert("RGBA")
-        _draw_highlight_pills_on_image(base, title=title, stamp=stamp)
+        _draw_highlight_pills_on_image(base, title=title, stamp=stamp, footer=footer)
         base.convert("RGB").save(out_path, format="PNG")
 
 
@@ -594,11 +607,11 @@ def _draw_highlight_title_and_stamp(
     """Draw the Shorts-style highlight title+stamp directly onto an image."""
 
     base = im.convert("RGBA")
-    _draw_highlight_pills_on_image(base, title=title, stamp=stamp)
+    _draw_highlight_pills_on_image(base, title=title, stamp=stamp, footer="")
     im.paste(base.convert("RGB"))
 
 
-def _draw_highlight_pills_on_image(base: Image.Image, *, title: str, stamp: str) -> None:
+def _draw_highlight_pills_on_image(base: Image.Image, *, title: str, stamp: str, footer: str) -> None:
     draw = ImageDraw.Draw(base, "RGBA")
 
     w, h = base.size
@@ -640,9 +653,9 @@ def _draw_highlight_pills_on_image(base: Image.Image, *, title: str, stamp: str)
         # highlight behind letters
         draw.rounded_rectangle((rx0, ry0, rx1, ry1), radius=r, fill=fill)
 
-        # text shadow
-        draw.text((cx + 2, int(y) + 3), line, font=font, fill=(0, 0, 0, 140), anchor="ma")
-        draw.text((cx, int(y)), line, font=font, fill=text_fill, anchor="ma")
+        # text shadow (use a top-aligned anchor to match bbox math)
+        draw.text((cx + 2, int(y) + 3), line, font=font, fill=(0, 0, 0, 140), anchor="mt")
+        draw.text((cx, int(y)), line, font=font, fill=text_fill, anchor="mt")
         return int(y) + int(getattr(font, "size", 64) * 1.05)
 
     # Title: wrap and draw line-by-line with per-line highlight.
@@ -685,6 +698,27 @@ def _draw_highlight_pills_on_image(base: Image.Image, *, title: str, stamp: str)
             sy = _draw_highlighted_line(line=ln, font=stamp_font, cx=w // 2, y=sy, fill=stamp_bg)
             if idx < len(stamp_lines) - 1:
                 sy += int(sgap)
+
+    footer = " ".join((footer or "").split()).strip()
+    if footer:
+        footer_scale = 0.75
+        footer_wrapped, footer_font = _fit_text_in_box(
+            draw,
+            footer,
+            max_width=int(w * 0.92),
+            max_height=int(h * 0.10),
+            max_lines=2,
+            size_max=max(18, int(min(78, int(w * 0.075)) * footer_scale)),
+            size_min=max(14, int(34 * footer_scale)),
+        )
+        footer_lines = [ln for ln in (footer_wrapped or "").splitlines() if ln.strip()]
+        # Keep it comfortably above the bottom safe area.
+        fy = int(h * 0.865)
+        fgap = max(4, int(getattr(footer_font, "size", 44) * 0.16))
+        for idx, ln in enumerate(footer_lines):
+            fy = _draw_highlighted_line(line=ln, font=footer_font, cx=w // 2, y=fy, fill=title_bg)
+            if idx < len(footer_lines) - 1:
+                fy += int(fgap)
 
 
 def _pick_font(
@@ -814,7 +848,7 @@ def _fit_title_text(
     max_text_h = int(height * 0.28)
 
     # Start big and step down until it fits.
-    max_size = min(160, int(width * 0.10))
+    max_size = min(150, int(width * 0.095))
     min_size = 44
     step = 4
 

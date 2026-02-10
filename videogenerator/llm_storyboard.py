@@ -210,6 +210,125 @@ def _clean_highlight_clips(
     return cleaned
 
 
+def _detect_spoiler_warning_clip(
+    segments: list[TranscriptSegment],
+    *,
+    audio_duration: float,
+    detect_within_seconds: float = 60.0,
+    detect_jitter_seconds: float = 5.0,
+    target_clip_seconds: float = 40.0,
+) -> HighlightClip | None:
+    """Detect a spoken spoiler warning early in the review.
+
+    If detected, return a single clip from t=0 to shortly after the warning,
+    so the Shorts cut stays coherent and ends right after the warning is said.
+    """
+
+    dur = max(0.0, float(audio_duration))
+    if dur <= 0.0:
+        return None
+
+    # User intent: if a spoiler warning is detected by ~60s, make a short that ends
+    # right after the warning. Allow small jitter since timestamps can drift.
+    scan_until = min(dur, float(detect_within_seconds) + float(detect_jitter_seconds))
+    if scan_until <= 0.0:
+        return None
+
+    def _norm(txt: str) -> str:
+        return " ".join(str(txt or "").lower().replace("-", " ").split())
+
+    def _is_negative_context(txt: str) -> bool:
+        # Avoid false positives like "spoiler-free" or "no spoilers".
+        return (
+            "spoiler free" in txt
+            or "spoiler-free" in txt
+            or "spoilerfree" in txt
+            or "no spoilers" in txt
+            or "without spoilers" in txt
+        )
+
+    def _is_warning(txt: str) -> bool:
+        if _is_negative_context(txt):
+            return False
+        if "spoiler warning" in txt or "spoiler alert" in txt:
+            return True
+        if "spoiler" in txt and ("warning" in txt or "alert" in txt):
+            return True
+        # Common phrasing: "from here on, spoilers" / "from here it's spoilers".
+        if ("from here" in txt or "from now" in txt) and ("spoiler" in txt or "spoilers" in txt):
+            return True
+        return False
+
+    # Find earliest warning segment within the first minute.
+    idx = None
+    for i, seg in enumerate(segments[:300]):
+        try:
+            if float(seg.start) > scan_until:
+                break
+        except Exception:
+            continue
+        txt = _norm(getattr(seg, "text", ""))
+        if not txt:
+            continue
+        if _is_warning(txt):
+            idx = i
+            break
+
+    if idx is None:
+        return None
+
+    # Include the entire warning utterance, possibly spanning adjacent segments.
+    warning_end = 0.0
+    try:
+        warning_end = float(segments[idx].end)
+    except Exception:
+        warning_end = 0.0
+
+    j = idx + 1
+    while j < len(segments):
+        try:
+            if float(segments[j].start) > scan_until:
+                break
+        except Exception:
+            break
+
+        gap = 999.0
+        try:
+            gap = float(segments[j].start) - float(segments[j - 1].end)
+        except Exception:
+            gap = 999.0
+
+        nxt = _norm(getattr(segments[j], "text", ""))
+        if gap <= 0.75 and ("spoiler" in nxt or "warning" in nxt or "alert" in nxt):
+            try:
+                warning_end = max(warning_end, float(segments[j].end))
+            except Exception:
+                pass
+            j += 1
+            continue
+        break
+
+    # End should include the spoiler warning being spoken.
+    end_after_warning = min(dur, max(0.0, warning_end + 0.50))
+    if end_after_warning <= 0.25:
+        return None
+
+    # User request: the Shorts cut should literally be the beginning of the full review.
+    # If a spoiler warning is detected early (within ~1 minute), cap the intro cut at ~40s.
+    start = 0.0
+    cutoff = float(target_clip_seconds)
+    if cutoff > 0:
+        end = min(dur, cutoff)
+    else:
+        # Fallback: end shortly after warning (shouldn't happen with default settings).
+        end = float(end_after_warning)
+
+    if end <= 0.25:
+        return None
+
+    return HighlightClip(start=float(start), end=float(end), reason="Spoiler warning")
+
+
 def extract_review_highlights_with_llm(
     segments: list[TranscriptSegment],
     *,
@@ -225,17 +344,22 @@ def extract_review_highlights_with_llm(
     Returns a small set of timestamped clips (start/end in original audio seconds)
     intended to be concatenated into a Shorts-length highlight cut.
     """
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set")
-
     if not segments:
         return []
 
     dur = max(0.0, float(audio_duration))
     if dur <= 0.0:
         return []
+
+    # Special case: if we detect a spoiler warning early, the Shorts should be
+    # the intro up to (and including) the spoiler warning, then stop.
+    spoiler_clip = _detect_spoiler_warning_clip(segments, audio_duration=dur)
+    if spoiler_clip is not None:
+        return [spoiler_clip]
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
 
     # Keep prompt compact: use a limited window of segments (usually merged by caller).
     transcript = [
@@ -250,12 +374,17 @@ def extract_review_highlights_with_llm(
     system = (
         "You are a video editor creating a YouTube Shorts highlight cut from a FULL-LENGTH review. "
         "Pick the MOST IMPORTANT and MOST INTERESTING moments that represent the core points and verdict. "
+        "CRITICAL: the highlight must feel coherent when watched as a single short. "
+        "Prefer ONE contiguous excerpt (a single clip) that stands on its own, instead of stitching unrelated parts. "
+        "If you return multiple clips, they must be in strict chronological order and should be near-adjacent (small gaps) so the cut makes sense. "
+        "Avoid jump-cuts that switch topics abruptly. "
         "Return ONLY valid JSON (no markdown). "
         "Output schema: an array of objects {start: number, end: number, reason: string}. "
         "Rules: 0 <= start < end <= audio_duration. "
         "Return at most max_clips clips, in chronological order, with NO overlaps. "
         "Each clip length should be between min_clip_seconds and max_clip_seconds. "
         "Try to keep the total combined length <= target_total_seconds (never exceed 60 seconds). "
+        "When possible, include a brief lead-in so the first sentence is not mid-thought. "
         "Choose moments that contain the key opinions, comparisons, and final takeaway."
     )
 
@@ -304,6 +433,27 @@ def extract_review_highlights_with_llm(
         min_clip_seconds=float(min_clip_seconds),
         max_clip_seconds=float(max_clip_seconds),
     )
+
+    # Coherence guardrail: if the selected clips have large gaps, prefer a single contiguous excerpt.
+    # Strategy: merge near-adjacent clips; if still disjoint, keep only the first block.
+    merged: list[HighlightClip] = []
+    max_gap_s = 2.25
+    for c in cleaned:
+        if not merged:
+            merged.append(c)
+            continue
+        prev = merged[-1]
+        gap = float(c.start) - float(prev.end)
+        if gap <= max_gap_s:
+            merged[-1] = HighlightClip(start=float(prev.start), end=float(c.end), reason=(prev.reason or c.reason))
+        else:
+            merged.append(c)
+
+    if len(merged) > 1:
+        # Keep only the earliest contiguous block for narrative consistency.
+        merged = [merged[0]]
+
+    cleaned = merged
 
     # Hard cap total length: keep <= target_total_seconds (and never exceed 60s).
     total = 0.0

@@ -49,6 +49,11 @@ def make_shorts_from_review_highlights(
     llm_model: str,
     llm_pick_images: bool,
     reuse_images: bool,
+    bgm_path: str | Path | None = None,
+    bgm_volume: float = 0.10,
+    bgm_duck: bool = True,
+    bgm_generate: bool = False,
+    bgm_preset: str | None = None,
     max_slides: int = 4,
     target_total_seconds: float = 35.0,
 ) -> Path | None:
@@ -67,6 +72,30 @@ def make_shorts_from_review_highlights(
     segments = _load_transcript_segments(transcript_json)
     if not segments:
         return None
+
+    # For image search, avoid polluting the topic with channel-name prefixes.
+    # This improves relevance for movie/show stills.
+    effective_topic = topic
+    try:
+        raw = " ".join(str(topic or "").split()).strip()
+        lowered = raw.lower()
+        for prefix in ["brutally honest review - ", "brutally honest review:", "brutally honest review "]:
+            if lowered.startswith(prefix):
+                raw = raw[len(prefix) :].strip(" -:|")
+                break
+        effective_topic = raw or topic
+    except Exception:
+        effective_topic = topic
+
+    # Auto rule: for garbage reviews, default to clown BGM unless caller chose a BGM option.
+    if (bgm_path is None) and (not bgm_generate) and (bgm_preset is None):
+        try:
+            from .youtube import _fallback_verdict_label
+
+            if _fallback_verdict_label(segments=segments) == "Garbage!":
+                bgm_preset = "clown"
+        except Exception:
+            pass
 
     audio_duration = get_audio_duration_seconds(review_audio_path)
 
@@ -124,7 +153,7 @@ def make_shorts_from_review_highlights(
     run_pipeline(
         audio_path=shorts_audio,
         out_dir=shorts_dir,
-        topic=topic,
+        topic=effective_topic,
         video_type="shorts",
         image_provider=image_provider,
         serpapi_api_key=serpapi_api_key,
@@ -174,9 +203,11 @@ def make_shorts_from_review_highlights(
             out_dir=shorts_dir / "slides_overlay",
             title="",
             stamp_text=verdict_stamp,
+            footer_text="Full Review Click Below",
             width=1080,
             height=1920,
             show_title=False,
+            prefer_raw_first_scene=False,
         )
     except Exception:
         slides_to_render = slides
@@ -193,9 +224,11 @@ def make_shorts_from_review_highlights(
         transition=None,
         transition_seconds=0.0,
         ken_burns=False,
-        bgm_path=None,
-        bgm_generate=False,
-        bgm_preset=None,
+        bgm_path=bgm_path,
+        bgm_volume=float(bgm_volume),
+        bgm_duck=bool(bgm_duck),
+        bgm_generate=bool(bgm_generate),
+        bgm_preset=(None if (bgm_preset is None or str(bgm_preset).strip() == "") else str(bgm_preset)),
     )
 
     return shorts_dir

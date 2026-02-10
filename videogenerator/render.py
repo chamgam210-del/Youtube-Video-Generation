@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import subprocess
+import shutil
 import wave
 from pathlib import Path
 
@@ -27,6 +28,63 @@ def _is_encoder_error(stderr: str) -> bool:
 def _ffmpeg_exe() -> str:
     # imageio-ffmpeg downloads a working ffmpeg binary per-platform
     return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def _bgm_preset_cache_dir() -> Path:
+    d = Path.cwd() / ".cache" / "bgm_presets"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def ensure_bgm_preset_wav(*, preset: str, seconds: float = 32.0) -> Path:
+    """Create (if needed) and return the WAV path for a built-in preset.
+
+    This makes presets tangible .wav files that can be played directly, and lets
+    rendering reuse cached audio instead of regenerating every run.
+    """
+
+    key = str(preset or "").strip().lower()
+    if not key:
+        raise ValueError("preset must be non-empty")
+
+    cache = _bgm_preset_cache_dir()
+    seconds = max(1.0, float(seconds))
+
+    if key in ("ambient", "pad"):
+        # Not a wav file; ambient uses lavfi generation in ffmpeg.
+        raise ValueError("ambient preset is generated in ffmpeg (no wav)")
+
+    if key in ("elevator", "elevator_music"):
+        out = cache / "bgm_elevator.wav"
+        gen = _generate_elevator_music_wav
+        gen_seconds = seconds
+    elif key in ("creepy", "horror", "spooky"):
+        out = cache / "bgm_creepy.wav"
+        gen = _generate_creepy_music_wav
+        gen_seconds = seconds
+    elif key in ("hiphop", "hip_hop", "hip-hop", "hip hop"):
+        out = cache / "bgm_hiphop.wav"
+        gen = _generate_hiphop_music_wav
+        gen_seconds = seconds
+    elif key in ("rnb", "r&b", "rb", "r_b"):
+        out = cache / "bgm_rnb.wav"
+        gen = _generate_rnb_music_wav
+        gen_seconds = seconds
+    elif key in ("clown", "circus", "clown_music", "circus_music", "mocking"):
+        out = cache / "bgm_clown.wav"
+        gen = _generate_clown_music_wav
+        gen_seconds = min(seconds, 24.0)
+    else:
+        raise ValueError(f"Unknown bgm_preset: {preset!r}")
+
+    try:
+        if out.exists() and out.stat().st_size > 4096:
+            return out
+    except Exception:
+        pass
+
+    gen(out_wav=out, seconds=float(gen_seconds))
+    return out
 
 
 def _generate_elevator_music_wav(*, out_wav: Path, seconds: float, sample_rate: int = 44100) -> None:
@@ -123,7 +181,7 @@ def _generate_elevator_music_wav(*, out_wav: Path, seconds: float, sample_rate: 
             # Convert to int16.
             s_l = int(max(-1.0, min(1.0, mix_l)) * 32767)
             s_r = int(max(-1.0, min(1.0, mix_r)) * 32767)
-            wf.writeframesraw(int.to_bytes(s_l & 0xFFFF, 2, "little", signed=False) + int.to_bytes(s_r & 0xFFFF, 2, "little", signed=False))
+            wf.writeframesraw(int.to_bytes(s_l, 2, "little", signed=True) + int.to_bytes(s_r, 2, "little", signed=True))
 
         wf.writeframes(b"")
 
@@ -138,6 +196,7 @@ def _generate_creepy_music_wav(*, out_wav: Path, seconds: float, sample_rate: in
     out_wav.parent.mkdir(parents=True, exist_ok=True)
 
     total_seconds = max(1.0, float(seconds))
+
     total_frames = int(total_seconds * sample_rate)
 
     def soft_clip(x: float) -> float:
@@ -206,10 +265,433 @@ def _generate_creepy_music_wav(*, out_wav: Path, seconds: float, sample_rate: in
 
             s_l = int(max(-1.0, min(1.0, mix_l)) * 32767)
             s_r = int(max(-1.0, min(1.0, mix_r)) * 32767)
-            wf.writeframesraw(
-                int.to_bytes(s_l & 0xFFFF, 2, "little", signed=False)
-                + int.to_bytes(s_r & 0xFFFF, 2, "little", signed=False)
-            )
+            wf.writeframesraw(int.to_bytes(s_l, 2, "little", signed=True) + int.to_bytes(s_r, 2, "little", signed=True))
+
+        wf.writeframes(b"")
+
+
+def _generate_hiphop_music_wav(*, out_wav: Path, seconds: float, sample_rate: int = 44100) -> None:
+    """Generate a loop-friendly hip hop beat bed.
+
+    Deterministic, dependency-free synth: kick + snare + hats + simple bass.
+    Designed to be looped via ffmpeg (-stream_loop -1).
+    """
+
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+
+    bpm = 92.0
+    seconds_per_beat = 60.0 / bpm
+    steps_per_beat = 4  # 16th notes
+    seconds_per_step = seconds_per_beat / steps_per_beat
+
+    bars = 4
+    beats_per_bar = 4
+    loop_seconds = bars * beats_per_bar * seconds_per_beat
+
+    total_seconds = max(1.0, float(seconds))
+    total_frames = int(total_seconds * sample_rate)
+    loop_frames = max(1, int(loop_seconds * sample_rate))
+
+    def soft_clip(x: float) -> float:
+        return math.tanh(x)
+
+    def lcg_noise(n: int) -> float:
+        # Deterministic pseudo-noise in [-1, 1].
+        x = (1103515245 * (n + 12345) + 12345) & 0x7FFFFFFF
+        return (x / 0x7FFFFFFF) * 2.0 - 1.0
+
+    def exp_env(t: float, attack: float, decay: float) -> float:
+        if t < 0:
+            return 0.0
+        if t < attack:
+            return t / max(attack, 1e-6)
+        return math.exp(-(t - attack) / max(decay, 1e-6))
+
+    # 4 bars of 16th-note steps.
+    total_steps = bars * beats_per_bar * steps_per_beat
+    # Kick on 1, the "and" of 2, and 4 (classic-ish feel).
+    kick_steps = {0, 6, 12, 16, 22, 28, 32, 38, 44, 48, 54, 60}
+    # Snare on 2 and 4.
+    snare_steps = {8, 24, 40, 56}
+    # Hats: 8th notes with some 16th fills.
+    hat_steps = set(range(0, total_steps, 2)) | {7, 15, 23, 31, 39, 47, 55, 63}
+
+    # Bass pattern (bar-relative), root-ish notes in Hz (roughly E minor vibe).
+    bass_notes = [41.20, 49.00, 55.00, 49.00]  # E1, G1, A1, G1
+
+    # Small chunked writer for performance.
+    chunk = bytearray()
+    chunk_flush_frames = 4096
+
+    with wave.open(str(out_wav), "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+
+        for frame in range(total_frames):
+            lf = frame % loop_frames
+            t = lf / sample_rate
+
+            step = int(t // seconds_per_step) % total_steps
+            step_t = t - (step * seconds_per_step)
+
+            mix = 0.0
+
+            # Kick: short pitch-swept sine.
+            if step in kick_steps:
+                kt = step_t
+                kenv = exp_env(kt, 0.003, 0.10)
+                # Exponential-ish sweep 90 -> 45 Hz.
+                f0, f1 = 90.0, 45.0
+                sweep = math.exp(-kt / 0.06)
+                kfreq = f1 + (f0 - f1) * sweep
+                mix += 0.85 * kenv * math.sin(2.0 * math.pi * kfreq * t)
+
+            # Snare: noise burst + quiet tone.
+            if step in snare_steps:
+                st = step_t
+                senv = exp_env(st, 0.002, 0.08)
+                noise = lcg_noise(lf) * 0.6 + lcg_noise(lf * 7 + 13) * 0.4
+                # Crude band emphasis: mix some high noise.
+                sn = 0.50 * noise
+                sn += 0.12 * math.sin(2.0 * math.pi * 185.0 * t)
+                mix += 0.55 * senv * sn
+
+            # Hi-hats: very short high-frequency noise clicks.
+            if step in hat_steps:
+                ht = step_t
+                henv = exp_env(ht, 0.001, 0.03)
+                n = lcg_noise(lf * 3 + 17)
+                # Emphasize high end by multiplying with a fast sine.
+                hh = n * math.sin(2.0 * math.pi * 8000.0 * t)
+                mix += 0.18 * henv * hh
+
+            # Bass: 8th-note-ish sustained sub.
+            bass_step = (step // 2)  # 8th note index
+            bass_freq = bass_notes[(bass_step // 4) % len(bass_notes)]
+            bass_phase = t % (2.0 * seconds_per_beat)
+            benv = exp_env(bass_phase, 0.02, 0.35)
+            bass = 0.35 * benv * math.sin(2.0 * math.pi * bass_freq * t)
+            mix += bass
+
+            # Gentle saturation and safety (slightly hotter so it is audible under narration).
+            mix = soft_clip(mix * 1.20)
+
+            s = int(max(-1.0, min(1.0, mix)) * 32767)
+            s_l = s
+            # Tiny stereo widening via alternating phase noise.
+            s_r = int(max(-1.0, min(1.0, soft_clip((mix + 0.02 * lcg_noise(lf * 11 + 5))))) * 32767)
+
+            chunk += int.to_bytes(s_l, 2, "little", signed=True)
+            chunk += int.to_bytes(s_r, 2, "little", signed=True)
+
+            if (frame + 1) % chunk_flush_frames == 0:
+                wf.writeframesraw(chunk)
+                chunk.clear()
+
+        if chunk:
+            wf.writeframesraw(chunk)
+            chunk.clear()
+
+        wf.writeframes(b"")
+
+
+def _generate_rnb_music_wav(*, out_wav: Path, seconds: float, sample_rate: int = 44100) -> None:
+    """Generate a loop-friendly R&B/hip hop style bed.
+
+    Original, deterministic synth beat: swung hats, tight kick/snare, 808-ish sub bass,
+    and a simple electric-piano style chord progression.
+    """
+
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+
+    bpm = 82.0
+    spb = 60.0 / bpm
+    steps_per_beat = 4  # 16ths
+    sps = spb / steps_per_beat
+    swing = 0.18  # delay every other 16th slightly
+
+    bars = 4
+    beats_per_bar = 4
+    loop_seconds = bars * beats_per_bar * spb
+
+    total_seconds = max(1.0, float(seconds))
+    total_frames = int(total_seconds * sample_rate)
+    loop_frames = max(1, int(loop_seconds * sample_rate))
+
+    def soft_clip(x: float) -> float:
+        return math.tanh(x)
+
+    def lcg(n: int) -> int:
+        return (1103515245 * (n + 12345) + 12345) & 0x7FFFFFFF
+
+    def noise(n: int) -> float:
+        return (lcg(n) / 0x7FFFFFFF) * 2.0 - 1.0
+
+    def exp_env(t: float, attack: float, decay: float) -> float:
+        if t < 0:
+            return 0.0
+        if t < attack:
+            return t / max(attack, 1e-6)
+        return math.exp(-(t - attack) / max(decay, 1e-6))
+
+    def hz(midi: int) -> float:
+        return 440.0 * (2.0 ** ((midi - 69) / 12.0))
+
+    # Chord progression (4 bars): Am7 | Fmaj7 | Cmaj7 | G6
+    chords_midi: list[list[int]] = [
+        [57, 60, 64, 67],  # A3 C4 E4 G4
+        [53, 57, 60, 64],  # F3 A3 C4 E4
+        [48, 52, 55, 59],  # C3 E3 G3 B3
+        [55, 59, 62, 64],  # G3 B3 D4 E4 (G6-ish)
+    ]
+
+    # Drum patterns on 16ths in 1 bar, repeated.
+    steps_per_bar = beats_per_bar * steps_per_beat  # 16
+    # A common-ish R&B pocket: kick on 1, (1e), 3, (3a); snare on 2 & 4.
+    kick_bar = {0, 3, 8, 14}
+    snare_bar = {4, 12}
+    hat_bar = set(range(0, steps_per_bar, 2)) | {3, 7, 11, 15}  # 8ths + a little texture
+
+    # Bass follows chord root, with some octave jumps.
+    bass_roots = [45, 41, 36, 43]  # A2, F2, C2, G2
+
+    chunk = bytearray()
+    chunk_flush_frames = 4096
+
+    with wave.open(str(out_wav), "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+
+        for frame in range(total_frames):
+            lf = frame % loop_frames
+            t = lf / sample_rate
+
+            # Determine bar/beat/step.
+            bar = int(t // (beats_per_bar * spb)) % bars
+            t_in_bar = t - bar * (beats_per_bar * spb)
+
+            step_raw = int(t_in_bar // sps)
+            step_in_step = t_in_bar - (step_raw * sps)
+
+            # Apply swing by shifting the "off" 16ths later.
+            step = step_raw % steps_per_bar
+            is_off = (step % 2) == 1
+            swing_shift = (sps * swing) if is_off else 0.0
+            step_t = max(0.0, step_in_step - swing_shift)
+
+            mix = 0.0
+
+            # --- Drums ---
+            if step in kick_bar:
+                kt = step_t
+                kenv = exp_env(kt, 0.002, 0.12)
+                # 808-ish thump: pitch drop 95 -> 48Hz.
+                sweep = math.exp(-kt / 0.07)
+                kfreq = 48.0 + (95.0 - 48.0) * sweep
+                mix += 0.95 * kenv * math.sin(2.0 * math.pi * kfreq * t)
+                # click
+                mix += 0.08 * exp_env(kt, 0.001, 0.02) * math.sin(2.0 * math.pi * 2400.0 * t)
+
+            if step in snare_bar:
+                st = step_t
+                senv = exp_env(st, 0.002, 0.10)
+                n = (0.7 * noise(lf * 5 + 11) + 0.3 * noise(lf * 13 + 7))
+                # snare body + noise
+                body = 0.22 * math.sin(2.0 * math.pi * 190.0 * t)
+                mix += 0.55 * senv * (0.55 * n + body)
+
+            if step in hat_bar:
+                ht = step_t
+                henv = exp_env(ht, 0.001, 0.035)
+                n = noise(lf * 3 + 17)
+                # bright hat
+                hh = n * math.sin(2.0 * math.pi * 9000.0 * t)
+                mix += 0.18 * henv * hh
+
+            # --- Keys (electric piano-ish) ---
+            # Hit chords on beat 1 and a light stab on beat 3.
+            chord_hit = (step == 0) or (step == 8)
+            if chord_hit:
+                # A slightly longer envelope for the chord stab.
+                # Use t-based phase; envelope based on time since this step started.
+                pass
+
+            # Compute chord contribution continuously but with stronger onset at step 0/8.
+            chord = chords_midi[bar % len(chords_midi)]
+            # time since last chord onset within bar (either step 0 or step 8)
+            onset_step = 0 if step_raw < 8 else 8
+            onset_t = t_in_bar - (onset_step * sps)
+            cenv = exp_env(onset_t, 0.008, 0.55)
+            # simple EP timbre: fundamental + a couple harmonics.
+            chord_sig = 0.0
+            for m in chord:
+                f = hz(m)
+                chord_sig += 0.70 * math.sin(2.0 * math.pi * f * t)
+                chord_sig += 0.18 * math.sin(2.0 * math.pi * (2.0 * f) * t)
+                chord_sig += 0.08 * math.sin(2.0 * math.pi * (3.0 * f) * t)
+            chord_sig /= max(1.0, float(len(chord)))
+            mix += 0.18 * cenv * chord_sig
+
+            # --- Bass ---
+            # Bass notes on 1, (1a), 3, (3&)
+            bass_steps = {0, 2, 8, 10}
+            if step in bass_steps:
+                bt = step_t
+                benv = exp_env(bt, 0.004, 0.22)
+                root = bass_roots[bar % len(bass_roots)]
+                # occasional octave on the second hit
+                if step in {2, 10}:
+                    root += 12
+                bf = hz(root)
+                # 808-ish: sine + tiny 2nd harmonic
+                bass = math.sin(2.0 * math.pi * bf * t) + 0.18 * math.sin(2.0 * math.pi * (2.0 * bf) * t)
+                mix += 0.48 * benv * bass
+
+            # Glue + safety.
+            mix = soft_clip(mix * 1.10)
+
+            s = int(max(-1.0, min(1.0, mix)) * 32767)
+            # subtle stereo: tiny phase offset in right + slight noise
+            r = soft_clip((mix + 0.015 * noise(lf * 11 + 5)))
+            s_r = int(max(-1.0, min(1.0, r)) * 32767)
+
+            chunk += int.to_bytes(s, 2, "little", signed=True)
+            chunk += int.to_bytes(s_r, 2, "little", signed=True)
+
+            if (frame + 1) % chunk_flush_frames == 0:
+                wf.writeframesraw(chunk)
+                chunk.clear()
+
+        if chunk:
+            wf.writeframesraw(chunk)
+            chunk.clear()
+
+        wf.writeframes(b"")
+
+
+def _generate_clown_music_wav(*, out_wav: Path, seconds: float, sample_rate: int = 44100) -> None:
+    """Generate a loop-friendly clown/circus mocking bed.
+
+    Deterministic synth: calliope-ish square lead, oom-pah bass, and tiny snare/hat ticks.
+    Intended to be obviously "circus" without using any copyrighted material.
+    """
+
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+
+    bpm = 152.0
+    spb = 60.0 / bpm
+    beats_per_bar = 4
+    bars = 8
+    loop_seconds = bars * beats_per_bar * spb
+
+    total_seconds = max(1.0, float(seconds))
+    total_frames = int(total_seconds * sample_rate)
+    loop_frames = max(1, int(loop_seconds * sample_rate))
+
+    def soft_clip(x: float) -> float:
+        return math.tanh(x)
+
+    def lcg(n: int) -> int:
+        return (1103515245 * (n + 12345) + 12345) & 0x7FFFFFFF
+
+    def noise(n: int) -> float:
+        return (lcg(n) / 0x7FFFFFFF) * 2.0 - 1.0
+
+    def exp_env(t: float, attack: float, decay: float) -> float:
+        if t < 0:
+            return 0.0
+        if t < attack:
+            return t / max(attack, 1e-6)
+        return math.exp(-(t - attack) / max(decay, 1e-6))
+
+    def hz(midi: int) -> float:
+        return 440.0 * (2.0 ** ((midi - 69) / 12.0))
+
+    # Major-scale-ish melody with goofy chromatic dips.
+    # (C-ish center, but intentionally a bit cheeky.)
+    melody_midi = [
+        72, 74, 76, 77,  # C5 D5 E5 F5
+        76, 74, 72, 71,  # E5 D5 C5 B4
+        72, 74, 72, 69,  # C5 D5 C5 A4
+        71, 72, 71, 67,  # B4 C5 B4 G4
+    ]
+    # Oom-pah bass in C: root/fifth.
+    bass_root = 36  # C2
+    bass_fifth = 43  # G2
+
+    chunk = bytearray()
+    chunk_flush_frames = 4096
+
+    with wave.open(str(out_wav), "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+
+        for frame in range(total_frames):
+            lf = frame % loop_frames
+            t = lf / sample_rate
+
+            bar_t = t % (beats_per_bar * spb)
+            beat = int(bar_t // spb)
+            beat_t = bar_t - beat * spb
+
+            # 8th notes for melody.
+            eighth = int((t / (spb / 2.0)))
+            eighth_t = (t % (spb / 2.0))
+            note = melody_midi[eighth % len(melody_midi)]
+            f = hz(note)
+
+            # Calliope-ish lead: square wave with vibrato + a touch of harmonic.
+            vib = 1.0 + 0.010 * math.sin(2.0 * math.pi * 6.0 * t)
+            phase = 2.0 * math.pi * (f * vib) * t
+            lead_sq = 1.0 if math.sin(phase) >= 0 else -1.0
+            lead = 0.55 * lead_sq + 0.18 * math.sin(2.0 * math.pi * (2.0 * f) * t)
+            lead *= exp_env(eighth_t, 0.004, 0.12)
+
+            # Oom-pah bass: on beats 1 and 3 root; 2 and 4 fifth (staccato).
+            bass_m = bass_root if beat in (0, 2) else bass_fifth
+            bf = hz(bass_m)
+            bass = math.sin(2.0 * math.pi * bf * t)
+            bass *= exp_env(beat_t, 0.002, 0.18)
+
+            # Tiny percussion: snare-ish on 2/4 and hat ticks on 8ths.
+            sn = 0.0
+            if beat in (1, 3):
+                sn_env = exp_env(beat_t, 0.001, 0.06)
+                sn = sn_env * noise(lf * 7 + 19)
+
+            hat = 0.0
+            hat_env = exp_env(eighth_t, 0.001, 0.03)
+            hat = hat_env * noise(lf * 5 + 3) * math.sin(2.0 * math.pi * 9500.0 * t)
+
+            mix = 0.32 * lead + 0.30 * bass + 0.10 * sn + 0.06 * hat
+
+            # Little "slide-whistle" style bend at the end of the loop.
+            if (loop_seconds - t) < 0.45:
+                tt = max(0.0, loop_seconds - t)
+                bend = 600.0 + (2200.0 - 600.0) * (1.0 - (tt / 0.45))
+                wh_env = exp_env(0.45 - tt, 0.001, 0.20)
+                mix += 0.10 * wh_env * math.sin(2.0 * math.pi * bend * t)
+
+            mix = soft_clip(mix * 1.35)
+
+            s_l = int(max(-1.0, min(1.0, mix)) * 32767)
+            # light stereo wiggle
+            mix_r = soft_clip(mix + 0.012 * noise(lf * 11 + 5))
+            s_r = int(max(-1.0, min(1.0, mix_r)) * 32767)
+
+            chunk += int.to_bytes(s_l, 2, "little", signed=True)
+            chunk += int.to_bytes(s_r, 2, "little", signed=True)
+
+            if (frame + 1) % chunk_flush_frames == 0:
+                wf.writeframesraw(chunk)
+                chunk.clear()
+
+        if chunk:
+            wf.writeframesraw(chunk)
+            chunk.clear()
 
         wf.writeframes(b"")
 
@@ -265,19 +747,18 @@ def render_slideshow(
         preset = str(bgm_preset).strip().lower()
         if preset in ("ambient", "pad"):
             bgm_generate = True
-        elif preset in ("elevator", "elevator_music"):
-            # Generate a short loop-friendly WAV and loop it in ffmpeg.
-            # Important: keep this short (we already `-stream_loop -1` it),
-            # otherwise generating a full-length WAV in Python is extremely slow.
-            bgm_wav = out_mp4.parent / "bgm_elevator.wav"
-            _generate_elevator_music_wav(out_wav=bgm_wav, seconds=32.0)
-            bgm_path = bgm_wav
-        elif preset in ("creepy", "horror", "spooky"):
-            bgm_wav = out_mp4.parent / "bgm_creepy.wav"
-            _generate_creepy_music_wav(out_wav=bgm_wav, seconds=32.0)
-            bgm_path = bgm_wav
         else:
-            raise ValueError(f"Unknown bgm_preset: {bgm_preset!r}")
+            # Ensure the preset WAV exists (cache) and use it.
+            bgm_wav = ensure_bgm_preset_wav(preset=preset, seconds=32.0)
+            bgm_path = bgm_wav
+
+            # Also copy into the output folder so it is easy to find/play.
+            try:
+                local = out_mp4.parent / bgm_wav.name
+                if not local.exists():
+                    shutil.copyfile(bgm_wav, local)
+            except Exception:
+                pass
 
     if bgm_path and bgm_generate:
         raise ValueError("Provide either bgm_path or bgm_generate, not both")
@@ -307,14 +788,14 @@ def render_slideshow(
                 frag = (
                     f"[{voice_label}]aformat=sample_fmts=fltp:sample_rates=44100,{adelay}apad,atrim=duration={total_duration:.3f}[voice_in];"
                     "[voice_in]asplit=2[voice_mix][voice_sc];"
-                    f"[{bgm_label}]aformat=sample_fmts=fltp:sample_rates=44100,lowpass=f=8000,volume={bgm_vol:.4f},apad,atrim=duration={total_duration:.3f}[bgm];"
+                    f"[{bgm_label}]aformat=sample_fmts=fltp:sample_rates=44100,lowpass=f=16000,volume={bgm_vol:.4f},apad,atrim=duration={total_duration:.3f}[bgm];"
                     "[bgm][voice_sc]sidechaincompress=threshold=0.02:ratio=12:attack=5:release=400[bgmduck];"
                     "[voice_mix][bgmduck]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.97[aout]"
                 )
             else:
                 frag = (
                     f"[{voice_label}]aformat=sample_fmts=fltp:sample_rates=44100,{adelay}apad,atrim=duration={total_duration:.3f}[voice];"
-                    f"[{bgm_label}]aformat=sample_fmts=fltp:sample_rates=44100,lowpass=f=8000,volume={bgm_vol:.4f},apad,atrim=duration={total_duration:.3f}[bgm];"
+                    f"[{bgm_label}]aformat=sample_fmts=fltp:sample_rates=44100,lowpass=f=16000,volume={bgm_vol:.4f},apad,atrim=duration={total_duration:.3f}[bgm];"
                     "[voice][bgm]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.97[aout]"
                 )
             return frag, "aout"

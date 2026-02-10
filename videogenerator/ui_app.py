@@ -111,7 +111,7 @@ with col_left:
     transition_seconds = st.slider("Transition seconds", min_value=0.0, max_value=1.0, value=0.35, step=0.05)
 
     st.subheader("3) Audio mix")
-    bgm_preset = st.selectbox("BGM preset", options=["elevator", "ambient", "creepy", "(none)"], index=0)
+    bgm_preset = st.selectbox("BGM preset", options=["elevator", "ambient", "creepy", "hiphop", "rnb", "clown", "(none)"], index=0)
     bgm_volume = st.slider("BGM volume", min_value=0.0, max_value=0.30, value=0.16, step=0.01)
     bgm_duck = st.checkbox("Ducking (reduce BGM under narration)", value=True)
 
@@ -461,6 +461,22 @@ with col_right:
 
             st.write("Rendering MP4…")
             out_mp4 = out_dir / "video.mp4"
+
+            effective_bgm_preset = None if bgm_preset == "(none)" else bgm_preset
+            if vt == "review" and effective_bgm_preset is None:
+                try:
+                    from videogenerator.youtube import _fallback_verdict_label
+
+                    v = ""
+                    if pkg is not None:
+                        v = str(pkg.verdict_label or "").strip()
+                    if not v:
+                        v = _fallback_verdict_label(segments=segments)
+                    if v == "Garbage!":
+                        effective_bgm_preset = "clown"
+                except Exception:
+                    pass
+
             render_slideshow(
                 slides_to_render,
                 str(saved_audio),
@@ -472,7 +488,7 @@ with col_right:
                 bgm_volume=float(bgm_volume),
                 bgm_duck=bool(bgm_duck),
                 bgm_generate=False,
-                bgm_preset=None if bgm_preset == "(none)" else bgm_preset,
+                bgm_preset=effective_bgm_preset,
                 intro_seconds=float(intro_s),
                 outro_seconds=float(outro_s),
                 transition=None if run_transition == "none" else run_transition,
@@ -496,6 +512,11 @@ with col_right:
                         llm_model="gpt-4o-mini",
                         llm_pick_images=True,
                         reuse_images=bool(reuse_images),
+                        bgm_path=None,
+                        bgm_volume=float(bgm_volume),
+                        bgm_duck=bool(bgm_duck),
+                        bgm_generate=False,
+                        bgm_preset=None if bgm_preset == "(none)" else bgm_preset,
                     )
                     if shorts_dir is not None:
                         st.success(f"Shorts created: {str(Path(shorts_dir) / 'video.mp4')}")
@@ -558,12 +579,33 @@ with col_right:
         st.write("Output folder:")
         st.code(str(out_dir), language="text")
 
+        # Players (render inside columns so they don't take the full page width)
+        video_path = out_dir / "video.mp4"
+        shorts_video = out_dir / "shorts_highlights" / "video.mp4"
+
+        if video_path.exists() or shorts_video.exists():
+            left, right = st.columns([2, 1])
+            if video_path.exists():
+                with left:
+                    st.subheader("Full review")
+                    try:
+                        st.video(str(video_path))
+                    except Exception:
+                        st.video(video_path.read_bytes(), format="video/mp4")
+
+            if shorts_video.exists():
+                with right:
+                    st.subheader("Short highlight")
+                    try:
+                        st.video(str(shorts_video))
+                    except Exception:
+                        st.video(shorts_video.read_bytes(), format="video/mp4")
+
         cols = st.columns([1, 1, 2])
         with cols[0]:
             if st.button("Open folder"):
                 _open_folder(out_dir)
         with cols[1]:
-            video_path = out_dir / "video.mp4"
             if video_path.exists():
                 st.write("Video:")
                 st.code(str(video_path), language="text")

@@ -8,7 +8,7 @@ import json
 from dotenv import load_dotenv
 
 from .pipeline import run
-from .render import render_slideshow
+from .render import ensure_bgm_preset_wav, render_slideshow
 from .models import Slide
 
 
@@ -17,7 +17,7 @@ def main() -> None:
     load_dotenv(override=False)
 
     p = argparse.ArgumentParser(description="MP3 -> transcript -> Wikimedia images -> MP4 slideshow")
-    p.add_argument("--audio", required=True, help="Path to input audio (mp3/wav/etc)")
+    p.add_argument("--audio", required=False, help="Path to input audio (mp3/wav/etc)")
     p.add_argument("--out", default="output", help="Output folder")
     p.add_argument("--topic", default=None, help="Optional topic hint for image search, e.g. 'Severance TV series'")
     p.add_argument(
@@ -111,7 +111,19 @@ def main() -> None:
         "--bgm-preset",
         type=str,
         default=None,
-        help="Built-in background music preset: 'ambient', 'elevator', or 'creepy'.",
+        help="Built-in background music preset: 'ambient', 'elevator', 'creepy', 'hiphop', 'rnb', or 'clown'.",
+    )
+
+    p.add_argument(
+        "--write-bgm-wav",
+        default=None,
+        help="Generate a built-in BGM preset WAV into .cache/bgm_presets and print its path (no video render).",
+    )
+    p.add_argument(
+        "--bgm-seconds",
+        type=float,
+        default=32.0,
+        help="Seconds to generate for --write-bgm-wav (default: 32).",
     )
     p.add_argument(
         "--no-bgm-duck",
@@ -188,6 +200,14 @@ def main() -> None:
     )
 
     args = p.parse_args()
+
+    if args.write_bgm_wav:
+        wav = ensure_bgm_preset_wav(preset=str(args.write_bgm_wav), seconds=float(args.bgm_seconds))
+        print(str(wav.resolve()))
+        return
+
+    if not args.audio:
+        raise SystemExit("--audio is required unless using --write-bgm-wav")
 
     # Shorts preset overrides.
     if args.shorts or str(getattr(args, "video_type", "")).strip().lower() == "shorts":
@@ -450,6 +470,16 @@ def main() -> None:
         # Treat --bgm-preset as the explicit choice; --bgm-generate becomes redundant.
         bgm_generate = False
 
+    # Auto rule: for garbage reviews, default to clown BGM (unless user chose a BGM option).
+    if (not bgm_path) and (not bgm_generate) and (not bgm_preset) and vt == "review" and segments:
+        try:
+            from .youtube import _fallback_verdict_label
+
+            if _fallback_verdict_label(segments=segments) == "Garbage!":
+                bgm_preset = "clown"
+        except Exception:
+            pass
+
     render_slideshow(
         slides,
         args.audio,
@@ -497,6 +527,11 @@ def main() -> None:
                 llm_model=str(args.llm_model),
                 llm_pick_images=(not args.no_llm_pick_images),
                 reuse_images=(not args.no_reuse_images),
+                bgm_path=bgm_path,
+                bgm_volume=float(args.bgm_volume),
+                bgm_duck=(not args.no_bgm_duck),
+                bgm_generate=bool(bgm_generate),
+                bgm_preset=bgm_preset,
             )
             if shorts_dir is not None:
                 print(str((Path(shorts_dir) / "video.mp4").resolve()))
