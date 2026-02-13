@@ -1771,12 +1771,13 @@ def run(
 
             # Assign prepared clips to matching slides.
             # For each prepared clip, find the slide whose time range best overlaps
-            # and replace it with a video clip slide.
+            # and split it: [image before] [video clip] [image after].
+            from .clip_tools import get_video_duration as _clip_dur
+
             for pc in prepared_clips:
                 best_idx = -1
                 best_overlap = 0.0
                 for si, sl in enumerate(slides):
-                    # Already has a video clip assigned? Skip.
                     if sl.video_clip_path:
                         continue
                     overlap_start = max(sl.start, pc.timeline_start)
@@ -1788,30 +1789,64 @@ def run(
 
                 if best_idx >= 0 and best_overlap > 0.5:
                     sl = slides[best_idx]
-                    # Split the slide if the clip only covers part of it.
-                    # For simplicity, we replace the entire slide duration with the clip
-                    # (the clip was already trimmed to the right duration).
-                    slides[best_idx] = Slide(
-                        start=sl.start,
-                        end=sl.end,
-                        image_path=sl.image_path,
-                        query=sl.query,
-                        headline=sl.headline,
-                        subhead=sl.subhead,
-                        source_page=sl.source_page,
-                        image_url=sl.image_url,
-                        license_name=sl.license_name,
-                        license_url=sl.license_url,
-                        attribution=sl.attribution,
-                        motion=sl.motion,
-                        window_text=sl.window_text,
-                        window_keywords=sl.window_keywords,
+                    actual_clip_dur = _clip_dur(pc.path)
+                    if actual_clip_dur <= 0:
+                        actual_clip_dur = pc.timeline_end - pc.timeline_start
+
+                    # Clamp clip duration to fit within the slide.
+                    clip_dur = min(actual_clip_dur, sl.end - sl.start)
+
+                    # Determine where the clip sits within the slide.
+                    clip_start_in_tl = max(sl.start, pc.timeline_start)
+                    clip_end_in_tl = min(sl.end, clip_start_in_tl + clip_dur)
+                    clip_dur = clip_end_in_tl - clip_start_in_tl
+
+                    new_slides: list[Slide] = []
+
+                    # Image part before the clip.
+                    if clip_start_in_tl - sl.start > 0.5:
+                        new_slides.append(Slide(
+                            start=sl.start, end=clip_start_in_tl,
+                            image_path=sl.image_path, query=sl.query,
+                            headline=sl.headline, subhead=sl.subhead,
+                            source_page=sl.source_page, image_url=sl.image_url,
+                            license_name=sl.license_name, license_url=sl.license_url,
+                            attribution=sl.attribution, motion=sl.motion,
+                            window_text=sl.window_text, window_keywords=sl.window_keywords,
+                            queries_tried=sl.queries_tried,
+                        ))
+
+                    # Video clip slide.
+                    new_slides.append(Slide(
+                        start=clip_start_in_tl, end=clip_end_in_tl,
+                        image_path=sl.image_path, query=sl.query,
+                        headline=sl.headline, subhead=sl.subhead,
+                        source_page=sl.source_page, image_url=sl.image_url,
+                        license_name=sl.license_name, license_url=sl.license_url,
+                        attribution=sl.attribution, motion=sl.motion,
+                        window_text=sl.window_text, window_keywords=sl.window_keywords,
                         queries_tried=sl.queries_tried,
                         video_clip_path=str(pc.path),
-                        video_clip_start=0.0,  # clip is already trimmed
-                        video_clip_end=float(sl.end - sl.start),
+                        video_clip_start=0.0,
+                        video_clip_end=clip_dur,
                         video_clip_mute=pc.muted,
-                    )
+                    ))
+
+                    # Image part after the clip.
+                    if sl.end - clip_end_in_tl > 0.5:
+                        new_slides.append(Slide(
+                            start=clip_end_in_tl, end=sl.end,
+                            image_path=sl.image_path, query=sl.query,
+                            headline=sl.headline, subhead=sl.subhead,
+                            source_page=sl.source_page, image_url=sl.image_url,
+                            license_name=sl.license_name, license_url=sl.license_url,
+                            attribution=sl.attribution, motion=sl.motion,
+                            window_text=sl.window_text, window_keywords=sl.window_keywords,
+                            queries_tried=sl.queries_tried,
+                        ))
+
+                    # Replace the original slide with the split parts.
+                    slides[best_idx:best_idx + 1] = new_slides
 
             write_json(out_dir / "prepared_clips.json", [
                 {"path": str(pc.path), "timeline_start": pc.timeline_start,

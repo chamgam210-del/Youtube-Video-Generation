@@ -1096,9 +1096,15 @@ def render_slideshow(
             # ── Video clip slide: trim from clip offset, scale, no Ken Burns ──
             if slide_is_clip[i]:
                 clip_start = float(slides[i].video_clip_start or 0.0)
+                # Use video_clip_end to limit trim duration (clip may be shorter than slide).
+                clip_end = float(slides[i].video_clip_end or dur_s)
+                clip_dur = min(dur_s, clip_end)
                 chain = (
                     f"[{in_label}]"
-                    f"trim=start={clip_start:.3f}:duration={dur_s:.3f},setpts=PTS-STARTPTS,"
+                    f"trim=start={clip_start:.3f}:duration={clip_dur:.3f},setpts=PTS-STARTPTS,"
+                    # tpad pads with last frame if clip is slightly shorter than expected.
+                    f"tpad=stop_mode=clone:stop_duration={max(0.0, dur_s - clip_dur + 0.1):.3f},"
+                    f"trim=duration={dur_s:.3f},setpts=PTS-STARTPTS,"
                     f"{scale_pad}"
                 )
                 if trans == "fade" and fade_s > 0.0 and dur_s > (2 * fade_s + 0.05):

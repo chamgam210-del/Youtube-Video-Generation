@@ -597,6 +597,10 @@ def main() -> None:
                     license_url=s.license_url,
                     attribution=s.attribution,
                     motion=getattr(s, "motion", None),
+                    video_clip_path=getattr(s, "video_clip_path", None),
+                    video_clip_start=getattr(s, "video_clip_start", None),
+                    video_clip_end=getattr(s, "video_clip_end", None),
+                    video_clip_mute=getattr(s, "video_clip_mute", False),
                 )
             )
 
