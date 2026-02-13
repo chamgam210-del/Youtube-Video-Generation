@@ -20,17 +20,6 @@ def _ffmpeg_exe() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
-def _ffprobe_exe() -> str:
-    """Derive ffprobe path from ffmpeg binary (imageio-ffmpeg bundles both)."""
-    ffmpeg = _ffmpeg_exe()
-    p = Path(ffmpeg)
-    probe = p.parent / p.name.replace("ffmpeg", "ffprobe")
-    if probe.exists():
-        return str(probe)
-    # Fallback: try system ffprobe.
-    return "ffprobe"
-
-
 # ── SerpAPI video search ────────────────────────────────────────────────────
 
 
@@ -264,9 +253,25 @@ def download_clip(
 
     out_template = str(dest_dir / f"{prefix}_%(id)s.%(ext)s")
 
+    # Point yt-dlp at the imageio-ffmpeg bundled binary so it can merge streams.
+    # imageio-ffmpeg names the binary e.g. "ffmpeg-win-x86_64-v7.1.exe" — yt-dlp
+    # expects "ffmpeg" or "ffmpeg.exe", so we create a shim copy/symlink.
+    ffmpeg_path = Path(_ffmpeg_exe())
+    ffmpeg_dir = str(ffmpeg_path.parent)
+    expected_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    shim = ffmpeg_path.parent / expected_name
+    if not shim.exists():
+        try:
+            shim.symlink_to(ffmpeg_path)
+        except OSError:
+            # Symlinks may require developer mode on Windows; fall back to copy.
+            import shutil as _shutil
+            _shutil.copy2(ffmpeg_path, shim)
+
     cmd = [
         ytdlp,
         "--no-playlist",
+        "--ffmpeg-location", ffmpeg_dir,
         "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best",
         "--merge-output-format", "mp4",
         "-o", out_template,
@@ -311,17 +316,25 @@ def download_clip(
 
 
 def get_video_duration(path: str | Path) -> float:
-    """Get duration of a video file in seconds."""
-    ffprobe = _ffprobe_exe()
+    """Get duration of a video file in seconds.
+
+    Uses ``ffmpeg -i`` (stderr parsing) since imageio-ffmpeg doesn't bundle
+    ffprobe on all platforms.  Falls back to ffprobe if available.
+    """
+    ffmpeg = _ffmpeg_exe()
     try:
         proc = subprocess.run(
-            [ffprobe, "-v", "quiet", "-print_format", "json", "-show_format", str(path)],
+            [ffmpeg, "-i", str(path)],
             capture_output=True, text=True, timeout=30,
         )
-        data = json.loads(proc.stdout)
-        return float(data.get("format", {}).get("duration", 0.0))
+        # Duration line appears in stderr: "Duration: HH:MM:SS.ff"
+        m = re.search(r"Duration:\s*(\d{2}):(\d{2}):(\d{2})\.(\d+)", proc.stderr or "")
+        if m:
+            h, mi, s, frac = m.groups()
+            return int(h) * 3600 + int(mi) * 60 + int(s) + float("0." + frac)
     except Exception:
-        return 0.0
+        pass
+    return 0.0
 
 
 def trim_clip(
