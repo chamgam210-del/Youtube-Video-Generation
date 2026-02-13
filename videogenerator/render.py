@@ -4,6 +4,8 @@ import math
 import subprocess
 import shutil
 import wave
+import os
+import re
 from pathlib import Path
 
 import imageio_ffmpeg
@@ -36,6 +38,130 @@ def _bgm_preset_cache_dir() -> Path:
     return d
 
 
+def _try_find_bgm_preset_audio_file(key: str) -> Path | None:
+    """Resolve a preset name to a user-provided audio file (mp3/wav/etc).
+
+    Supported locations (first match wins):
+    - $VIDEOGENERATOR_BGM_DIR/<key>.(mp3|wav|m4a|aac|flac|ogg)
+    - <repo_root>/assets/bgm/<key>.(mp3|wav|m4a|aac|flac|ogg)
+    - <cwd>/assets/bgm/<key>.(mp3|wav|m4a|aac|flac|ogg)
+    """
+
+    k = str(key or "").strip().lower()
+    if not k:
+        return None
+
+    exts = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")
+
+    def norm_stem(p: Path) -> str:
+        s = str(p.stem or "").lower()
+        s = re.sub(r"[^a-z0-9]+", "_", s)
+        s = re.sub(r"_+", "_", s).strip("_")
+        return s
+    candidates: list[Path] = []
+
+    env_dir = os.getenv("VIDEOGENERATOR_BGM_DIR")
+    if env_dir:
+        base = Path(env_dir).expanduser()
+        for ext in exts:
+            candidates.append(base / f"{k}{ext}")
+
+    repo_root = Path(__file__).resolve().parent.parent
+    for ext in exts:
+        candidates.append(repo_root / "assets" / "bgm" / f"{k}{ext}")
+
+    cwd = Path.cwd().resolve()
+    for ext in exts:
+        candidates.append(cwd / "assets" / "bgm" / f"{k}{ext}")
+
+    for p in candidates:
+        try:
+            if p.exists() and p.is_file() and p.stat().st_size > 4096:
+                return p
+        except Exception:
+            continue
+
+    # Fallback: scan typical bgm dirs and accept files whose normalized stem contains the preset key.
+    # This lets `cylinder_five` match `Cylinder Five - Chris Zabriskie.mp3`.
+    scan_dirs: list[Path] = []
+    if env_dir:
+        scan_dirs.append(Path(env_dir).expanduser())
+    scan_dirs.append(repo_root / "assets" / "bgm")
+    scan_dirs.append(cwd / "assets" / "bgm")
+
+    for d in scan_dirs:
+        try:
+            if not d.exists() or not d.is_dir():
+                continue
+            for ext in exts:
+                for p in d.glob(f"*{ext}"):
+                    try:
+                        if p.stat().st_size <= 4096:
+                            continue
+                        if k in norm_stem(p):
+                            return p
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+    return None
+
+
+def _convert_audio_file_to_wav(*, in_path: Path, out_wav: Path, seconds: float, sample_rate: int = 44100) -> None:
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg = _ffmpeg_exe()
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(in_path.resolve()),
+        "-t",
+        str(max(1.0, float(seconds))),
+        "-ac",
+        "2",
+        "-ar",
+        str(int(sample_rate)),
+        "-c:a",
+        "pcm_s16le",
+        str(out_wav.resolve()),
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"ffmpeg audio convert failed: {p.stderr or p.stdout}")
+
+
+def bgm_preset_available(preset: str) -> bool:
+    """Return True if `preset` is a known built-in or a resolvable local file-backed preset."""
+
+    key = str(preset or "").strip().lower()
+    if not key:
+        return False
+    if key in ("ambient", "pad"):
+        return True
+    if key in (
+        "elevator",
+        "elevator_music",
+        "creepy",
+        "horror",
+        "spooky",
+        "hiphop",
+        "hip_hop",
+        "hip-hop",
+        "hip hop",
+        "rnb",
+        "r&b",
+        "rb",
+        "r_b",
+        "clown",
+        "circus",
+        "clown_music",
+        "circus_music",
+        "mocking",
+    ):
+        return True
+    return _try_find_bgm_preset_audio_file(key) is not None
+
+
 def ensure_bgm_preset_wav(*, preset: str, seconds: float = 32.0) -> Path:
     """Create (if needed) and return the WAV path for a built-in preset.
 
@@ -53,6 +179,25 @@ def ensure_bgm_preset_wav(*, preset: str, seconds: float = 32.0) -> Path:
     if key in ("ambient", "pad"):
         # Not a wav file; ambient uses lavfi generation in ffmpeg.
         raise ValueError("ambient preset is generated in ffmpeg (no wav)")
+
+    # File-backed preset: let users drop an mp3/wav into assets/bgm/<preset>.*
+    # and use it by name (e.g. bgm_preset='cylinder_five').
+    audio_file = _try_find_bgm_preset_audio_file(key)
+    if audio_file is not None:
+        out = cache / f"bgm_{key}.wav"
+        try:
+            if out.exists() and out.stat().st_size > 4096:
+                # Regenerate if the source is newer.
+                try:
+                    if audio_file.stat().st_mtime <= out.stat().st_mtime:
+                        return out
+                except Exception:
+                    return out
+        except Exception:
+            pass
+
+        _convert_audio_file_to_wav(in_path=audio_file, out_wav=out, seconds=seconds)
+        return out
 
     if key in ("elevator", "elevator_music"):
         out = cache / "bgm_elevator.wav"
@@ -75,7 +220,12 @@ def ensure_bgm_preset_wav(*, preset: str, seconds: float = 32.0) -> Path:
         gen = _generate_clown_music_wav
         gen_seconds = min(seconds, 24.0)
     else:
-        raise ValueError(f"Unknown bgm_preset: {preset!r}")
+        raise ValueError(
+            f"Unknown bgm_preset: {preset!r}. "
+            "If you meant a local file-backed preset, put the audio in assets/bgm/ "
+            "(e.g. 'cylinder_five.mp3' or 'Cylinder Five - Chris Zabriskie.mp3') "
+            "or set VIDEOGENERATOR_BGM_DIR."
+        )
 
     try:
         if out.exists() and out.stat().st_size > 4096:
@@ -869,7 +1019,11 @@ def render_slideshow(
             "-fps_mode",
             "cfr",
             "-vf",
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+            (
+                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+                f"crop={width}:{height}:(in_w-out_w)/2:(in_h-out_h)/2,"
+                "setsar=1,format=yuv420p"
+            ),
             "-r",
             str(fps),
             "-pix_fmt",
@@ -895,11 +1049,19 @@ def render_slideshow(
 
         cmd: list[str] = [ffmpeg, "-y"]
 
-        for p in img_paths:
-            # -loop 1 turns an image into an infinite video stream; we trim each slide in the filtergraph.
-            cmd += ["-loop", "1", "-i", str(p)]
+        # Track which slides are video clips vs still images.
+        slide_is_clip: list[bool] = []
+        for i, s in enumerate(slides):
+            if s.video_clip_path and Path(s.video_clip_path).exists():
+                # Video clip input — no -loop.
+                cmd += ["-i", str(Path(s.video_clip_path).resolve())]
+                slide_is_clip.append(True)
+            else:
+                # Still image — loop to create infinite video stream.
+                cmd += ["-loop", "1", "-i", str(img_paths[i])]
+                slide_is_clip.append(False)
 
-        voice_index = len(img_paths)
+        voice_index = len(slides)
         cmd += ["-i", str(voice_path)]
 
         bgm_index: int | None = None
@@ -924,27 +1086,76 @@ def render_slideshow(
             in_label = f"{i}:v"
             base_label = f"v{i}"
             scale_pad = (
-                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p,setsar=1,fps={fps}"
+                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+                f"crop={width}:{height}:(in_w-out_w)/2:(in_h-out_h)/2,"
+                f"format=yuv420p,setsar=1,fps={fps}"
             )
 
             dur_s = float(dur)
-            if ken_burns:
+
+            # ── Video clip slide: trim from clip offset, scale, no Ken Burns ──
+            if slide_is_clip[i]:
+                clip_start = float(slides[i].video_clip_start or 0.0)
+                chain = (
+                    f"[{in_label}]"
+                    f"trim=start={clip_start:.3f}:duration={dur_s:.3f},setpts=PTS-STARTPTS,"
+                    f"{scale_pad}"
+                )
+                if trans == "fade" and fade_s > 0.0 and dur_s > (2 * fade_s + 0.05):
+                    chain += f",fade=t=in:st=0:d={fade_s:.3f},fade=t=out:st={dur_s - fade_s:.3f}:d={fade_s:.3f}"
+                chain += f"[{base_label}]"
+                v_filters.append(chain)
+                v_labels.append(f"[{base_label}]")
+                continue
+
+            # ── Still image slide (original logic) ──
+            motion = str(getattr(slides[i], "motion", "") or "").strip().lower()
+            if ken_burns and not motion:
+                motion = "zoom_in"
+
+            if ken_burns and motion and motion not in {"hold", "none", "static"}:
                 frames = max(1, int(round(dur_s * float(fps))))
                 denom = max(1, frames - 1)
-                zoom_max = 1.03
+                zoom_max = 1.08
+                if motion in {"snap", "snap_zoom", "snapzoom"}:
+                    zoom_max = 1.12
                 zoom_delta = zoom_max - 1.0
 
                 # Stable Ken Burns without zoompan (avoids common jitter/wobble artifacts).
                 # We scale up deterministically per frame, force even dimensions, then crop back to output.
                 prog = f"if(gte(n,{denom}),1,n/{denom})"
-                scale_w = f"2*trunc(iw*(1+{zoom_delta:.6f}*{prog})/2)"
-                scale_h = f"2*trunc(ih*(1+{zoom_delta:.6f}*{prog})/2)"
+
+                if motion in {"snap", "snap_zoom", "snapzoom"}:
+                    snap_d = f"max(1,{int(max(1.0, round(0.18 * denom)))})"
+                    prog_eff = f"if(lte(n,{snap_d}),n/{snap_d},1)"
+                else:
+                    prog_eff = prog
+
+                if motion in {"zoom_out", "out"}:
+                    scale_expr = f"(1+{zoom_delta:.6f}*(1-{prog_eff}))"
+                else:
+                    scale_expr = f"(1+{zoom_delta:.6f}*{prog_eff})"
+
+                # Pans keep a slightly larger scale and move the crop window.
+                if motion in {"pan_lr", "pan", "pan_left_right", "left_right"}:
+                    scale_expr = "1.10"
+                    crop_x = f"2*trunc(((in_w-out_w)*{prog})/4)"
+                    crop_y = "2*trunc((in_h-out_h)/4)"
+                elif motion in {"pan_rl", "pan_right_left", "right_left"}:
+                    scale_expr = "1.10"
+                    crop_x = f"2*trunc(((in_w-out_w)*(1-{prog}))/4)"
+                    crop_y = "2*trunc((in_h-out_h)/4)"
+                else:
+                    crop_x = "2*trunc((in_w-out_w)/4)"
+                    crop_y = "2*trunc((in_h-out_h)/4)"
+
+                scale_w = f"2*trunc(iw*{scale_expr}/2)"
+                scale_h = f"2*trunc(ih*{scale_expr}/2)"
                 effect = (
                     f"format=rgba,"
                     f"scale=w='{scale_w}':h='{scale_h}':eval=frame:flags=lanczos+accurate_rnd,"
-                    f"crop={width}:{height}:x='2*trunc((in_w-out_w)/4)':y='2*trunc((in_h-out_h)/4)',"
-                    f"format=yuv420p"
+                    f"crop={width}:{height}:x='{crop_x}':y='{crop_y}',"
+                    f"format=yuv420p,setsar=1"
                 )
                 chain = f"[{in_label}]{scale_pad},{effect},trim=duration={dur_s:.3f},setpts=PTS-STARTPTS"
             else:
@@ -999,18 +1210,25 @@ def render_slideshow(
 
         return cmd
 
-    # Ken Burns was removed/disabled due to jitter on common players.
-    ken_burns = False
-
-    # If transitions are enabled, use the filter_complex path.
-    if trans is not None:
+    # If transitions, Ken Burns, or video clips are present, use the filter_complex path.
+    has_video_clips = any(
+        s.video_clip_path and Path(s.video_clip_path).exists() for s in slides
+    )
+    if trans is not None or ken_burns or has_video_clips:
         base = _build_with_filters(use_duck=bgm_duck)
 
     # Prefer H.264 for YouTube; fall back if encoder isn't available.
-    attempts = [
-        ("libx264", ["-c:v", "libx264", "-tune", "stillimage"]),
-        ("mpeg4", ["-c:v", "mpeg4", "-q:v", "4"]),
-    ]
+    # When video clips are present, don't use -tune stillimage.
+    if has_video_clips:
+        attempts = [
+            ("libx264", ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]),
+            ("mpeg4", ["-c:v", "mpeg4", "-q:v", "4"]),
+        ]
+    else:
+        attempts = [
+            ("libx264", ["-c:v", "libx264", "-tune", "stillimage"]),
+            ("mpeg4", ["-c:v", "mpeg4", "-q:v", "4"]),
+        ]
 
     last_stderr = ""
     for name, extra in attempts:

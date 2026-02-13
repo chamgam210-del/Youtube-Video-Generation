@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import base64
+import io
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import requests
-from PIL import Image, ImageDraw, ImageEnhance, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 from .models import Slide, TranscriptSegment
 
@@ -20,6 +23,9 @@ class YouTubePackage:
     thumbnail_slide_index: int
     verdict_label: str
     thumbnail_stamp_text: str | None = None
+    # Optional: long-review thumbnail hook text + crop (debug/trace).
+    thumbnail_text: str | None = None
+    thumbnail_crop: dict[str, float] | None = None
 
 
 def _openai_chat_completions(*, api_key: str, model: str, messages: list[dict[str, Any]], timeout_s: int = 60) -> str:
@@ -37,6 +43,174 @@ def _openai_chat_completions(*, api_key: str, model: str, messages: list[dict[st
     resp.raise_for_status()
     data = resp.json()
     return data["choices"][0]["message"]["content"]
+
+
+_TITLE_STOP_WORDS = {
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "of",
+    "to",
+    "in",
+    "on",
+    "for",
+    "with",
+    "without",
+    "movie",
+    "film",
+    "review",
+}
+
+
+def _sanitize_thumbnail_phrase(raw: str, *, title: str) -> str:
+    s = " ".join(str(raw or "").split()).strip()
+    if not s:
+        return "WORTH IT?"
+
+    # If the model returned multiple lines/quotes, take the first non-empty line.
+    if "\n" in s:
+        s = next((ln.strip() for ln in s.splitlines() if ln.strip()), "").strip()
+    s = s.strip("\"'“”‘’` ")
+
+    # Keep only letters/numbers/spaces, plus a single trailing ? or !.
+    wants_q = "?" in s
+    wants_bang = ("!" in s) and (not wants_q)
+    s = re.sub(r"[^A-Za-z0-9\s]", " ", s)
+    s = " ".join(s.split()).strip()
+
+    words = s.split()
+    if len(words) > 4:
+        words = words[:4]
+
+    # Avoid repeating the title (drop significant title tokens if they appear).
+    title_tokens = [
+        t
+        for t in re.sub(r"[^A-Za-z0-9\s]", " ", str(title or "")).lower().split()
+        if t and (t not in _TITLE_STOP_WORDS) and (len(t) >= 4)
+    ]
+    if title_tokens and words:
+        lowered = [w.lower() for w in words]
+        filtered: list[str] = []
+        for w in words:
+            if w.lower() in title_tokens:
+                continue
+            filtered.append(w)
+        if filtered:
+            words = filtered
+
+    if not words:
+        out = "WORTH IT"
+    else:
+        out = " ".join(words)
+
+    out = out.upper().strip()
+    if wants_q:
+        out = out.rstrip("?!") + "?"
+    elif wants_bang:
+        out = out.rstrip("?!") + "!"
+
+    # Guardrails: avoid incomplete/auxiliary-only phrases that look broken on thumbnails.
+    try:
+        out_cmp = re.sub(r"[^A-Z0-9\s]", "", out).strip()
+        toks = [t for t in out_cmp.split() if t]
+        if toks == ["I", "WAS"]:
+            return "I WAS WRONG"
+
+        bad_two_word = {
+            "I AM",
+            "IM",
+            "I WAS",
+            "WE ARE",
+            "WE WERE",
+            "IT IS",
+            "IT WAS",
+            "THIS IS",
+            "THAT WAS",
+        }
+        if out_cmp in bad_two_word:
+            return "WORTH IT?"
+
+        if len(toks) == 2 and all(len(t) <= 3 for t in toks) and (not (out.endswith("?") or out.endswith("!"))):
+            return "WORTH IT?"
+        if len(toks) == 1 and len(toks[0]) <= 3 and (not (out.endswith("?") or out.endswith("!"))):
+            return "WORTH IT?"
+    except Exception:
+        pass
+    return out
+
+
+def pick_review_thumbnail_text_with_llm(
+    segments: list[TranscriptSegment],
+    *,
+    title: str,
+    model: str = "gpt-4o-mini",
+) -> str:
+    """Pick one CTR-optimized thumbnail phrase for a long movie review.
+
+    Uses the user's production prompt. Returns a sanitized 1–4 word phrase.
+    """
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return "WORTH IT?"
+
+    transcript = " ".join((str(s.text or "").strip() for s in segments if str(s.text or "").strip())).strip()
+    if not transcript:
+        return "WORTH IT?"
+
+    # Keep within a reasonable size so requests don't blow up.
+    if len(transcript) > 18000:
+        transcript = transcript[:18000]
+
+    system = (
+        "You are a YouTube growth expert specializing in movie review channels.\n\n"
+        "Your task is to select ONE thumbnail text (2–4 words max) that maximizes click-through rate.\n\n"
+        "This text must:\n\n"
+        "Be emotionally charged\n\n"
+        "Create curiosity or controversy\n\n"
+        "Be readable on a phone\n\n"
+        "NOT summarize the review\n\n"
+        "NOT repeat the title\n\n"
+        "NOT use punctuation beyond “?” or “!”\n\n"
+        "The thumbnail text should feel like a reaction, not an explanation.\n\n"
+        "Do NOT explain your reasoning.\n\n"
+        "Output ONLY the final thumbnail text, nothing else."
+    )
+
+    user = (
+        f"Movie title: {str(title or '').strip()}\n\n"
+        "Transcript:\n"
+        f"{transcript}\n\n"
+        "Guidelines:\n"
+        "- Choose ONE phrase (2–4 words max)\n"
+        "- Prioritize curiosity over accuracy\n"
+        "- Prefer emotional or opinionated language\n"
+        "- If the review is mixed or hesitant, lean controversial\n"
+        "- If the review is positive but unexpected, lean surprise\n"
+        "- If the review is negative, lean disappointment or disbelief\n\n"
+        "Examples of good outputs:\n"
+        "WORTH IT?\n"
+        "SURPRISINGLY GOOD\n"
+        "I WAS WRONG\n"
+        "THIS WORKS\n"
+        "WHAT HAPPENED?\n"
+        "NOT WHAT I EXPECTED\n\n"
+        "Return ONLY the thumbnail text."
+    )
+
+    try:
+        out = _openai_chat_completions(
+            api_key=api_key,
+            model=model,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            timeout_s=60,
+        )
+    except Exception:
+        return "WORTH IT?"
+
+    return _sanitize_thumbnail_phrase(out, title=title)
 
 
 def generate_youtube_package(
@@ -207,6 +381,8 @@ def write_youtube_metadata_text(out_dir: str | Path, pkg: YouTubePackage) -> Pat
         f"Thumbnail slide index:\n{pkg.thumbnail_slide_index}\n\n"
         f"Thumbnail verdict label:\n{pkg.verdict_label}\n"
         f"Thumbnail stamp text:\n{pkg.thumbnail_stamp_text or ''}\n"
+        f"Thumbnail text:\n{pkg.thumbnail_text or ''}\n"
+        f"Thumbnail crop:\n{json.dumps(pkg.thumbnail_crop or {}, ensure_ascii=False)}\n"
     )
     p.write_text(text, encoding="utf-8")
     return p
@@ -224,12 +400,88 @@ def create_thumbnail(
     match_video_frame: bool = False,
     theme: str = "default",
     show_title: bool = True,
+    crop: dict[str, float] | None = None,
 ) -> Path:
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     with Image.open(background_image) as im:
         im = im.convert("RGB")
+
+        pre_cropped_to_aspect = False
+
+        # Optional pre-crop (normalized coordinates in [0,1]) before aspect fitting.
+        if crop and all(k in crop for k in ("x", "y", "w", "h")):
+            try:
+                cx = float(crop.get("x") or 0.0)
+                cy = float(crop.get("y") or 0.0)
+                cw = float(crop.get("w") or 0.0)
+                ch = float(crop.get("h") or 0.0)
+                if cw > 0.01 and ch > 0.01:
+                    src_w, src_h = im.size
+                    x0 = int(max(0.0, min(1.0, cx)) * src_w)
+                    y0 = int(max(0.0, min(1.0, cy)) * src_h)
+                    x1 = int(max(0.0, min(1.0, cx + cw)) * src_w)
+                    y1 = int(max(0.0, min(1.0, cy + ch)) * src_h)
+
+                    # Expand the crop box to match the target aspect ratio by growing (not shrinking)
+                    # around the crop center when possible. This helps prevent faces being clipped
+                    # by a second cover-crop step.
+                    target_ratio = width / float(height)
+                    box_w = max(2, x1 - x0)
+                    box_h = max(2, y1 - y0)
+                    cx_px = x0 + box_w / 2.0
+                    cy_px = y0 + box_h / 2.0
+                    cur_ratio = box_w / float(box_h)
+
+                    if abs(cur_ratio - target_ratio) > 1e-3:
+                        if cur_ratio > target_ratio:
+                            # Too wide: expand height.
+                            new_h = int(round(box_w / float(target_ratio)))
+                            new_w = box_w
+                        else:
+                            # Too tall: expand width.
+                            new_w = int(round(box_h * float(target_ratio)))
+                            new_h = box_h
+
+                        new_w = max(2, min(int(src_w), int(new_w)))
+                        new_h = max(2, min(int(src_h), int(new_h)))
+
+                        nx0 = int(round(cx_px - new_w / 2.0))
+                        ny0 = int(round(cy_px - new_h / 2.0))
+                        nx1 = nx0 + new_w
+                        ny1 = ny0 + new_h
+
+                        # Clamp box into bounds while preserving size.
+                        if nx0 < 0:
+                            nx1 -= nx0
+                            nx0 = 0
+                        if ny0 < 0:
+                            ny1 -= ny0
+                            ny0 = 0
+                        if nx1 > src_w:
+                            shift = nx1 - src_w
+                            nx0 -= shift
+                            nx1 = src_w
+                        if ny1 > src_h:
+                            shift = ny1 - src_h
+                            ny0 -= shift
+                            ny1 = src_h
+
+                        nx0 = max(0, int(nx0))
+                        ny0 = max(0, int(ny0))
+                        nx1 = min(int(src_w), int(nx1))
+                        ny1 = min(int(src_h), int(ny1))
+                    else:
+                        nx0, ny0, nx1, ny1 = x0, y0, x1, y1
+
+                    if nx1 > nx0 + 2 and ny1 > ny0 + 2:
+                        im = im.crop((nx0, ny0, nx1, ny1))
+                        pre_cropped_to_aspect = True
+            except Exception:
+                pass
+
+        theme_norm = (theme or "default").strip().lower()
 
         if match_video_frame:
             # Match render.py: scale down to fit + pad (no cropping), so the thumbnail background
@@ -258,7 +510,12 @@ def create_thumbnail(
             else:
                 # too tall
                 new_h = int(src_w / target_ratio)
-                top = (src_h - new_h) // 2
+                # For long-review thumbnails, bias upward to leave headroom so the face isn't under the title.
+                excess = max(0, src_h - new_h)
+                if theme_norm == "review_long":
+                    top = int(round(excess * 0.32))
+                else:
+                    top = excess // 2
                 im = im.crop((0, top, src_w, top + new_h))
 
             im = im.resize((width, height), Image.Resampling.LANCZOS)
@@ -268,9 +525,130 @@ def create_thumbnail(
             overlay = Image.new("RGB", (width, height), (0, 0, 0))
             im = Image.blend(im, overlay, alpha=0.18)
 
-        draw = ImageDraw.Draw(im)
+        # If we already pre-cropped to (approximately) the target aspect, avoid an additional
+        # cover-crop effect by just resizing to the output size.
+        if pre_cropped_to_aspect and not match_video_frame:
+            try:
+                im = im.resize((width, height), Image.Resampling.LANCZOS)
+            except Exception:
+                pass
 
-        theme_norm = (theme or "default").strip().lower()
+        # Long review thumbnail: title + verdict stamp (reference-style), but with the
+        # title slightly smaller to avoid dominating the frame.
+        if theme_norm == "review_long":
+            # Darken aggressively for contrast.
+            im = ImageEnhance.Contrast(im).enhance(1.08)
+            overlay = Image.new("RGB", (width, height), (0, 0, 0))
+            im = Image.blend(im, overlay, alpha=0.30)
+
+            # Slight vignette for extra focus/contrast.
+            try:
+                vignette = Image.new("L", (width, height), 0)
+                vd = ImageDraw.Draw(vignette)
+                pad_x = int(width * 0.08)
+                pad_y = int(height * 0.10)
+                vd.ellipse((pad_x, pad_y, width - pad_x, height - pad_y), fill=255)
+                vignette = vignette.filter(ImageFilter.GaussianBlur(radius=int(min(width, height) * 0.06)))
+                vignette = Image.eval(vignette, lambda a: 255 - a)
+                shade = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+                shade.putalpha(vignette.point(lambda a: int(a * 0.35)))
+                base = im.convert("RGBA")
+                base.alpha_composite(shade)
+                im = base.convert("RGB")
+            except Exception:
+                pass
+
+            draw = ImageDraw.Draw(im)
+
+            # Title (top): smaller than the default theme.
+            if show_title:
+                title_text = " ".join((text or "").split()).strip()
+                if title_text:
+                    title_stroke_w = max(4, width // 180)
+                    title_fill = (0, 0, 0)  # black
+                    title_stroke = (255, 140, 0)  # orange outline
+
+                    fitted_text, title_font = _fit_title_text(
+                        draw,
+                        title_text,
+                        width=width,
+                        height=height,
+                        stroke_width=title_stroke_w,
+                        max_lines=3,
+                        max_text_h_ratio=0.18,
+                        max_size=min(108, int(width * 0.075)),
+                    )
+                    spacing = max(6, int(getattr(title_font, "size", 64) * 0.12))
+                    title_bbox = draw.multiline_textbbox(
+                        (0, 0),
+                        fitted_text,
+                        font=title_font,
+                        align="center",
+                        stroke_width=title_stroke_w,
+                        spacing=spacing,
+                    )
+                    title_w = title_bbox[2] - title_bbox[0]
+                    title_x = int((width - title_w) / 2)
+                    top_margin = max(14, title_stroke_w * 2)
+                    title_y = int(top_margin)
+                    draw.multiline_text(
+                        (title_x, title_y),
+                        fitted_text,
+                        font=title_font,
+                        fill=title_fill,
+                        align="center",
+                        stroke_width=title_stroke_w,
+                        stroke_fill=title_stroke,
+                        spacing=spacing,
+                    )
+
+            # Verdict stamp (bottom).
+            chosen_stamp = (str(verdict_text).strip() if verdict_text else "")
+            if chosen_stamp and chosen_stamp.lower() != "decent":
+                vt = chosen_stamp
+                # Green verdict text (no backing plate), slightly smaller.
+                verdict_font = _pick_font(vt, width, size_hint=int(width * 0.105), max_size=210)
+                verdict_stroke_w = max(9, width // 90)
+                verdict_fill = (0, 200, 83, 255)
+                verdict_stroke = (0, 0, 0, 255)
+                verdict_cx = int(width * 0.5)
+                verdict_cy = int(height * 0.86)
+
+                stamp_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+                stamp_draw = ImageDraw.Draw(stamp_layer)
+                stamp_spacing = max(6, int(getattr(verdict_font, "size", 64) * 0.10))
+                stamp_bbox = stamp_draw.multiline_textbbox(
+                    (0, 0),
+                    vt,
+                    font=verdict_font,
+                    align="center",
+                    stroke_width=verdict_stroke_w,
+                    spacing=stamp_spacing,
+                )
+                stamp_w = stamp_bbox[2] - stamp_bbox[0]
+                stamp_h = stamp_bbox[3] - stamp_bbox[1]
+                stamp_x = int(verdict_cx - stamp_w / 2)
+                stamp_y = int(verdict_cy - stamp_h / 2)
+
+                stamp_draw.multiline_text(
+                    (stamp_x, stamp_y),
+                    vt,
+                    font=verdict_font,
+                    fill=verdict_fill,
+                    align="center",
+                    stroke_width=verdict_stroke_w,
+                    stroke_fill=verdict_stroke,
+                    spacing=stamp_spacing,
+                )
+
+                base = im.convert("RGBA")
+                base.alpha_composite(stamp_layer)
+                im = base.convert("RGB")
+
+            im.save(out_path, format="PNG")
+            return out_path
+
+        draw = ImageDraw.Draw(im)
 
         # Visual rule: if a review is merely "Decent", show no stamp at all.
         if verdict_text is not None and str(verdict_text).strip().lower() == "decent":
@@ -372,17 +750,6 @@ def create_thumbnail(
                     stamp_y = int(verdict_cy - stamp_h / 2)
 
                     # Backing plate for better contrast (especially on busy backgrounds).
-                    if is_verdict:
-                        pad_x = max(22, int(getattr(verdict_font, "size", 140) * 0.55))
-                        pad_y = max(14, int(getattr(verdict_font, "size", 140) * 0.25))
-                        bx0 = max(0, stamp_x - pad_x)
-                        by0 = max(0, stamp_y - pad_y)
-                        bx1 = min(width, stamp_x + int(stamp_w) + pad_x)
-                        by1 = min(height, stamp_y + int(stamp_h) + pad_y)
-                        rr = max(18, int((by1 - by0) * 0.35))
-                        # subtle shadow
-                        stamp_draw.rounded_rectangle((bx0 + 6, by0 + 7, bx1 + 6, by1 + 7), radius=rr, fill=(0, 0, 0, 140))
-                        stamp_draw.rounded_rectangle((bx0, by0, bx1, by1), radius=rr, fill=(0, 0, 0, 170))
                     stamp_draw.multiline_text(
                         (stamp_x, stamp_y),
                         vt,
@@ -427,6 +794,439 @@ def create_thumbnail(
         im.save(out_path, format="PNG")
 
     return out_path
+
+
+def _encode_image_data_url(path: str | Path, *, max_side: int = 512, quality: int = 78) -> str:
+    p = Path(path)
+    with Image.open(p) as im:
+        im = im.convert("RGB")
+        w, h = im.size
+        scale = min(1.0, float(max_side) / float(max(w, h)))
+        if scale < 1.0:
+            im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=int(quality), optimize=True)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def _encode_pil_image_data_url(im: Image.Image, *, max_side: int = 512, quality: int = 78) -> str:
+    im = im.convert("RGB")
+    w, h = im.size
+    scale = min(1.0, float(max_side) / float(max(w, h)))
+    if scale < 1.0:
+        im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=int(quality), optimize=True)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def _vision_verify_centered_person(
+    *,
+    api_key: str,
+    model: str,
+    image_path: Path,
+    crop: dict[str, float] | None,
+    timeout_s: int = 60,
+) -> bool:
+    """Return True if (after applying crop) the image has a clearly visible centered person.
+
+    Close-ups are OK; we just need a visible person/face as the dominant subject,
+    and that subject should be near the center of the frame.
+    """
+
+    try:
+        with Image.open(image_path) as im:
+            im = im.convert("RGB")
+            if crop and all(k in crop for k in ("x", "y", "w", "h")):
+                try:
+                    cx = float(crop.get("x") or 0.0)
+                    cy = float(crop.get("y") or 0.0)
+                    cw = float(crop.get("w") or 0.0)
+                    ch = float(crop.get("h") or 0.0)
+                    if cw > 0.01 and ch > 0.01:
+                        src_w, src_h = im.size
+                        x0 = int(max(0.0, min(1.0, cx)) * src_w)
+                        y0 = int(max(0.0, min(1.0, cy)) * src_h)
+                        x1 = int(max(0.0, min(1.0, cx + cw)) * src_w)
+                        y1 = int(max(0.0, min(1.0, cy + ch)) * src_h)
+                        if x1 > x0 + 2 and y1 > y0 + 2:
+                            im = im.crop((x0, y0, x1, y1))
+                except Exception:
+                    pass
+
+            url = _encode_pil_image_data_url(im, max_side=512, quality=78)
+
+        system = (
+            "You are a strict thumbnail QA checker. Return ONLY valid JSON (no markdown).\n"
+            "Schema: {\"ok\": <bool>}\n"
+            "ok must be true ONLY if ALL are satisfied:\n"
+            "- There is a clearly visible PERSON/CHARACTER as the dominant subject (not a landscape/object).\n"
+            "- The person is near the center of the frame (roughly centered).\n"
+            "- The face is visible (eyes visible) OR it is an obvious close-up of the person.\n"
+            "- The face/head is NOT cut off by the frame edges (no missing forehead/chin/cheeks due to cropping).\n"
+            "- Composition leaves headroom: the face/head should not be too high in frame (reserve space for a title at the top).\n"
+            "- Not a poster/collage/text-heavy graphic.\n"
+        )
+
+        content = _openai_chat_completions(
+            api_key=api_key,
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Check this candidate."},
+                        {"type": "image_url", "image_url": {"url": url}},
+                    ],
+                },
+            ],
+            timeout_s=int(timeout_s),
+        )
+
+        parsed = json.loads(content)
+        if isinstance(parsed, dict):
+            return bool(parsed.get("ok"))
+        return False
+    except Exception:
+        return False
+
+
+def _vision_detect_main_face_bbox(
+    *,
+    api_key: str,
+    model: str,
+    image_path: Path,
+    timeout_s: int = 60,
+) -> dict[str, float] | None:
+    """Detect the dominant visible face bbox in normalized coordinates.
+
+    Returns {x,y,w,h} in [0,1] or None if not found.
+    """
+
+    try:
+        url = _encode_image_data_url(image_path, max_side=512, quality=78)
+        system = (
+            "You are a precise vision detector. Return ONLY valid JSON (no markdown).\n"
+            "Schema: {\"found\": <bool>, \"bbox\": {\"x\":<float>,\"y\":<float>,\"w\":<float>,\"h\":<float>}}\n"
+            "Rules:\n"
+            "- If a face is visible, choose the MOST PROMINENT face (largest/most central).\n"
+            "- bbox must tightly enclose the full face/head (include forehead+chin; don’t crop it).\n"
+            "- Coordinates are normalized [0,1] with x,y as TOP-LEFT.\n"
+            "- If no clear face is visible, set found=false." 
+        )
+
+        content = _openai_chat_completions(
+            api_key=api_key,
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Detect the main face bbox."},
+                        {"type": "image_url", "image_url": {"url": url}},
+                    ],
+                },
+            ],
+            timeout_s=int(timeout_s),
+        )
+
+        parsed = json.loads(content)
+        if not isinstance(parsed, dict) or not bool(parsed.get("found")):
+            return None
+        bbox = parsed.get("bbox")
+        if not isinstance(bbox, dict):
+            return None
+        x = float(bbox.get("x"))
+        y = float(bbox.get("y"))
+        w = float(bbox.get("w"))
+        h = float(bbox.get("h"))
+        if w <= 0.01 or h <= 0.01:
+            return None
+        x = max(0.0, min(1.0, x))
+        y = max(0.0, min(1.0, y))
+        w = max(0.01, min(1.0 - x, w))
+        h = max(0.01, min(1.0 - y, h))
+        return {"x": x, "y": y, "w": w, "h": h}
+    except Exception:
+        return None
+
+
+def _crop_center_face(
+    *,
+    face_bbox: dict[str, float],
+    target_ratio: float,
+    face_fill: float = 0.52,
+    headroom_frac: float = 0.18,
+) -> dict[str, float]:
+    """Compute a crop window that centers the face and leaves top headroom for title.
+
+    - face_fill ~ fraction of crop height covered by face bbox height.
+    - headroom_frac ~ reserved top portion (for title), pushing face lower.
+    """
+
+    fx = float(face_bbox.get("x"))
+    fy = float(face_bbox.get("y"))
+    fw = float(face_bbox.get("w"))
+    fh = float(face_bbox.get("h"))
+    fcx = fx + fw / 2.0
+    fcy = fy + fh / 2.0
+
+    # Choose crop height such that the face occupies ~face_fill of crop height.
+    crop_h = min(1.0, max(0.20, fh / max(0.20, min(0.90, face_fill))))
+    crop_w = min(1.0, max(0.20, crop_h * float(target_ratio)))
+
+    # If width is constrained, recompute height from width.
+    if crop_w >= 0.999 and target_ratio > 0:
+        crop_h = min(1.0, crop_w / float(target_ratio))
+
+    # Place face near center, but slightly lower to leave room for title at top.
+    desired_x = 0.50
+    # Map headroom into desired face Y position inside crop.
+    desired_y = min(0.70, max(0.45, 0.50 + float(headroom_frac) * 0.55))
+
+    x = fcx - desired_x * crop_w
+    y = fcy - desired_y * crop_h
+
+    # Clamp.
+    x = max(0.0, min(1.0 - crop_w, x))
+    y = max(0.0, min(1.0 - crop_h, y))
+
+    return {"x": float(x), "y": float(y), "w": float(crop_w), "h": float(crop_h)}
+
+
+def pick_long_review_thumbnail_with_vision(
+    *,
+    slides: list[Slide],
+    topic: str | None,
+    title: str,
+    model: str = "gpt-4o-mini",
+    max_candidates: int = 8,
+    forced_text: str | None = None,
+) -> tuple[int, str, dict[str, float] | None]:
+    """Pick (slide_index, thumbnail_text, crop) for long review thumbnails.
+
+    Uses OpenAI vision if OPENAI_API_KEY is set; otherwise falls back.
+    crop is normalized {x,y,w,h} in [0,1] relative to the selected image.
+    """
+
+    if not slides:
+        return 0, "WORTH IT?", None
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return _fallback_thumbnail_index(slides), "WORTH IT?", None
+
+    forced = " ".join(str(forced_text or "").split()).strip()
+    if forced:
+        words = forced.split()
+        if len(words) > 4:
+            forced = " ".join(words[:4])
+
+    # Prefer likely character/scene stills; avoid poster-y queries when possible.
+    scored: list[tuple[int, float]] = []
+    for i, s in enumerate(slides[:50]):
+        q = (s.query or "").lower()
+        score = 0.0
+        if "poster" in q:
+            score -= 2.0
+        if any(k in q for k in ("still", "scene", "screencap", "frame", "cast")):
+            score += 1.0
+        if any(k in q for k in ("close", "portrait", "face")):
+            score += 0.8
+        scored.append((i, score))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    # Build a small, diverse candidate set (top scored + a few spaced picks) to increase
+    # odds of finding a clear face close-up.
+    max_c = max(4, min(int(max_candidates), len(scored)))
+    top = [i for i, _ in scored[: max(2, max_c // 2)]]
+    spaced: list[int] = []
+    if len(scored) > 6:
+        step = max(1, len(scored) // max(3, max_c // 2))
+        for j in range(0, len(scored), step):
+            spaced.append(scored[j][0])
+            if len(spaced) >= max(2, max_c - len(top)):
+                break
+
+    picks: list[int] = []
+    for i in (top + spaced):
+        if i not in picks:
+            picks.append(i)
+        if len(picks) >= max_c:
+            break
+    if not picks:
+        picks = [0]
+
+    system = (
+        "You are selecting a YouTube MOVIE REVIEW thumbnail background. "
+        "Follow these rules strictly:\n"
+        "- The image MUST feature a clearly visible PERSON/CHARACTER as the dominant subject.\n"
+        "- That person MUST be near the center of the frame (centered composition).\n"
+        "- Close-up is good; face/eyes should be visible; avoid tiny full-body shots.\n"
+        "- Do NOT crop so tight that any part of the face/head is cut off. Leave a little breathing room.\n"
+        "- Use ONLY one focal point (one person). Avoid crowds.\n"
+        "- Avoid posters, collages, text-heavy images, logos.\n"
+        "- Provide ONE strong text phrase (2-4 words max). Examples: 'WORTH IT?', 'SURPRISING', 'I WAS WRONG', 'BRUTAL'.\n"
+        "Return ONLY valid JSON (no markdown).\n"
+        "Schema: {\"index\": <int>, \"text\": <string>, \"crop\": {\"x\":<float>,\"y\":<float>,\"w\":<float>,\"h\":<float>}}\n"
+        "crop must be normalized [0,1] (top-left x,y + w,h) and should center the person/face in-frame."
+    )
+
+    def _pad_crop(c: dict[str, float] | None, *, pad_frac: float = 0.12) -> dict[str, float] | None:
+        if not c:
+            return None
+        try:
+            x = float(c.get("x"))
+            y = float(c.get("y"))
+            w = float(c.get("w"))
+            h = float(c.get("h"))
+        except Exception:
+            return c
+        if w <= 0.01 or h <= 0.01:
+            return c
+
+        # Expand around center to reduce risk of cutting off forehead/chin.
+        cx = x + w / 2.0
+        cy = y + h / 2.0
+        w2 = min(1.0, w * (1.0 + float(pad_frac)))
+        h2 = min(1.0, h * (1.0 + float(pad_frac)))
+        x2 = cx - w2 / 2.0
+        y2 = cy - h2 / 2.0
+
+        # Clamp into [0,1].
+        x2 = max(0.0, min(1.0 - w2, x2))
+        y2 = max(0.0, min(1.0 - h2, y2))
+        return {"x": float(x2), "y": float(y2), "w": float(w2), "h": float(h2)}
+
+    def _add_headroom(c: dict[str, float] | None, *, headroom_frac_of_h: float = 0.10) -> dict[str, float] | None:
+        """Shift crop up a bit so the subject lands lower (more top headroom)."""
+        if not c:
+            return None
+        try:
+            x = float(c.get("x"))
+            y = float(c.get("y"))
+            w = float(c.get("w"))
+            h = float(c.get("h"))
+        except Exception:
+            return c
+        if h <= 0.01:
+            return c
+        y2 = max(0.0, y - float(headroom_frac_of_h) * h)
+        y2 = min(1.0 - h, y2)
+        return {"x": x, "y": float(y2), "w": w, "h": h}
+
+    def _pick_from_candidates(candidate_idxs: list[int]) -> tuple[int, str, dict[str, float] | None]:
+        user_text = {
+            "title": (title or "").strip(),
+            "topic": (topic or "").strip(),
+            "forced_text": forced,
+            "candidates": [
+                {"i": idx, "query": (slides[idx].query or ""), "filename": Path(slides[idx].image_path).name}
+                for idx in candidate_idxs
+            ],
+        }
+
+        content_parts: list[dict[str, Any]] = [{"type": "text", "text": json.dumps(user_text, ensure_ascii=False)}]
+        for idx in candidate_idxs:
+            try:
+                p = Path(slides[idx].image_path)
+                try:
+                    raw = _try_find_raw_for_card(p)
+                    if raw is not None:
+                        p = raw
+                except Exception:
+                    pass
+                url = _encode_image_data_url(p)
+                content_parts.append({"type": "image_url", "image_url": {"url": url}})
+            except Exception:
+                continue
+
+        content = _openai_chat_completions(
+            api_key=api_key,
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": content_parts},
+            ],
+            timeout_s=90,
+        )
+
+        parsed = json.loads(content)
+        if not isinstance(parsed, dict):
+            raise RuntimeError("Vision thumbnail picker returned non-object JSON")
+
+        idx = int(parsed.get("index"))
+        if idx not in candidate_idxs:
+            idx = candidate_idxs[0]
+
+        text = " ".join(str(parsed.get("text") or "").split()).strip() or "WORTH IT?"
+        if forced:
+            text = forced
+        words = text.split()
+        if len(words) > 4:
+            text = " ".join(words[:4])
+
+        crop = parsed.get("crop")
+        crop_out: dict[str, float] | None = None
+        if isinstance(crop, dict):
+            try:
+                cx = float(crop.get("x"))
+                cy = float(crop.get("y"))
+                cw = float(crop.get("w"))
+                ch = float(crop.get("h"))
+                if cw > 0.01 and ch > 0.01:
+                    crop_out = {
+                        "x": max(0.0, min(1.0, cx)),
+                        "y": max(0.0, min(1.0, cy)),
+                        "w": max(0.01, min(1.0, cw)),
+                        "h": max(0.01, min(1.0, ch)),
+                    }
+            except Exception:
+                crop_out = None
+
+        crop_out = _pad_crop(crop_out, pad_frac=0.14)
+        crop_out = _add_headroom(crop_out, headroom_frac_of_h=0.12)
+
+        return idx, text, crop_out
+
+    remaining = list(picks)
+    best_idx, best_text, best_crop = remaining[0], "WORTH IT?", None
+    for _attempt in range(3):
+        if not remaining:
+            break
+        idx, text, crop_out = _pick_from_candidates(remaining)
+        best_idx, best_text, best_crop = idx, text, crop_out
+
+        # Verify: must be a centered visible person (close-up ok) AND face should be centered.
+        try:
+            p = Path(slides[idx].image_path)
+            raw = None
+            try:
+                raw = _try_find_raw_for_card(p)
+            except Exception:
+                raw = None
+            if raw is not None:
+                p = raw
+
+            # Use face bbox to override crop for better centering.
+            face_bbox = _vision_detect_main_face_bbox(api_key=api_key, model=model, image_path=p)
+            if face_bbox is not None:
+                target_ratio = 16.0 / 9.0
+                crop_out = _pad_crop(_crop_center_face(face_bbox=face_bbox, target_ratio=target_ratio), pad_frac=0.10)
+
+            if _vision_verify_centered_person(api_key=api_key, model=model, image_path=p, crop=crop_out):
+                return best_idx, best_text, crop_out
+        except Exception:
+            pass
+
+        remaining = [i for i in remaining if i != idx]
+
+    return best_idx, best_text, best_crop
 
 
 def overlay_shorts_title_and_stamp(
@@ -842,20 +1642,22 @@ def _fit_title_text(
     height: int,
     stroke_width: int,
     max_lines: int,
+    max_text_h_ratio: float = 0.28,
+    max_size: int | None = None,
 ) -> tuple[str, ImageFont.FreeTypeFont | ImageFont.ImageFont]:
     # Safe area near the top so we don't collide with the mid-frame stamp.
     max_text_w = int(width * 0.92)
-    max_text_h = int(height * 0.28)
+    max_text_h = int(height * float(max_text_h_ratio))
 
     # Start big and step down until it fits.
-    max_size = min(150, int(width * 0.095))
+    max_size_eff = int(max_size) if max_size is not None else min(150, int(width * 0.095))
     min_size = 44
     step = 4
 
     best_text = " ".join((text or "").split())
     best_font: ImageFont.FreeTypeFont | ImageFont.ImageFont = _pick_font(best_text, width)
 
-    for size in range(max_size, min_size - 1, -step):
+    for size in range(max_size_eff, min_size - 1, -step):
         font = _load_font_with_size(size)
         wrapped = _wrap_text_to_width(
             draw,

@@ -18,6 +18,7 @@ dependencies = [
   "imageio-ffmpeg>=0.4.9",
   "python-dotenv>=1.0",
   "openai-whisper>=20231117",
+  "yt-dlp>=2024.1",
 ]
 
 [project.optional-dependencies]

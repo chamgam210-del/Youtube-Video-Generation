@@ -145,11 +145,14 @@ def enforce_first_slide_seconds(
                 end=end,
                 image_path=s0.image_path,
                 query=s0.query,
+                headline=getattr(s0, "headline", None),
+                subhead=getattr(s0, "subhead", None),
                 source_page=s0.source_page,
                 image_url=s0.image_url,
                 license_name=s0.license_name,
                 license_url=s0.license_url,
                 attribution=s0.attribution,
+                motion=getattr(s0, "motion", None),
             )
         ]
 
@@ -181,11 +184,14 @@ def enforce_first_slide_seconds(
                 end=float(end),
                 image_path=s.image_path,
                 query=s.query,
+                headline=getattr(s, "headline", None),
+                subhead=getattr(s, "subhead", None),
                 source_page=s.source_page,
                 image_url=s.image_url,
                 license_name=s.license_name,
                 license_url=s.license_url,
                 attribution=s.attribution,
+                motion=getattr(s, "motion", None),
             )
         )
         cur = float(end)
@@ -199,11 +205,14 @@ def enforce_first_slide_seconds(
             end=float(last_end),
             image_path=last.image_path,
             query=last.query,
+            headline=getattr(last, "headline", None),
+            subhead=getattr(last, "subhead", None),
             source_page=last.source_page,
             image_url=last.image_url,
             license_name=last.license_name,
             license_url=last.license_url,
             attribution=last.attribution,
+            motion=getattr(last, "motion", None),
         )
     )
 

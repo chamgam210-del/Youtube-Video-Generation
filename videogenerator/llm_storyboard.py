@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,9 +36,512 @@ class HighlightClip:
 
 
 @dataclass(frozen=True)
+class HighlightSpan:
+    start_i: int
+    end_i: int
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class InferredTopic:
     topic: str
     topic_type: str  # tv_show|movie|product|other
+
+
+@dataclass(frozen=True)
+class ShortsReviewHookFrame:
+    image_type: str  # poster|closeup|prestige_still|reaction_closeup|neutral
+    text: str
+    duration: float
+    motion: str  # none
+
+
+@dataclass(frozen=True)
+class ShortsReviewBeat:
+    timestamp: str
+    line: str
+    image_type: str  # prestige_still|reaction_closeup|closeup|neutral|poster
+    motion: str  # none|slow_zoom|slow_zoom_in|snap_zoom|minimal
+    text: str
+    priority: str  # hook|tension|payoff|verdict|loop
+    importance: str  # low|medium|high
+
+
+@dataclass(frozen=True)
+class ShortsReviewEndingFrame:
+    image_type: str  # neutral|poster|closeup
+    text: str
+    duration: float
+    motion: str  # none
+
+
+@dataclass(frozen=True)
+class ShortsReviewStoryboard:
+    hook_frame: ShortsReviewHookFrame
+    beats: list[ShortsReviewBeat]
+    ending_frame: ShortsReviewEndingFrame
+
+
+_TS_RE = re.compile(r"(?P<s>\d+(?:\.\d+)?)\s*(?:–|—|-|to)\s*(?P<e>\d+(?:\.\d+)?)")
+
+_PIVOT_RE = re.compile(r"\b(but|however|here'?s the thing)\b", re.IGNORECASE)
+
+
+def _parse_timestamp_range(ts: str) -> tuple[float, float] | None:
+    m = _TS_RE.search(str(ts or ""))
+    if not m:
+        return None
+    try:
+        s = float(m.group("s"))
+        e = float(m.group("e"))
+    except Exception:
+        return None
+    if e <= s:
+        return None
+    return s, e
+
+
+def _is_pivot(line: str) -> bool:
+    return bool(_PIVOT_RE.search(str(line or "")))
+
+
+def _normalize_hook_text(t: str) -> str:
+    txt = " ".join(str(t or "").replace("\n", " ").split()).strip()
+    if not txt:
+        return "HOW?!"
+
+    low = txt.lower()
+    banned = {
+        "this movie",
+        "this show",
+        "this film",
+        "my review",
+        "review",
+    }
+    if any(b in low for b in banned):
+        return "HOW?!"
+
+    # Encourage curiosity punctuation.
+    if ("?" not in txt) and ("!" not in txt):
+        txt = txt.upper() + "?"
+    return txt
+
+
+def _two_words_max(text: str) -> str:
+    t = " ".join(str(text or "").replace("\n", " ").split()).strip()
+    if not t:
+        return ""
+    # Keep emojis/punctuation if it is already a short CTA.
+    words = [w for w in t.split(" ") if w]
+    if len(words) <= 2:
+        return t
+    return " ".join(words[:2]).strip()
+
+
+def _coerce_choice(val: str, allowed: set[str], default: str) -> str:
+    v = str(val or "").strip().lower()
+    return v if v in allowed else default
+
+
+def parse_shorts_review_storyboard(obj: Any) -> ShortsReviewStoryboard:
+    if not isinstance(obj, dict):
+        raise ValueError("Story schema must be a JSON object")
+
+    hook = obj.get("hook_frame")
+    beats = obj.get("beats")
+    ending = obj.get("ending_frame")
+
+    if not isinstance(hook, dict):
+        raise ValueError("hook_frame is required")
+    if not isinstance(beats, list):
+        raise ValueError("beats must be an array")
+    if not isinstance(ending, dict):
+        raise ValueError("ending_frame is required")
+
+    hook_frame = ShortsReviewHookFrame(
+        image_type=_coerce_choice(
+            hook.get("image_type"),
+            {"poster", "closeup", "prestige_still", "reaction_closeup", "neutral"},
+            "poster",
+        ),
+        text=str(hook.get("text") or "").strip(),
+        duration=float(hook.get("duration") or 1.6),
+        motion=_coerce_choice(hook.get("motion"), {"none"}, "none"),
+    )
+
+    ending_frame = ShortsReviewEndingFrame(
+        image_type=_coerce_choice(
+            ending.get("image_type"),
+            {"neutral", "poster", "closeup", "prestige_still", "reaction_closeup"},
+            "neutral",
+        ),
+        text=str(ending.get("text") or "").strip(),
+        duration=float(ending.get("duration") or 1.2),
+        motion=_coerce_choice(ending.get("motion"), {"none"}, "none"),
+    )
+
+    out_beats: list[ShortsReviewBeat] = []
+    for item in beats:
+        if not isinstance(item, dict):
+            continue
+
+        ts = str(item.get("timestamp") or "").strip()
+        parsed = _parse_timestamp_range(ts)
+        if not parsed:
+            # Accept start/end numeric as a back-compat format.
+            try:
+                s = float(item.get("start"))
+                e = float(item.get("end"))
+                if e > s:
+                    ts = f"{s:.2f}-{e:.2f}"
+            except Exception:
+                ts = ""
+        else:
+            # Timestamp clamp: keep beats short so captions don't linger.
+            s, e = float(parsed[0]), float(parsed[1])
+            if (e - s) > 2.2:
+                e = s + 2.2
+            ts = f"{s:.2f}-{e:.2f}"
+
+        out_beats.append(
+            ShortsReviewBeat(
+                timestamp=ts,
+                line=str(item.get("line") or "").strip(),
+                image_type=_coerce_choice(
+                    item.get("image_type"),
+                    {"poster", "closeup", "prestige_still", "reaction_closeup", "neutral"},
+                    "prestige_still",
+                ),
+                motion=_coerce_choice(
+                    item.get("motion"),
+                    {"none", "slow_zoom", "slow_zoom_in", "snap_zoom", "minimal"},
+                    "slow_zoom",
+                ),
+                text=str(item.get("text") or "").strip(),
+                priority=_coerce_choice(
+                    item.get("priority"),
+                    {"hook", "tension", "payoff", "verdict", "loop"},
+                    "tension",
+                ),
+                importance=_coerce_choice(item.get("importance"), {"low", "medium", "high"}, "medium"),
+            )
+        )
+
+    return ShortsReviewStoryboard(hook_frame=hook_frame, beats=out_beats, ending_frame=ending_frame)
+
+
+def normalize_shorts_review_storyboard(
+    sb: ShortsReviewStoryboard,
+    *,
+    hook_seconds: float,
+    ending_seconds: float,
+    max_beats: int,
+) -> ShortsReviewStoryboard:
+    hook_s = max(0.0, float(hook_seconds))
+    end_s = max(0.0, float(ending_seconds))
+
+    # Enforce hook/ending invariants.
+    hook = ShortsReviewHookFrame(
+        image_type=sb.hook_frame.image_type,
+        text=_normalize_hook_text(sb.hook_frame.text),
+        duration=hook_s,
+        motion="none",
+    )
+    ending = ShortsReviewEndingFrame(
+        # Loop-compat: keep ending background compatible with the hook palette/composition.
+        image_type=(hook.image_type or sb.ending_frame.image_type),
+        text=(str(sb.ending_frame.text or "").strip() or "AGREE? 👇"),
+        duration=end_s,
+        motion="none",
+    )
+
+    beats = sb.beats[: max(0, int(max_beats))]
+
+    # Hook contrast (Rule A): hook must visually reset vs beat 1.
+    # We can't measure brightness/crop/temperature directly, so we enforce a reliable proxy:
+    # - If hook is a poster (wide/centered), beat 1 becomes a close-up (subject distance + crop change).
+    # - If hook is a close-up, beat 1 becomes a poster (subject distance + composition reset).
+    if beats:
+        desired_first = beats[0].image_type
+        hook_it = (hook.image_type or "").strip().lower()
+        if hook_it == "poster":
+            if beats[0].image_type not in {"closeup", "reaction_closeup"}:
+                desired_first = "closeup"
+        elif hook_it in {"closeup", "reaction_closeup"}:
+            desired_first = "poster"
+        else:
+            if beats[0].image_type == hook.image_type:
+                desired_first = "closeup" if hook_it == "poster" else "prestige_still"
+
+        if beats[0].image_type != desired_first:
+            beats[0] = ShortsReviewBeat(
+                timestamp=beats[0].timestamp,
+                line=beats[0].line,
+                image_type=desired_first,
+                motion=beats[0].motion,
+                text=beats[0].text,
+                priority=beats[0].priority,
+                importance=beats[0].importance,
+            )
+
+    # Caption density: <=2 words except hook/ending (we keep those as-is).
+    cleaned: list[ShortsReviewBeat] = []
+    for b in beats:
+        txt = _two_words_max(b.text)
+        # Pivot enforcement (Rule B): do NOT carry "BUT…" forward on the spoken beat.
+        # The pipeline inserts a dedicated pivot interrupt card + silence before the words.
+        if _is_pivot(b.line):
+            txt = ""
+        cleaned.append(
+            ShortsReviewBeat(
+                timestamp=b.timestamp,
+                line=b.line,
+                image_type=b.image_type,
+                motion=b.motion,
+                text=txt,
+                priority=("tension" if _is_pivot(b.line) else b.priority),
+                importance=("high" if _is_pivot(b.line) else b.importance),
+            )
+        )
+
+    # Caption integrity: if text doesn't change, image shouldn't change.
+    # Collapse consecutive beats with identical text (including empty) into one visual beat.
+    def _merge_ts(a: str, b: str) -> str:
+        ra = _parse_timestamp_range(a)
+        rb = _parse_timestamp_range(b)
+        if not ra or not rb:
+            return a
+        s = float(ra[0])
+        e = float(rb[1])
+        if e <= s:
+            return a
+        return f"{s:.2f}-{e:.2f}"
+
+    collapsed: list[ShortsReviewBeat] = []
+    for b in cleaned:
+        if collapsed and (collapsed[-1].text == b.text):
+            prev = collapsed[-1]
+            collapsed[-1] = ShortsReviewBeat(
+                timestamp=_merge_ts(prev.timestamp, b.timestamp),
+                line=(prev.line + " " + b.line).strip(),
+                image_type=prev.image_type,
+                motion=prev.motion,
+                text=prev.text,
+                priority=prev.priority,
+                importance=prev.importance,
+            )
+        else:
+            collapsed.append(b)
+
+    cleaned = collapsed
+
+    # Visual diversity: avoid repeating the same image_type back-to-back.
+    for i in range(1, len(cleaned)):
+        prev = cleaned[i - 1]
+        cur = cleaned[i]
+        if prev.image_type == cur.image_type:
+            alt = "closeup"
+            if cur.image_type in {"closeup", "reaction_closeup"}:
+                alt = "prestige_still"
+            elif cur.image_type == "prestige_still":
+                alt = "reaction_closeup"
+            elif cur.image_type == "poster":
+                alt = "closeup"
+            cleaned[i] = ShortsReviewBeat(
+                timestamp=cur.timestamp,
+                line=cur.line,
+                image_type=alt,
+                motion=cur.motion,
+                text=cur.text,
+                priority=cur.priority,
+                importance=cur.importance,
+            )
+
+    # Importance hierarchy: cap highs to 3, keep at least 2 when possible.
+    highs = [i for i, b in enumerate(cleaned) if b.importance == "high"]
+    if len(highs) > 3:
+        # Downgrade later highs first.
+        for i in highs[3:]:
+            b = cleaned[i]
+            cleaned[i] = ShortsReviewBeat(
+                timestamp=b.timestamp,
+                line=b.line,
+                image_type=b.image_type,
+                motion=b.motion,
+                text=b.text,
+                priority=b.priority,
+                importance="medium",
+            )
+    elif len(highs) < 2 and len(cleaned) >= 2:
+        # Promote hook/tension pivots when the model didn't pick any.
+        for i, b in enumerate(cleaned[:6]):
+            if b.priority in {"hook", "payoff", "verdict"}:
+                cleaned[i] = ShortsReviewBeat(
+                    timestamp=b.timestamp,
+                    line=b.line,
+                    image_type=b.image_type,
+                    motion=b.motion,
+                    text=b.text,
+                    priority=b.priority,
+                    importance="high",
+                )
+                highs.append(i)
+                if len([x for x in highs if x == i]) >= 2:
+                    break
+
+    # Motion by intent (never random).
+    mapped: list[ShortsReviewBeat] = []
+    for b in cleaned:
+        pr = b.priority
+        if pr == "hook":
+            motion = "none"
+        elif pr == "tension":
+            motion = "snap_zoom"
+        elif pr == "payoff":
+            motion = "minimal"
+        elif pr == "loop":
+            motion = "none"
+        else:  # verdict
+            motion = "minimal"
+
+        mapped.append(
+            ShortsReviewBeat(
+                timestamp=b.timestamp,
+                line=b.line,
+                image_type=b.image_type,
+                motion=motion,
+                text=b.text,
+                priority=b.priority,
+                importance=b.importance,
+            )
+        )
+
+    # Reduce motion fatigue: cap snap_zoom usage (motion is punctuation, not decoration).
+    snap_cap_ratio = 0.45
+    snaps = 0
+    out_mapped: list[ShortsReviewBeat] = []
+    n = max(1, len(mapped))
+    for b in mapped:
+        m = b.motion
+        if m == "snap_zoom":
+            snaps += 1
+            if (snaps / float(n)) > float(snap_cap_ratio):
+                m = "minimal"
+        out_mapped.append(
+            ShortsReviewBeat(
+                timestamp=b.timestamp,
+                line=b.line,
+                image_type=b.image_type,
+                motion=m,
+                text=b.text,
+                priority=b.priority,
+                importance=b.importance,
+            )
+        )
+
+    mapped = out_mapped
+
+    return ShortsReviewStoryboard(hook_frame=hook, beats=mapped, ending_frame=ending)
+
+
+def plan_shorts_review_storyboard_with_llm(
+    segments: list[TranscriptSegment],
+    *,
+    audio_duration: float,
+    topic: str | None,
+    max_beats: int,
+    hook_seconds: float = 4.0,
+    ending_seconds: float = 4.0,
+    model: str = "gpt-4o-mini",
+) -> ShortsReviewStoryboard:
+    """Generate a retention-first Shorts Review storyboard with a strict schema.
+
+    Timestamps are in VIDEO time (i.e. transcript times are shifted by hook_seconds).
+    """
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    hook_s = max(0.0, float(hook_seconds))
+    end_s = max(0.0, float(ending_seconds))
+    total = hook_s + max(0.0, float(audio_duration))
+
+    transcript = []
+    for s in segments:
+        try:
+            st = round(float(s.start) + hook_s, 2)
+            en = round(float(s.end) + hook_s, 2)
+        except Exception:
+            continue
+        if en <= st:
+            continue
+        transcript.append({"start": st, "end": en, "text": str(s.text or "").strip()})
+
+    system = (
+        "You are generating a storyboard for a YouTube Short (Shorts Review). "
+        "Return ONLY valid JSON (no markdown). "
+        "You MUST output valid JSON following the provided schema. "
+        "\n\nRules you MUST follow:\n"
+        "- The first 1.6 seconds must be a static hook frame designed to stop scrolling.\n"
+        "- Rule A (Hook contrast): hook frame must differ from beat 1 in 2+ visual dimensions: brightness, crop, color temperature, subject distance.\n"
+        "  (Example: hook = dark centered poster; beat 1 = brighter off-center close-up.)\n"
+        "- Visuals must change every 1–2 seconds (never hold long).\n"
+        "- Rule B (Pivot pause): pivot phrases (but/however/here's the thing) must get snap zoom AND a 0.25–0.35s silence pause before the words.\n"
+        "  Pivot beat timestamps MUST start exactly at the pivot phrase.\n"
+        "- Do NOT evenly distribute timing.\n"
+        "- The storyboard must delay the verdict and create curiosity.\n"
+        "- The final frame must encourage looping (static, question-based).\n"
+        "- The ending frame must be visually compatible with the hook (similar palette/contrast/simplicity) so the loop seam is less noticeable.\n"
+        "- On-screen text must be <= 2 words per beat (EXCEPT hook_frame and ending_frame).\n"
+        "- Rule C (Caption clamp): beat timestamps must closely match spoken line duration; text must not outlive the spoken line by >0.1s.\n"
+        "- Only 2–3 beats may have importance='high'.\n"
+        "\nMotion must be chosen by intent (never random):\n"
+        "- hook -> motion none\n"
+        "- tension -> motion snap_zoom\n"
+        "- payoff/verdict -> motion minimal\n"
+        "- loop -> motion none\n"
+        "\nDo NOT describe scenes literally. Focus on emotion, contrast, and retention."
+    )
+
+    schema = {
+        "hook_frame": {"image_type": "poster|closeup", "text": "OSCAR BAIT?", "duration": 1.6, "motion": "none"},
+        "beats": [
+            {
+                "timestamp": "1.6-3.6",
+                "line": "This movie got Oscar nominations.",
+                "image_type": "prestige_still|reaction_closeup|closeup|neutral",
+                "motion": "slow_zoom|snap_zoom|minimal|none",
+                "text": "OSCAR-NOM",
+                "priority": "hook|tension|payoff|verdict|loop",
+                "importance": "low|medium|high",
+            }
+        ],
+        "ending_frame": {"image_type": "neutral", "text": "AGREE? 👇", "duration": 1.2, "motion": "none"},
+    }
+
+    user = {
+        "topic": (topic or "").strip(),
+        "video_duration": round(float(total), 2),
+        "hook_seconds": round(float(hook_s), 2),
+        "ending_seconds": round(float(end_s), 2),
+        "max_beats": int(max_beats),
+        "transcript": transcript,
+        "schema": schema,
+    }
+
+    content = _openai_chat_completions(
+        api_key=api_key,
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+        ],
+    )
+
+    parsed = json.loads(content)
+    sb = parse_shorts_review_storyboard(parsed)
+    return normalize_shorts_review_storyboard(sb, hook_seconds=hook_s, ending_seconds=end_s, max_beats=max_beats)
 
 
 def _topic_in_query(topic: str, query: str) -> bool:
@@ -133,6 +637,93 @@ def pick_image_with_llm(
     if idx < 0 or idx >= len(candidates):
         raise RuntimeError(f"LLM picker index out of range: {idx}")
     return idx
+
+
+def suggest_image_search_queries_with_llm(
+    *,
+    anchor: str,
+    window_text: str,
+    topic_type: str | None = None,
+    video_type: str | None = None,
+    model: str = "gpt-4o-mini",
+    max_queries: int = 5,
+) -> list[str]:
+    """Suggest search queries for finding relevant stills.
+
+    The goal is to keep results within the same movie/show (anchor), but vary by transcript context.
+    Returns a list of short queries (strings). Raises if OPENAI_API_KEY is missing.
+    """
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    a = (anchor or "").strip()
+    wt = (window_text or "").strip()
+    if not a or not wt:
+        return []
+
+    n = int(max(1, min(8, max_queries)))
+
+    system = (
+        "You generate web image search queries for finding stills from a specific movie or TV show. "
+        "Return ONLY valid JSON (no markdown). "
+        "Output schema: {\"queries\": [<string>, ...]} with 3 to 5 items. "
+        "Every query MUST include the exact anchor string (the movie/show name). "
+        "Use the transcript window to pick concrete visual keywords (e.g., guitar, band, soundtrack, performance, tense scene). "
+        "Keep queries short (4-9 words). "
+        "Prefer scene imagery terms like: scene still, screencap, frame, close up. "
+        "Avoid: review site names, years unless already in anchor, 'poster', 'official poster', 'logo'."
+    )
+
+    user = {
+        "anchor": a,
+        "topic_type": (topic_type or "").strip(),
+        "video_type": (video_type or "").strip(),
+        "window_text": wt[:900],
+        "max_queries": n,
+    }
+
+    content = _openai_chat_completions(
+        api_key=api_key,
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+        ],
+    )
+
+    try:
+        parsed = json.loads(content)
+    except Exception as e:
+        raise RuntimeError(f"LLM did not return valid JSON. Got: {content[:400]}") from e
+
+    qs = parsed.get("queries") if isinstance(parsed, dict) else None
+    if not isinstance(qs, list):
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for q in qs:
+        if not isinstance(q, str):
+            continue
+        s = " ".join(q.split()).strip()
+        if not s:
+            continue
+        sl = s.lower()
+        if "poster" in sl or "logo" in sl:
+            continue
+        if a.lower() not in sl:
+            # Enforce anchoring defensively.
+            s = f"{a} {s}".strip()
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+        if len(out) >= n:
+            break
+
+    return out
 
 
 def _openai_chat_completions(
@@ -327,6 +918,298 @@ def _detect_spoiler_warning_clip(
         return None
 
     return HighlightClip(start=float(start), end=float(end), reason="Spoiler warning")
+
+
+def _looks_like_sentence_start(txt: str) -> bool:
+    t = (txt or "").strip()
+    if not t:
+        return True
+    # If it starts with a lowercase letter or a connective, it likely continues a thought.
+    if t[:1].isalpha() and t[:1].islower():
+        return False
+    return True
+
+
+def _looks_like_sentence_end(txt: str) -> bool:
+    t = (txt or "").strip()
+    if not t:
+        return True
+    return t.endswith((".", "!", "?"))
+
+
+def _expand_span_to_sentence_boundaries(
+    segments: list[TranscriptSegment], *, start_i: int, end_i: int, max_expand_seconds: float = 7.0
+) -> tuple[int, int]:
+    n = len(segments)
+    if n == 0:
+        return start_i, end_i
+    s = max(0, min(n - 1, int(start_i)))
+    e = max(s, min(n - 1, int(end_i)))
+
+    # Expand backwards if the first text looks mid-thought.
+    try:
+        base_start = float(segments[s].start)
+    except Exception:
+        base_start = 0.0
+    while s > 0 and (not _looks_like_sentence_start(segments[s].text)):
+        try:
+            prev_start = float(segments[s - 1].start)
+        except Exception:
+            prev_start = base_start
+        if (base_start - prev_start) > float(max_expand_seconds):
+            break
+        s -= 1
+        try:
+            base_start = float(segments[s].start)
+        except Exception:
+            break
+
+    # Expand forwards if the last text looks like it cuts off.
+    try:
+        base_end = float(segments[e].end)
+    except Exception:
+        base_end = 0.0
+    while e < (n - 1) and (not _looks_like_sentence_end(segments[e].text)):
+        try:
+            next_end = float(segments[e + 1].end)
+        except Exception:
+            next_end = base_end
+        if (next_end - base_end) > float(max_expand_seconds):
+            break
+        e += 1
+        try:
+            base_end = float(segments[e].end)
+        except Exception:
+            break
+
+    return s, e
+
+
+def _token_jaccard(a: str, b: str) -> float:
+    stop = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "so",
+        "to",
+        "of",
+        "in",
+        "on",
+        "for",
+        "with",
+        "it",
+        "this",
+        "that",
+        "is",
+        "was",
+        "are",
+        "were",
+        "be",
+        "been",
+        "i",
+        "you",
+        "we",
+        "they",
+        "he",
+        "she",
+    }
+
+    def toks(s: str) -> set[str]:
+        raw = "".join(ch.lower() if ch.isalnum() else " " for ch in (s or ""))
+        out = {t for t in raw.split() if len(t) >= 3 and t not in stop}
+        return out
+
+    ta = toks(a)
+    tb = toks(b)
+    if not ta or not tb:
+        return 0.0
+    inter = len(ta & tb)
+    union = len(ta | tb)
+    return float(inter) / float(union) if union else 0.0
+
+
+def _clips_from_spans(
+    segments: list[TranscriptSegment],
+    spans: list[HighlightSpan],
+    *,
+    audio_duration: float,
+    max_total_seconds: float = 60.0,
+    min_clip_seconds: float = 5.0,
+    max_clip_seconds: float = 20.0,
+) -> list[HighlightClip]:
+    dur = max(0.0, float(audio_duration))
+    if dur <= 0.0 or not segments or not spans:
+        return []
+
+    # Sort spans chronologically by segment start.
+    spans2 = []
+    for sp in spans:
+        try:
+            s_i = int(sp.start_i)
+            e_i = int(sp.end_i)
+        except Exception:
+            continue
+        if e_i < s_i:
+            s_i, e_i = e_i, s_i
+        s_i = max(0, min(len(segments) - 1, s_i))
+        e_i = max(0, min(len(segments) - 1, e_i))
+        spans2.append(HighlightSpan(start_i=s_i, end_i=e_i, reason=str(sp.reason or "").strip()))
+
+    spans2.sort(key=lambda sp: float(segments[sp.start_i].start))
+
+    picked: list[HighlightClip] = []
+    used_text = ""
+    total = 0.0
+    cap = min(60.0, max(10.0, float(max_total_seconds)))
+
+    for sp in spans2:
+        s_i, e_i = _expand_span_to_sentence_boundaries(segments, start_i=sp.start_i, end_i=sp.end_i)
+
+        try:
+            start = float(segments[s_i].start)
+            end = float(segments[e_i].end)
+        except Exception:
+            continue
+
+        start = max(0.0, min(dur, start))
+        end = max(0.0, min(dur, end))
+        if end <= start:
+            continue
+
+        # Enforce per-clip max length.
+        if (end - start) > float(max_clip_seconds):
+            end = start + float(max_clip_seconds)
+
+        # Deduplicate: skip clips that repeat the same point.
+        clip_text = " ".join((segments[i].text or "").strip() for i in range(s_i, min(e_i + 1, len(segments))))
+        if used_text:
+            if _token_jaccard(used_text, clip_text) >= 0.72:
+                continue
+
+        # Budget.
+        remaining = cap - total
+        if remaining <= 0.0:
+            break
+
+        if (end - start) > remaining:
+            end = start + remaining
+
+        if (end - start) < float(min_clip_seconds):
+            continue
+
+        picked.append(HighlightClip(start=start, end=end, reason=sp.reason))
+        total += float(end - start)
+        used_text = (used_text + " " + clip_text).strip()
+
+    # Final: de-overlap + clamp.
+    return _clean_highlight_clips(
+        picked,
+        audio_duration=dur,
+        max_clips=max(12, len(picked) or 0),
+        min_clip_seconds=float(min_clip_seconds),
+        max_clip_seconds=float(max_clip_seconds),
+    )
+
+
+def extract_review_highlights_meaningful_with_llm(
+    segments: list[TranscriptSegment],
+    *,
+    audio_duration: float,
+    max_total_seconds: float = 60.0,
+    model: str = "gpt-4o-mini",
+) -> list[HighlightClip]:
+    """Create a meaningful <=60s highlight montage from a review transcript.
+
+    The model selects segment-index spans (not raw seconds) so we can cut on transcript
+    boundaries and avoid mid-sentence jumps.
+    """
+
+    if not segments:
+        return []
+
+    dur = max(0.0, float(audio_duration))
+    if dur <= 0.0:
+        return []
+
+    # Keep the existing spoiler-intro behavior.
+    spoiler_clip = _detect_spoiler_warning_clip(segments, audio_duration=dur)
+    if spoiler_clip is not None:
+        return [spoiler_clip]
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    transcript = []
+    for i, s in enumerate(segments[:320]):
+        transcript.append(
+            {
+                "i": int(i),
+                "start": round(float(s.start), 2),
+                "end": round(float(s.end), 2),
+                "text": str(s.text or "")[:260],
+            }
+        )
+
+    system = (
+        "You are a senior video editor. Build a 1-minute MAX highlight montage from a FULL review transcript. "
+        "Your cut must sound like a coherent short: no mid-sentence cuts, no abrupt topic whiplash, and no repeated points. "
+        "If the reviewer repeats themselves, pick only the strongest occurrence. "
+        "Return ONLY valid JSON (no markdown). "
+        "Schema: {\"spans\": [{\"start_i\": int, \"end_i\": int, \"reason\": string}]}. "
+        "Rules: spans must be in chronological order, not overlap, and each span should start/end on segment boundaries. "
+        "Each span should be roughly 6-20 seconds and the total combined duration must be <= max_total_seconds (hard cap 60). "
+        "Each span must begin with a complete sentence that can stand alone (no 'and/but/so' mid-thought starts). "
+        "Avoid duplicate points even if paraphrased. "
+        "Pick spans that cover: hook, core opinion(s), key pros/cons, and a final takeaway." 
+    )
+
+    user = {
+        "audio_duration": round(dur, 2),
+        "max_total_seconds": float(min(60.0, float(max_total_seconds))),
+        "transcript": transcript,
+    }
+
+    content = _openai_chat_completions(
+        api_key=api_key,
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+        ],
+    )
+
+    try:
+        parsed = json.loads(content)
+    except Exception as e:
+        raise RuntimeError(f"LLM did not return valid JSON. Got: {content[:400]}") from e
+
+    raw_spans = (parsed or {}).get("spans") if isinstance(parsed, dict) else None
+    if not isinstance(raw_spans, list):
+        raise RuntimeError("LLM JSON must be an object with key 'spans' (array)")
+
+    spans: list[HighlightSpan] = []
+    for item in raw_spans:
+        if not isinstance(item, dict):
+            continue
+        try:
+            s_i = int(item.get("start_i"))
+            e_i = int(item.get("end_i"))
+        except Exception:
+            continue
+        spans.append(HighlightSpan(start_i=s_i, end_i=e_i, reason=str(item.get("reason") or "").strip()))
+
+    return _clips_from_spans(
+        segments,
+        spans,
+        audio_duration=dur,
+        max_total_seconds=float(min(60.0, float(max_total_seconds))),
+        min_clip_seconds=6.0,
+        max_clip_seconds=20.0,
+    )
 
 
 def extract_review_highlights_with_llm(
@@ -744,8 +1627,12 @@ def plan_rich_slides_with_llm(
     )
     if k == "shorts":
         system += (
-            " This is for a YouTube Short: keep slides punchy; prefer 4-10 slides; "
-            "headline should be very short (max 6 words) and hooky."
+            " This is for a YouTube Short with retention-focused visuals. "
+            "Prefer MANY quick beats when max_slides allows (often 12-24 slides for a 30-45s short). "
+            "Aim for ~1.5-2.2 seconds per slide on average when audio_duration <= 60. "
+            "headline should be 2-4 words (keyword style), not a sentence; avoid filler; no spoilers. "
+            "subhead should usually be omitted for Shorts unless essential. "
+            "query should be biased toward: 'official poster', 'close up', 'scene still', 'actor face', 'cast still'."
         )
 
     user = {

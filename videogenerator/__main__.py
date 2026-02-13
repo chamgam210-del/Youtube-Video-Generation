@@ -21,6 +21,11 @@ def main() -> None:
     p.add_argument("--out", default="output", help="Output folder")
     p.add_argument("--topic", default=None, help="Optional topic hint for image search, e.g. 'Severance TV series'")
     p.add_argument(
+        "--visual-subject",
+        default=None,
+        help="Force image searches to target this exact movie/TV show name (useful when Shorts scripts don't say the title). Overrides --topic for image search.",
+    )
+    p.add_argument(
         "--image-provider",
         default="wikimedia",
         choices=["wikimedia", "serpapi", "google_images"],
@@ -35,7 +40,12 @@ def main() -> None:
         default=None,
         help="SerpAPI key (or set SERPAPI_API_KEY). Used when --image-provider serpapi/google_images.",
     )
-    p.add_argument("--max-images", type=int, default=12, help="Max number of images to use")
+    p.add_argument(
+        "--max-images",
+        type=int,
+        default=12,
+        help="Max number of images to use (ignored for shorts_review; beat count is auto-determined)",
+    )
     p.add_argument("--min-seg-seconds", type=float, default=6.0, help="Minimum transcript segment duration per slide")
     p.add_argument("--whisper-model", default="small", help="Whisper model name: tiny/base/small/medium/large")
     p.add_argument(
@@ -45,6 +55,23 @@ def main() -> None:
         help="How to decide slide cut points + queries. 'llm' requires OPENAI_API_KEY. 'auto' uses LLM if available, else falls back.",
     )
     p.add_argument("--llm-model", default="gpt-4o-mini", help="LLM model for --storyboard llm/auto")
+
+    p.add_argument(
+        "--shorts-from-text",
+        default=None,
+        help="Path to a text file containing raw review thoughts. Generates 30-40s Shorts scripts and writes shorts_scripts.json into --out (no audio needed).",
+    )
+    p.add_argument(
+        "--shorts-count",
+        type=int,
+        default=5,
+        help="How many Shorts scripts to generate for --shorts-from-text (default: 5).",
+    )
+    p.add_argument(
+        "--shorts-script-model",
+        default="gpt-5.2",
+        help="LLM model to use for --shorts-from-text (default: gpt-5.2).",
+    )
     p.add_argument(
         "--no-llm-pick-images",
         action="store_true",
@@ -64,8 +91,8 @@ def main() -> None:
     p.add_argument(
         "--video-type",
         default="review",
-        choices=["review", "explainer", "shorts", "auto"],
-        help="Video style. 'review' uses image-only slides; 'explainer' uses text-on-slide cards; 'auto' tries to infer.",
+        choices=["review", "explainer", "shorts", "shorts_review", "auto"],
+        help="Video style. 'review' uses image-only slides; 'explainer' uses text-on-slide cards; 'shorts_review' is retention-style short review (keyword cards, fast cuts). 'auto' tries to infer.",
     )
     p.add_argument(
         "--shorts",
@@ -88,7 +115,7 @@ def main() -> None:
     p.add_argument(
         "--ken-burns",
         action="store_true",
-        help="(Disabled) Previously applied a zoom effect; kept for compatibility but currently has no effect.",
+        help="Apply a subtle zoom/crop motion effect (Ken Burns).",
     )
 
     p.add_argument(
@@ -129,6 +156,17 @@ def main() -> None:
         "--no-bgm-duck",
         action="store_true",
         help="Disable narration-aware ducking (sidechain compression) on background music.",
+    )
+    p.add_argument(
+        "--mix-video-clips",
+        action="store_true",
+        help="Use AI to find and splice relevant video clips (B-roll) into the video. Requires SERPAPI_API_KEY and yt-dlp.",
+    )
+    p.add_argument(
+        "--max-video-clips",
+        type=int,
+        default=6,
+        help="Maximum number of video clips the AI can insert (default: 6).",
     )
     p.add_argument(
         "--verify-video",
@@ -206,26 +244,79 @@ def main() -> None:
         print(str(wav.resolve()))
         return
 
+    if args.shorts_from_text:
+        from .shorts_scripts import format_script_bracketed, generate_shorts_scripts_from_review_text_with_llm
+
+        out_dir = Path(args.out)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        src = Path(str(args.shorts_from_text))
+        txt = src.read_text(encoding="utf-8")
+        scripts = generate_shorts_scripts_from_review_text_with_llm(
+            txt,
+            topic=str((args.visual_subject or args.topic) or "").strip() or None,
+            count=int(args.shorts_count),
+            model=str(args.shorts_script_model),
+        )
+
+        payload = {
+            "topic": str((args.visual_subject or args.topic) or "").strip(),
+            "count": int(args.shorts_count),
+            "model": str(args.shorts_script_model),
+            "shorts": [
+                {
+                    "title": s.title,
+                    "thumbnail_text": s.thumbnail_text,
+                    "lines": [
+                        {
+                            "start": ln.start,
+                            "end": ln.end,
+                            "text": ln.text,
+                            "keywords": ln.keywords,
+                            "image_query": ln.image_query,
+                        }
+                        for ln in s.lines
+                    ],
+                }
+                for s in scripts
+            ],
+        }
+
+        (out_dir / "shorts_scripts.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        for i, s in enumerate(scripts, start=1):
+            (out_dir / f"shorts_script_{i:02d}.txt").write_text(format_script_bracketed(s), encoding="utf-8")
+
+        print(str((out_dir / "shorts_scripts.json").resolve()))
+        return
+
     if not args.audio:
-        raise SystemExit("--audio is required unless using --write-bgm-wav")
+        raise SystemExit("--audio is required unless using --write-bgm-wav or --shorts-from-text")
 
     # Shorts preset overrides.
-    if args.shorts or str(getattr(args, "video_type", "")).strip().lower() == "shorts":
-        args.video_type = "shorts"
+    vt_arg = str(getattr(args, "video_type", "")).strip().lower()
+    is_shorts_like = args.shorts or (vt_arg in {"shorts", "shorts_review"})
+    if is_shorts_like:
+        # If user used --shorts, keep legacy behavior as "shorts".
+        # If they explicitly chose shorts_review, preserve it.
+        if args.shorts and vt_arg != "shorts_review":
+            args.video_type = "shorts"
+        else:
+            args.video_type = (vt_arg or "shorts").strip().lower() or "shorts"
         # If user didn't explicitly override width/height, switch to 9:16.
         if int(args.width) == 1920 and int(args.height) == 1080:
             args.width = 1080
             args.height = 1920
 
-        # Shorts should be punchy: cap slides.
-        try:
-            args.max_images = min(int(args.max_images), 4)
-        except Exception:
-            args.max_images = 4
-
-        # Default: no transitions for shorts unless explicitly requested.
+        # Shorts retention defaults (only when user didn't explicitly override).
         import sys
 
+        if "--max-images" not in sys.argv:
+            args.max_images = 20
+        if "--min-seg-seconds" not in sys.argv:
+            args.min_seg_seconds = 1.8
+
+        # Default: no transitions for shorts unless explicitly requested.
         if "--transition" not in sys.argv:
             args.transition = "none"
         if "--transition-seconds" not in sys.argv:
@@ -261,7 +352,7 @@ def main() -> None:
     run(
         audio_path=args.audio,
         out_dir=out_dir,
-        topic=args.topic,
+        topic=(str(args.visual_subject).strip() or args.topic),
         video_type=str(args.video_type),
         image_provider=args.image_provider,
         serpapi_api_key=args.serpapi_key or os.getenv("SERPAPI_API_KEY"),
@@ -277,12 +368,28 @@ def main() -> None:
         llm_model=args.llm_model,
         llm_pick_images=(not args.no_llm_pick_images),
         reuse_images=(not args.no_reuse_images),
+        mix_video_clips=bool(args.mix_video_clips),
+        max_video_clips=int(args.max_video_clips),
     )
 
     # Load slides back from timeline.json for rendering
     timeline_path = out_dir / "timeline.json"
     data = json.loads(timeline_path.read_text(encoding="utf-8"))
     slides = [Slide(**s) for s in data]
+
+    # Pipeline may produce a padded narration track (e.g., Shorts Review pivot silences).
+    audio_for_render = args.audio
+    try:
+        meta_path = out_dir / "run_meta.json"
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            rp = (meta or {}).get("render_audio_path")
+            if rp:
+                p = Path(str(rp))
+                if p.exists() and p.stat().st_size > 4096:
+                    audio_for_render = str(p)
+    except Exception:
+        audio_for_render = args.audio
 
     # Load transcript segments written by the pipeline (used for title generation).
     segments = None
@@ -340,7 +447,14 @@ def main() -> None:
 
     if not args.no_youtube_metadata:
         try:
-            from .youtube import create_thumbnail, generate_youtube_package, write_youtube_metadata_text
+            from .youtube import (
+                YouTubePackage,
+                create_thumbnail,
+                generate_youtube_package,
+                pick_long_review_thumbnail_with_vision,
+                pick_review_thumbnail_text_with_llm,
+                write_youtube_metadata_text,
+            )
 
             pkg = generate_youtube_package(
                 segments,
@@ -351,43 +465,79 @@ def main() -> None:
                 video_type=str(args.video_type),
                 model=args.llm_model,
             )
+
+            # Long review thumbnails: use vision to select a face-forward still + tight crop + 2–4 word hook.
+            if vt == "review":
+                try:
+                    forced_phrase = None
+                    try:
+                        if segments:
+                            forced_phrase = pick_review_thumbnail_text_with_llm(
+                                segments,
+                                title=title,
+                                model=args.llm_model,
+                            )
+                    except Exception:
+                        forced_phrase = None
+                    idx_v, thumb_text, thumb_crop = pick_long_review_thumbnail_with_vision(
+                        slides=slides,
+                        topic=args.topic,
+                        title=title,
+                        model=args.llm_model,
+                        forced_text=forced_phrase,
+                    )
+                    pkg = YouTubePackage(
+                        title=pkg.title,
+                        description=pkg.description,
+                        tags=pkg.tags,
+                        thumbnail_slide_index=int(idx_v),
+                        verdict_label=pkg.verdict_label,
+                        thumbnail_stamp_text=None,
+                        thumbnail_text=thumb_text,
+                        thumbnail_crop=thumb_crop,
+                    )
+                except Exception:
+                    pass
             write_youtube_metadata_text(out_dir, pkg)
             shorts_overlay_stamp = pkg.thumbnail_stamp_text
 
-            # Thumbnail background comes from a chosen slide asset.
-            thumb_slide = slides[max(0, min(len(slides) - 1, int(pkg.thumbnail_slide_index)))]
-            thumb_path = out_dir / "thumbnail.png"
+            # Shorts Review: skip separate thumbnail asset generation (captions/keywords only workflow).
+            if vt != "shorts_review":
+                # Thumbnail background comes from a chosen slide asset.
+                thumb_slide = slides[max(0, min(len(slides) - 1, int(pkg.thumbnail_slide_index)))]
+                thumb_path = out_dir / "thumbnail.png"
 
-            bg_img = thumb_slide.image_path
-            # For explainer/shorts, slides may be rendered card_XX.png with LLM text.
-            # For Shorts thumbnails, prefer the raw downloaded image (sXX_*.png).
-            if vt == "shorts":
-                try:
-                    from .youtube import _try_find_raw_for_card
-                    from pathlib import Path as _P
+                bg_img = thumb_slide.image_path
+                # For explainer/shorts, slides may be rendered card_XX.png with LLM text.
+                # For Shorts thumbnails, prefer the raw downloaded image (sXX_*.png).
+                if vt in {"shorts"}:
+                    try:
+                        from .youtube import _try_find_raw_for_card
+                        from pathlib import Path as _P
 
-                    raw = _try_find_raw_for_card(_P(bg_img))
-                    if raw is not None:
-                        bg_img = str(raw)
-                except Exception:
-                    pass
-            create_thumbnail(
-                out_path=thumb_path,
-                background_image=bg_img,
-                text=(cleaned_topic_title or ("Brutally Honest Review" if vt == "review" else str(pkg.title or title))),
-                verdict_text=pkg.verdict_label,
-                stamp_text=pkg.thumbnail_stamp_text,
-                match_video_frame=False,
-                width=(int(args.width) if vt == "shorts" else 1280),
-                height=(int(args.height) if vt == "shorts" else 720),
-                theme=("highlight" if vt == "shorts" else "default"),
-                show_title=(vt != "shorts"),
-            )
+                        raw = _try_find_raw_for_card(_P(bg_img))
+                        if raw is not None:
+                            bg_img = str(raw)
+                    except Exception:
+                        pass
+                create_thumbnail(
+                    out_path=thumb_path,
+                    background_image=bg_img,
+                    text=((pkg.title or title) if vt == "review" else (cleaned_topic_title or ("Brutally Honest Review" if vt == "review" else str(pkg.title or title)))),
+                    verdict_text=(pkg.verdict_label if vt == "review" else pkg.verdict_label),
+                    stamp_text=(None if vt == "review" else pkg.thumbnail_stamp_text),
+                    match_video_frame=False,
+                    width=(int(args.width) if vt in {"shorts"} else 1280),
+                    height=(int(args.height) if vt in {"shorts"} else 720),
+                    theme=("highlight" if vt in {"shorts"} else ("review_long" if vt == "review" else "default")),
+                    show_title=(True if vt == "review" else (vt not in {"shorts"})),
+                    crop=(pkg.thumbnail_crop if vt == "review" else None),
+                )
         except Exception:
             pass
 
     # Shorts: keep a persistent title+stamp overlay throughout the entire video.
-    if vt == "shorts" and slides:
+    if vt in {"shorts"} and slides:
         try:
             from .youtube import overlay_shorts_title_and_stamp
 
@@ -403,6 +553,9 @@ def main() -> None:
             )
         except Exception:
             pass
+
+    # Shorts Review: audio starts after the hook frame (hook is produced by the pipeline timeline).
+    hook_s = 4.0 if (vt == "shorts_review") else 0.0
 
     if not args.no_branding and (intro_seconds > 0.0 or outro_seconds > 0.0):
 
@@ -443,6 +596,7 @@ def main() -> None:
                     license_name=s.license_name,
                     license_url=s.license_url,
                     attribution=s.attribution,
+                    motion=getattr(s, "motion", None),
                 )
             )
 
@@ -482,7 +636,7 @@ def main() -> None:
 
     render_slideshow(
         slides,
-        args.audio,
+        audio_for_render,
         out_mp4,
         width=args.width,
         height=args.height,
@@ -492,11 +646,11 @@ def main() -> None:
         bgm_duck=(not args.no_bgm_duck),
         bgm_generate=bgm_generate,
         bgm_preset=bgm_preset,
-        intro_seconds=intro_seconds if (not args.no_branding) else 0.0,
+        intro_seconds=(float(hook_s) if vt == "shorts_review" else (intro_seconds if (not args.no_branding) else 0.0)),
         outro_seconds=outro_seconds if (not args.no_branding) else 0.0,
         transition=None if args.transition == "none" else args.transition,
         transition_seconds=float(args.transition_seconds),
-        ken_burns=bool(args.ken_burns),
+        ken_burns=(vt == "shorts_review") or bool(args.ken_burns),
     )
 
     if args.verify_video:
@@ -505,38 +659,6 @@ def main() -> None:
         v = verify_local(out_mp4)
         print(v.duration_line.strip())
         print(f"has_audio={v.has_audio} audio_peak={v.audio_peak} frame_hashes={v.frame_hashes}")
-
-    # Review -> auto-generate a Shorts highlights cut.
-    try:
-        vt_now = (str(args.video_type) or "review").strip().lower()
-    except Exception:
-        vt_now = "review"
-
-    if vt_now == "review":
-        try:
-            from .review_highlights_shorts import make_shorts_from_review_highlights
-
-            shorts_dir = make_shorts_from_review_highlights(
-                review_audio_path=args.audio,
-                review_out_dir=out_dir,
-                topic=(args.topic or None),
-                image_provider=str(args.image_provider),
-                serpapi_api_key=(args.serpapi_key or os.getenv("SERPAPI_API_KEY")),
-                whisper_model=str(args.whisper_model),
-                min_image_width=int(args.min_image_width),
-                llm_model=str(args.llm_model),
-                llm_pick_images=(not args.no_llm_pick_images),
-                reuse_images=(not args.no_reuse_images),
-                bgm_path=bgm_path,
-                bgm_volume=float(args.bgm_volume),
-                bgm_duck=(not args.no_bgm_duck),
-                bgm_generate=bool(bgm_generate),
-                bgm_preset=bgm_preset,
-            )
-            if shorts_dir is not None:
-                print(str((Path(shorts_dir) / "video.mp4").resolve()))
-        except Exception:
-            pass
 
     print(str(out_mp4.resolve()))
 

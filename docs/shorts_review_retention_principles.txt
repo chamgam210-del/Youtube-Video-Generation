@@ -1,0 +1,40 @@
+Shorts Review – Retention Visual Principles (strict)
+
+Goal
+- Keep the viewer’s eyes busy and aligned with the spoken hook/beat.
+
+Rules
+1) Visual change every 1–2 seconds
+- Every beat should introduce at least one of:
+  - A new image, OR
+  - A visible motion change (zoom/crop/pan), OR
+  - A new on-screen keyword/caption emphasis.
+
+2) Captions/keywords only
+- Do NOT add stamp-style overlays.
+- Do NOT add persistent title/stamp overlays.
+- Use on-screen keyword/caption text tied to the current spoken beat.
+
+3) No separate thumbnail workflow
+- Do not generate a separate thumbnail asset as part of Shorts Review output.
+
+4) Image picking must stay on the topic
+- Image search should remain anchored to the movie/TV show (visual subject), even when the spoken script never mentions the title.
+- Bias toward close-ups/stills/scenes/cast shots for retention.
+
+5) Avoid repetition
+- Prefer unique images and varied framing/subject; only reuse if necessary to keep timing contiguous.
+
+Operational target
+- For a 30–40s Shorts Review, expect roughly 18–25 beats/slides.
+
+LLM storyboard constraints (non-negotiable)
+- Use a strict JSON schema with:
+  - hook_frame: 0.7s static, high-contrast text
+  - beats: 1–2s cuts with priority + importance labels
+  - ending_frame: ~1.2s static loop CTA (question-based)
+- Must NOT evenly distribute timing.
+- Must enforce hook contrast vs beat 1.
+- Must insert a micro-pattern interrupt around pivot phrases ("but", "however", "here's the thing").
+- On-screen text must be <= 2 words per beat (except hook + ending).
+- Only 2–3 beats should be importance=high.

@@ -134,6 +134,15 @@ uv run python -m videogenerator \
   --bgm-volume 0.10
 ```
 
+#### Add a local MP3 as a named preset
+
+You can also use your own audio file *by preset name* (useful for the UI dropdown).
+
+- Put the file at: `assets/bgm/cylinder_five.mp3` (or `.wav/.m4a/.aac/.flac/.ogg`)
+- Then use: `--bgm-preset cylinder_five`
+
+Optional: set `VIDEOGENERATOR_BGM_DIR` to a folder containing `cylinder_five.mp3` if you don’t want it under `assets/`.
+
 ### Verify the output MP4
 
 Local verification (no network): checks the MP4 has an audio stream, measures a quick audio peak, and extracts a few frames to see if they change.

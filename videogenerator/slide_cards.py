@@ -32,6 +32,8 @@ def render_slide_card(
     with Image.open(background_image) as im:
         im = im.convert("RGB")
 
+        layout_norm = (layout or "default").strip().lower()
+
         # Cover-crop to target aspect.
         src_w, src_h = im.size
         target_ratio = width / float(height)
@@ -51,15 +53,54 @@ def render_slide_card(
         # Darken a bit for legibility.
         im = ImageEnhance.Contrast(im).enhance(1.05)
         overlay = Image.new("RGB", (width, height), (0, 0, 0))
-        im = Image.blend(im, overlay, alpha=0.28)
+        dark_alpha = 0.28
+        if layout_norm in {"shorts_hook", "hook", "shorts_review_hook", "shorts_emphasis_hook"}:
+            # Hook frame needs to stop the swipe: higher contrast.
+            dark_alpha = 0.40
+            im = ImageEnhance.Contrast(im).enhance(1.10)
+        im = Image.blend(im, overlay, alpha=float(dark_alpha))
 
         draw = ImageDraw.Draw(im)
 
         headline = (spec.headline or "").strip()
         subhead = (spec.subhead or "").strip() if spec.subhead else ""
 
+        def _scale_px(px_1080: int) -> int:
+            # Spec is authored for 1080px-wide Shorts.
+            return max(10, int(round(float(px_1080) * (float(width) / 1080.0))))
+
         # Fonts.
-        headline_font = _pick_font(headline, width, max_size=int(width * 0.085), min_size=54)
+        # Shorts emphasis cards use explicit pixel sizing (scaled by width) for phone readability.
+        if layout_norm in {"shorts_emphasis_hook"}:
+            # 120–150px, SemiBold/Bold
+            headline_font = _pick_font(
+                headline,
+                width,
+                max_size=_scale_px(150),
+                min_size=_scale_px(120),
+                prefer=[r"C:\\Windows\\Fonts\\seguisb.ttf", r"C:\\Windows\\Fonts\\segoeuib.ttf", r"C:\\Windows\\Fonts\\arialbd.ttf"],
+            )
+        elif layout_norm in {"shorts_emphasis_pivot"}:
+            # 140–170px, Bold (pattern interrupt)
+            headline_font = _pick_font(
+                headline,
+                width,
+                max_size=_scale_px(170),
+                min_size=_scale_px(140),
+                prefer=[r"C:\\Windows\\Fonts\\segoeuib.ttf", r"C:\\Windows\\Fonts\\arialbd.ttf", r"C:\\Windows\\Fonts\\impact.ttf"],
+            )
+        elif layout_norm in {"shorts_emphasis_cta"}:
+            # 90–120px, SemiBold
+            headline_font = _pick_font(
+                headline,
+                width,
+                max_size=_scale_px(120),
+                min_size=_scale_px(90),
+                prefer=[r"C:\\Windows\\Fonts\\seguisb.ttf", r"C:\\Windows\\Fonts\\arialbd.ttf", r"C:\\Windows\\Fonts\\segoeuib.ttf"],
+            )
+        else:
+            headline_font = _pick_font(headline, width, max_size=int(width * 0.085), min_size=54)
+
         subhead_font = _pick_font(subhead, width, max_size=int(width * 0.050), min_size=36)
 
         # Layout.
@@ -82,8 +123,34 @@ def render_slide_card(
                 h_total += max(0, len(sub_lines) - 1) * int(subhead_font.size * 0.22)
             return int(h_total)
 
-        layout_norm = (layout or "default").strip().lower()
-        if layout_norm in {"shorts", "short", "shorts_safe"}:
+        def _clamp_to_max_bottom(y0: int, *, max_bottom_ratio: float) -> int:
+            """Clamp the text block so its bottom stays above `max_bottom_ratio` of the frame."""
+
+            max_bottom = int(height * float(max_bottom_ratio))
+            bh = _block_height()
+            y_max = max(0, int(max_bottom - bh))
+            return max(0, min(int(y0), int(y_max)))
+
+        if layout_norm in {"shorts_emphasis_hook"}:
+            # Shorts emphasis hook: upper third, static.
+            center_y = int(height * 0.20)
+            y = int(center_y - (_block_height() // 2))
+            y = _clamp_to_max_bottom(y, max_bottom_ratio=0.62)
+        elif layout_norm in {"shorts_emphasis_pivot"}:
+            # Shorts emphasis pivot: centered / slightly high.
+            center_y = int(height * 0.30)
+            y = int(center_y - (_block_height() // 2))
+            y = _clamp_to_max_bottom(y, max_bottom_ratio=0.62)
+        elif layout_norm in {"shorts_emphasis_cta"}:
+            # Shorts loop CTA: lower third.
+            center_y = int(height * 0.74)
+            y = int(center_y - (_block_height() // 2))
+            # Keep a small bottom margin.
+            y = max(0, min(int(y), int(height * 0.84)))
+        elif layout_norm in {"shorts_hook", "hook", "shorts_review_hook"}:
+            # Legacy hook layout: true center.
+            y = max(0, (height - _block_height()) // 2)
+        elif layout_norm in {"shorts", "short", "shorts_safe"}:
             # Reserve space for persistent top title pill and bottom stamp pill.
             safe_top = int(height * 0.30)
             safe_bottom = int(height * 0.26)
@@ -103,7 +170,8 @@ def render_slide_card(
             cx=width // 2,
             y=y,
             fill=(255, 255, 255),
-            stroke_width=max(3, width // 320),
+            # Spec: black outline 2–4px.
+            stroke_width=max(2, min(4, width // 320)),
             stroke_fill=(0, 0, 0),
             line_gap=int(headline_font.size * 0.18),
         )
@@ -128,8 +196,15 @@ def render_slide_card(
     return out_path
 
 
-def _pick_font(text: str, width: int, *, max_size: int, min_size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    font_candidates = [
+def _pick_font(
+    text: str,
+    width: int,
+    *,
+    max_size: int,
+    min_size: int,
+    prefer: list[str] | None = None,
+) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    font_candidates = list(prefer or []) + [
         r"C:\\Windows\\Fonts\\impact.ttf",
         r"C:\\Windows\\Fonts\\arialbd.ttf",
         r"C:\\Windows\\Fonts\\seguisb.ttf",
