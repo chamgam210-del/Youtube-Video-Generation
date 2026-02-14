@@ -48,3 +48,24 @@ class VideoClipSuggestion:
     search_query: str  # what to search for
     reason: str  # why this clip was suggested
     mute: bool = True  # default mute for copyright safety
+
+
+@dataclass(frozen=True)
+class CommentaryClipSuggestion:
+    """LLM-suggested clip insertion for commentary videos.
+
+    Two modes:
+    - ``reference``: narrator references a specific clip ("here's the clip…").
+      The system finds and inserts that one clip.
+    - ``compilation``: narrator describes a broad reaction / news event.
+      The system grabs several popular clips and concatenates them into a montage.
+    """
+
+    timeline_start: float
+    timeline_end: float
+    search_query: str  # primary search query
+    reason: str
+    clip_type: str = "reference"  # "reference" | "compilation"
+    num_clips: int = 1  # how many clips to grab (>1 for compilation)
+    extra_queries: list[str] | None = None  # additional search queries for compilations
+    mute: bool = True

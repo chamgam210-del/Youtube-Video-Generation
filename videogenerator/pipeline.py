@@ -174,7 +174,7 @@ def run(
         segments = [segments[0].__class__(start=0.0, end=audio_duration, text=segments[0].text)]
 
     vt = (video_type or "review").strip().lower()
-    if vt not in {"review", "explainer", "shorts", "shorts_review", "auto"}:
+    if vt not in {"review", "explainer", "shorts", "shorts_review", "commentary", "auto"}:
         vt = "review"
 
     # Shorts Review determines its own beat count from audio duration.
@@ -231,7 +231,7 @@ def run(
     # For non-review videos, we want a stable topic hint to keep image searches on the right subject.
     effective_topic: str | None = (topic or "").strip() or None
     topic_type: str | None = None
-    if vt in {"explainer", "shorts", "shorts_review", "auto"} and not effective_topic:
+    if vt in {"explainer", "shorts", "shorts_review", "commentary", "auto"} and not effective_topic:
         if use_llm:
             try:
                 from .llm_storyboard import infer_topic_with_llm
@@ -249,7 +249,7 @@ def run(
             topic_type = inferred.topic_type
 
     # Heuristic: if transcript strongly suggests TV content, treat as tv_show.
-    if vt in {"explainer", "shorts", "shorts_review"} and (topic_type is None or topic_type == "other"):
+    if vt in {"explainer", "shorts", "shorts_review", "commentary"} and (topic_type is None or topic_type == "other"):
         try:
             tail = " ".join(s.text for s in merged[-25:]).lower()
         except Exception:
@@ -1857,6 +1857,146 @@ def run(
             ])
         except Exception as exc:
             # Video clip mixing is best-effort; don't fail the whole pipeline.
+            import traceback
+            traceback.print_exc()
+
+    # ── Commentary clip insertion: always-on for commentary type ──────────────
+    if vt == "commentary":
+        # Commentary always uses the commentary-specific LLM to find reference clips
+        # and build compilation montages.
+        try:
+            from .commentary_clips import suggest_commentary_clips
+            from .clip_tools import (
+                prepare_clip_for_suggestion as _prep_ref,
+                prepare_compilation_clip as _prep_comp,
+                get_video_duration as _clip_dur,
+                PreparedClip,
+            )
+            from .models import VideoClipSuggestion as _VCS
+
+            clip_dir = ensure_dir(out_dir / "clips")
+
+            csug = suggest_commentary_clips(
+                segments=segments,
+                topic=effective_topic or audio_path.stem,
+                title=audio_path.stem,
+                audio_duration=timeline_duration,
+                max_clips=max_video_clips,
+                model=llm_model,
+            )
+            write_json(out_dir / "commentary_clip_suggestions.json", [
+                {"timeline_start": s.timeline_start, "timeline_end": s.timeline_end,
+                 "search_query": s.search_query, "reason": s.reason,
+                 "clip_type": s.clip_type, "num_clips": s.num_clips,
+                 "extra_queries": s.extra_queries, "mute": s.mute}
+                for s in csug
+            ])
+
+            prepared_clips: list[PreparedClip] = []
+            for ci, sug in enumerate(csug):
+                try:
+                    if sug.clip_type == "compilation":
+                        pc = _prep_comp(
+                            sug,
+                            dest_dir=clip_dir,
+                            clip_index=ci,
+                            width=video_width,
+                            height=video_height,
+                            llm_model=llm_model,
+                        )
+                    else:
+                        # Reference clip: use existing single-clip flow.
+                        ref_sug = _VCS(
+                            timeline_start=sug.timeline_start,
+                            timeline_end=sug.timeline_end,
+                            search_query=sug.search_query,
+                            reason=sug.reason,
+                            mute=sug.mute,
+                        )
+                        pc = _prep_ref(
+                            ref_sug,
+                            dest_dir=clip_dir,
+                            clip_index=ci,
+                            width=video_width,
+                            height=video_height,
+                            llm_model=llm_model,
+                        )
+                    if pc is not None:
+                        prepared_clips.append(pc)
+                except Exception:
+                    pass
+
+            # Assign prepared clips to matching slides (same logic as review mixing).
+            for pc in prepared_clips:
+                best_idx = -1
+                best_overlap = 0.0
+                for si, sl in enumerate(slides):
+                    if sl.video_clip_path:
+                        continue
+                    overlap_start = max(sl.start, pc.timeline_start)
+                    overlap_end = min(sl.end, pc.timeline_end)
+                    overlap = max(0.0, overlap_end - overlap_start)
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_idx = si
+
+                if best_idx >= 0 and best_overlap > 0.5:
+                    sl = slides[best_idx]
+                    actual_clip_dur = _clip_dur(pc.path)
+                    if actual_clip_dur <= 0:
+                        actual_clip_dur = pc.timeline_end - pc.timeline_start
+                    clip_dur = min(actual_clip_dur, sl.end - sl.start)
+                    clip_start_in_tl = max(sl.start, pc.timeline_start)
+                    clip_end_in_tl = min(sl.end, clip_start_in_tl + clip_dur)
+                    clip_dur = clip_end_in_tl - clip_start_in_tl
+
+                    new_slides: list[Slide] = []
+                    if clip_start_in_tl - sl.start > 0.5:
+                        new_slides.append(Slide(
+                            start=sl.start, end=clip_start_in_tl,
+                            image_path=sl.image_path, query=sl.query,
+                            headline=sl.headline, subhead=sl.subhead,
+                            source_page=sl.source_page, image_url=sl.image_url,
+                            license_name=sl.license_name, license_url=sl.license_url,
+                            attribution=sl.attribution, motion=sl.motion,
+                            window_text=sl.window_text, window_keywords=sl.window_keywords,
+                            queries_tried=sl.queries_tried,
+                        ))
+                    new_slides.append(Slide(
+                        start=clip_start_in_tl, end=clip_end_in_tl,
+                        image_path=sl.image_path, query=sl.query,
+                        headline=sl.headline, subhead=sl.subhead,
+                        source_page=sl.source_page, image_url=sl.image_url,
+                        license_name=sl.license_name, license_url=sl.license_url,
+                        attribution=sl.attribution, motion=sl.motion,
+                        window_text=sl.window_text, window_keywords=sl.window_keywords,
+                        queries_tried=sl.queries_tried,
+                        video_clip_path=str(pc.path),
+                        video_clip_start=0.0,
+                        video_clip_end=clip_dur,
+                        video_clip_mute=pc.muted,
+                    ))
+                    if sl.end - clip_end_in_tl > 0.5:
+                        new_slides.append(Slide(
+                            start=clip_end_in_tl, end=sl.end,
+                            image_path=sl.image_path, query=sl.query,
+                            headline=sl.headline, subhead=sl.subhead,
+                            source_page=sl.source_page, image_url=sl.image_url,
+                            license_name=sl.license_name, license_url=sl.license_url,
+                            attribution=sl.attribution, motion=sl.motion,
+                            window_text=sl.window_text, window_keywords=sl.window_keywords,
+                            queries_tried=sl.queries_tried,
+                        ))
+                    slides[best_idx:best_idx + 1] = new_slides
+
+            write_json(out_dir / "prepared_clips.json", [
+                {"path": str(pc.path), "timeline_start": pc.timeline_start,
+                 "timeline_end": pc.timeline_end, "source_url": pc.source_url,
+                 "source_title": pc.source_title, "search_query": pc.search_query,
+                 "muted": pc.muted}
+                for pc in prepared_clips
+            ])
+        except Exception:
             import traceback
             traceback.print_exc()
 

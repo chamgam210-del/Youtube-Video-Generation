@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 import imageio_ffmpeg
 
 if TYPE_CHECKING:
-    from .models import VideoClipSuggestion
+    from .models import CommentaryClipSuggestion, VideoClipSuggestion
 
 def _ffmpeg_exe() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
@@ -530,6 +530,191 @@ def prepare_clip_for_suggestion(
         timeline_end=suggestion.timeline_end,
         source_url=chosen.url,
         source_title=chosen.title,
+        search_query=suggestion.search_query,
+        muted=suggestion.mute,
+    )
+
+
+# ── Compilation: download multiple clips → montage ──────────────────────────
+
+
+def _concat_clips_ffmpeg(
+    clip_paths: list[Path],
+    output_path: Path,
+    *,
+    width: int = 1920,
+    height: int = 1080,
+    mute: bool = True,
+) -> Path:
+    """Concatenate multiple trimmed clips into a single montage video."""
+
+    ffmpeg = _ffmpeg_exe()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build a concat demuxer file.
+    concat_file = output_path.parent / f"{output_path.stem}_concat.txt"
+    lines: list[str] = []
+    for p in clip_paths:
+        safe = str(p.resolve()).replace("\\", "/")
+        lines.append(f"file '{safe}'")
+    concat_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    cmd = [
+        ffmpeg, "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(concat_file),
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "23",
+        "-r", "30",
+        "-pix_fmt", "yuv420p",
+    ]
+    if mute:
+        cmd += ["-an"]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", "128k"]
+    cmd.append(str(output_path))
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg concat failed: {(proc.stderr or '')[:500]}")
+    return output_path
+
+
+def prepare_compilation_clip(
+    suggestion: "CommentaryClipSuggestion",
+    *,
+    dest_dir: str | Path,
+    clip_index: int = 0,
+    width: int = 1920,
+    height: int = 1080,
+    llm_model: str = "gpt-4o-mini",
+) -> PreparedClip | None:
+    """Search, download, trim, and concatenate multiple clips into a montage.
+
+    Used for ``compilation``-type commentary clip suggestions.
+    Returns a single :class:`PreparedClip` with the concatenated montage, or None.
+    """
+
+    from .models import CommentaryClipSuggestion  # deferred
+
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir = dest_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    total_duration = float(suggestion.timeline_end - suggestion.timeline_start)
+    if total_duration <= 0:
+        return None
+
+    num_clips = max(2, min(6, suggestion.num_clips))
+    per_clip_dur = max(2.0, total_duration / num_clips)
+
+    # Gather all search queries (main + extras).
+    queries: list[str] = [suggestion.search_query]
+    if suggestion.extra_queries:
+        queries.extend(suggestion.extra_queries)
+    # Pad to num_clips by repeating main query with variations.
+    while len(queries) < num_clips:
+        queries.append(suggestion.search_query)
+
+    trimmed_parts: list[Path] = []
+    source_urls: list[str] = []
+    source_titles: list[str] = []
+
+    seen_urls: set[str] = set()  # deduplicate across queries
+
+    for qi, query in enumerate(queries[:num_clips]):
+        try:
+            results = search_video_clips(
+                query,
+                max_results=5,
+                preferred_max_duration=300.0,
+            )
+            if not results:
+                continue
+
+            # Pick best with LLM.
+            best_idx = _pick_best_clip_with_llm(
+                results,
+                search_query=query,
+                reason=suggestion.reason,
+                model=llm_model,
+            )
+
+            # Find first non-duplicate.
+            chosen = None
+            for offset in range(len(results)):
+                candidate = results[(best_idx + offset) % len(results)]
+                if candidate.url not in seen_urls:
+                    chosen = candidate
+                    break
+            if chosen is None:
+                continue
+
+            seen_urls.add(chosen.url)
+
+            # Download.
+            raw_path = download_clip(
+                chosen.url,
+                raw_dir,
+                prefix=f"comp{clip_index:02d}_{qi:02d}",
+                max_duration=300.0,
+            )
+            if raw_path is None:
+                continue
+
+            # Find segment + trim.
+            clip_start, clip_dur = find_best_clip_segment(
+                raw_path,
+                target_duration=per_clip_dur,
+                model=llm_model,
+            )
+
+            part_path = dest_dir / f"comp{clip_index:02d}_part{qi:02d}.mp4"
+            trim_clip(
+                raw_path,
+                part_path,
+                start=clip_start,
+                duration=clip_dur,
+                width=width,
+                height=height,
+                mute=suggestion.mute,
+            )
+            trimmed_parts.append(part_path)
+            source_urls.append(chosen.url)
+            source_titles.append(chosen.title)
+
+        except Exception:
+            continue  # non-fatal
+
+    if not trimmed_parts:
+        return None
+
+    # Concatenate all parts into one montage.
+    montage_path = dest_dir / f"prepared_{clip_index:02d}.mp4"
+    if len(trimmed_parts) == 1:
+        # Single clip, just rename / copy.
+        import shutil as _shutil
+        _shutil.copy2(trimmed_parts[0], montage_path)
+    else:
+        _concat_clips_ffmpeg(
+            trimmed_parts,
+            montage_path,
+            width=width,
+            height=height,
+            mute=suggestion.mute,
+        )
+
+    actual_dur = get_video_duration(montage_path)
+
+    return PreparedClip(
+        path=montage_path,
+        timeline_start=suggestion.timeline_start,
+        timeline_end=suggestion.timeline_start + (actual_dur if actual_dur > 0 else total_duration),
+        source_url=", ".join(source_urls),
+        source_title=" | ".join(source_titles),
         search_query=suggestion.search_query,
         muted=suggestion.mute,
     )

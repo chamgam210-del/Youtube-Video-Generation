@@ -148,9 +148,9 @@ with col_left:
 
     video_type = st.selectbox(
         "Video type",
-        options=["review (images only)", "explainer (text + images)", "shorts (9:16)", "shorts review (9:16, retention)", "auto"],
+        options=["review (images only)", "explainer (text + images)", "commentary (clip insertion)", "shorts (9:16)", "shorts review (9:16, retention)", "auto"],
         index=0,
-        help="Explainer/shorts use LLM-planned text-on-slide storyboards when available.",
+        help="Explainer/shorts use LLM-planned text-on-slide storyboards. Commentary auto-inserts referenced clips and compilations.",
     )
 
     # When creating Shorts, retention usually improves with faster cuts and more images.
@@ -419,6 +419,8 @@ with col_right:
         vt = "review"
         if video_type.startswith("explainer"):
             vt = "explainer"
+        elif video_type.startswith("commentary"):
+            vt = "commentary"
         elif video_type.startswith("shorts review"):
             vt = "shorts_review"
         elif video_type.startswith("shorts"):

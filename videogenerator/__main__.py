@@ -91,8 +91,8 @@ def main() -> None:
     p.add_argument(
         "--video-type",
         default="review",
-        choices=["review", "explainer", "shorts", "shorts_review", "auto"],
-        help="Video style. 'review' uses image-only slides; 'explainer' uses text-on-slide cards; 'shorts_review' is retention-style short review (keyword cards, fast cuts). 'auto' tries to infer.",
+        choices=["review", "explainer", "shorts", "shorts_review", "commentary", "auto"],
+        help="Video style. 'review' uses image-only slides; 'explainer' uses text-on-slide cards; 'shorts_review' is retention-style short review (keyword cards, fast cuts); 'commentary' is for reaction/commentary videos with auto clip insertion. 'auto' tries to infer.",
     )
     p.add_argument(
         "--shorts",
