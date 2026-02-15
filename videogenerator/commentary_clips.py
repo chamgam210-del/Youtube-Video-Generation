@@ -91,28 +91,39 @@ def suggest_commentary_clips(
         "At certain moments the viewer should SEE the clip(s) being discussed.\n\n"
         "There are TWO types of clip insertion:\n\n"
         '1. **reference** – The host explicitly cues a specific clip:\n'
-        '   - Trigger phrases: "here\'s the clip", "take a look", "watch this", '
-        '"let\'s see", "check this out", "play the clip", "this is what she said", etc.\n'
+        '   - Trigger phrases (MUST detect ALL of these): "let\'s take a look at the clip", '
+        '"here\'s the clip", "take a look", "watch this", "let\'s watch", '
+        '"let\'s see", "check this out", "play the clip", "this is what she said", '
+        '"this is what he said", "look at this", "roll the clip", etc.\n'
+        '   - CRITICAL: Every time the host says one of these trigger phrases, you MUST '
+        "create a reference clip insertion at that EXACT timestamp. Do NOT skip any.\n"
         '   - You must find the EXACT clip the host is referencing (the controversial statement, '
         "the interview moment, the news segment, etc.).\n"
-        "   - Usually 1 clip, 4-15 seconds.\n\n"
+        "   - Use the surrounding transcript context to determine WHAT clip the host is "
+        "referring to, then craft a specific search query.\n"
+        "   - Usually 1 clip, 4–15 seconds.\n\n"
         '2. **compilation** – The host describes a broad reaction or event:\n'
         '   - Trigger phrases: "everyone is losing their minds", "people are going crazy", '
         '"here\'s what people are saying", "reactions have been insane", '
-        '"republicans/democrats are freaking out", etc.\n'
+        '"they went off", "they all lost their mind", '
+        '"republicans/democrats are freaking out", "they just went off like one after the other", etc.\n'
         "   - You should grab MULTIPLE popular clips on that topic and compile them into a montage.\n"
-        "   - Usually 3-5 clips, total 10-25 seconds.\n"
+        "   - Usually 3–5 clips, total 10–25 seconds.\n"
         "   - Provide the main search_query AND extra_queries (one per clip variant).\n\n"
-        "RULES:\n"
+        "CRITICAL RULES:\n"
+        "- **SCAN EVERY LINE** of the transcript for trigger phrases. Do NOT miss any.\n"
+        "- The clip insertion 'start' should be the EXACT timestamp where the host says "
+        "the trigger phrase. The clip plays IMMEDIATELY after the cue.\n"
         f"- Suggest AT MOST {max_clips} insertions total.\n"
-        f"- Each insertion should be {min_clip_seconds:.0f}-{max_clip_seconds:.0f} seconds.\n"
+        f"- Each insertion should be {min_clip_seconds:.0f}–{max_clip_seconds:.0f} seconds.\n"
         "- Clips must NOT overlap.\n"
         "- For **reference** clips: search_query should be very specific "
-        "(person name + what they said/did + context).\n"
+        "(person name + what they said/did + context). Use the surrounding transcript "
+        "to figure out what the host is talking about.\n"
         "- For **compilation** clips: search_query is the broad topic; "
         "extra_queries are specific source variations (different news outlets, reaction videos, etc.).\n"
-        "- Set mute=true for copyrighted clips. Set mute=false only for news clips or "
-        "public domain content where keeping audio adds value.\n"
+        "- Set mute=false for news clips where keeping audio adds value (interviews, "
+        "press conferences, news segments). Set mute=true for music/entertainment clips.\n"
         "- Space insertions out; don't cluster.\n"
         "- If the narrator never cues a clip or describes reactions, return an empty list [].\n\n"
         "Return ONLY valid JSON (no markdown). Schema:\n"
