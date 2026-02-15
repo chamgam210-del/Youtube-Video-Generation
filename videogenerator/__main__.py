@@ -179,6 +179,16 @@ def main() -> None:
         ),
     )
     p.add_argument(
+        "--clip-research",
+        action="store_true",
+        default=False,
+        help=(
+            "Use agentic web research to find clips instead of simple YouTube search. "
+            "Searches Google, scrapes news articles, and uses LLM to evaluate clips. "
+            "Finds more accurate clips but uses more API calls. Requires playwright."
+        ),
+    )
+    p.add_argument(
         "--verify-video",
         action="store_true",
         help="After render, verify audio presence and whether frames change",
@@ -381,6 +391,7 @@ def main() -> None:
         mix_video_clips=bool(args.mix_video_clips),
         max_video_clips=int(args.max_video_clips),
         clip_queries=args.clip_queries,
+        clip_research=bool(getattr(args, 'clip_research', False)),
     )
 
     # Load slides back from timeline.json for rendering

@@ -19,6 +19,7 @@ dependencies = [
   "python-dotenv>=1.0",
   "openai-whisper>=20231117",
   "yt-dlp>=2024.1",
+  "playwright>=1.40",
 ]
 
 [project.optional-dependencies]

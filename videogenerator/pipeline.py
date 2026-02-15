@@ -41,6 +41,7 @@ def run(
     mix_video_clips: bool = False,
     max_video_clips: int = 6,
     clip_queries: list[str] | None = None,
+    clip_research: bool = False,
 ) -> Path:
     audio_path = Path(audio_path)
     out_dir = Path(out_dir)
@@ -1878,6 +1879,12 @@ def run(
             )
             from .models import VideoClipSuggestion as _VCS, CommentaryClipSuggestion as _CCS
 
+            # Agentic research pipeline for finding clips.
+            _use_research = clip_research
+            if _use_research:
+                from .clip_researcher import research_and_prepare_clip as _prep_research
+                print("[pipeline] Using AGENTIC clip research pipeline")
+
             clip_dir = ensure_dir(out_dir / "clips")
 
             if clip_queries:
@@ -1962,11 +1969,37 @@ def run(
                 for s in csug
             ])
 
+            # Build transcript context for the research agent.
+            _transcript_text = "\n".join(f"[{s.start:.1f}-{s.end:.1f}] {s.text}" for s in segments)
+
             prepared_clips: list[PreparedClip] = []
             _seen_clip_urls: set[str] = set()  # avoid downloading same video for different queries
             for ci, sug in enumerate(csug):
                 try:
-                    if sug.clip_type == "compilation":
+                    if _use_research:
+                        # ── Agentic research pipeline ──
+                        # Extract transcript window around the clip for context.
+                        ctx_start = max(0.0, sug.timeline_start - 30)
+                        ctx_end = sug.timeline_end + 30
+                        ctx_lines = [
+                            f"[{s.start:.1f}-{s.end:.1f}] {s.text}"
+                            for s in segments
+                            if s.start >= ctx_start and s.end <= ctx_end
+                        ]
+                        transcript_ctx = "\n".join(ctx_lines)
+                        pc = _prep_research(
+                            sug,
+                            dest_dir=clip_dir,
+                            clip_index=ci,
+                            width=video_width,
+                            height=video_height,
+                            topic=effective_topic or audio_path.stem,
+                            transcript_context=transcript_ctx,
+                            llm_model="gpt-4o",
+                            seen_urls=_seen_clip_urls,
+                            max_scrape_pages=5,
+                        )
+                    elif sug.clip_type == "compilation":
                         pc = _prep_comp(
                             sug,
                             dest_dir=clip_dir,

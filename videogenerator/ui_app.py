@@ -344,6 +344,15 @@ with col_left:
             "Example:\nMegyn Kelly reaction Bad Bunny halftime\nBen Shapiro reaction Bad Bunny\nDonald Trump Bad Bunny halftime show"
         ),
     )
+    clip_research = st.checkbox(
+        "Agentic clip research (Google + web scraping)",
+        value=False,
+        help=(
+            "Use an AI research agent to find clips instead of simple YouTube search. "
+            "Searches Google, scrapes news articles for embedded YouTube links, and uses "
+            "LLM evaluation to pick the best clip. More accurate but slower and uses more API calls."
+        ),
+    )
     clip_queries: list[str] | None = None
     if clip_queries_text.strip():
         # Split on newlines first, then on commas within each line.
@@ -491,6 +500,7 @@ with col_right:
                 mix_video_clips=bool(mix_video_clips),
                 max_video_clips=int(max_video_clips),
                 clip_queries=clip_queries,
+                clip_research=bool(clip_research),
             )
 
             # Show reuse decision (if any) from pipeline metadata.
