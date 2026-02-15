@@ -1,4 +1,4 @@
-"""Agentic web research pipeline for finding video clips.
+"""Agentic web research pipeline for finding video clips from any source.
 
 Instead of relying solely on YouTube search via SerpAPI, this module uses a
 multi-step research approach:
@@ -8,14 +8,17 @@ multi-step research approach:
 2. **Google Search** – Uses SerpAPI Google search (web + video) to find
    articles, Reddit threads, social media posts that reference specific clips.
 3. **Web Scraper** – Uses Playwright to visit promising pages and extract
-   YouTube links with surrounding context (titles, descriptions).
+   video links from ANY platform (YouTube, Twitter/X, Instagram, TikTok,
+   Vimeo, Dailymotion, Facebook, Reddit, Rumble, etc.) with context.
 4. **Evaluation Agent** – An LLM scores and ranks all discovered clips based
    on relevance, specificity, and quality signals.
-5. **Download & Prepare** – Uses the existing yt-dlp pipeline for the winner.
+5. **Download & Prepare** – Uses yt-dlp (which supports 1000+ sites) to
+   download the winning clip from whatever platform it's hosted on.
 
 This approach finds clips that YouTube search alone cannot surface — e.g.
 a specific Megyn Kelly segment on Piers Morgan's show about the Bad Bunny
-halftime show, which may be buried on YouTube but linked from news articles.
+halftime show, which may be buried on YouTube but linked from news articles,
+or a viral Twitter/X clip that was never uploaded to YouTube.
 """
 
 from __future__ import annotations
@@ -48,13 +51,19 @@ from .clip_tools import (
 
 @dataclass
 class DiscoveredClip:
-    """A YouTube clip found through web research with rich context."""
+    """A video clip found through web research with rich context.
+
+    Supports clips from any platform that yt-dlp can download:
+    YouTube, Twitter/X, Instagram, TikTok, Vimeo, Dailymotion,
+    Facebook, Reddit, Rumble, Twitch, and 1000+ more.
+    """
 
     url: str
     title: str
     context: str  # surrounding text from the page where we found this link
     source_page: str  # the web page URL where we found this
     source_type: str  # "google_search", "google_video", "article_scrape", "youtube_search"
+    platform: str = ""  # "youtube", "twitter", "tiktok", etc. (auto-detected)
     view_count: int | None = None
     duration_seconds: float | None = None
     relevance_score: float = 0.0  # LLM-assigned 0-1 score
@@ -136,14 +145,17 @@ def _generate_research_queries(
         "Given a clip query (describing what we're looking for) and optional context,\n"
         "generate 6-8 diverse Google search queries that would help find this specific clip.\n\n"
         "Strategy:\n"
-        "1. Direct YouTube search queries (person + topic + 'clip'/'video')\n"
-        "2. News article queries that would LINK to the clip (news sites often embed YouTube videos)\n"
+        "1. Direct video search queries (person + topic + 'clip'/'video')\n"
+        "2. News article queries that would LINK to the clip (news sites often embed videos)\n"
         "3. Reddit/social media queries where people share these clips\n"
         "4. Show-specific queries (if the person has a show, search for that show + topic)\n"
-        "5. Variation queries with synonyms ('rant', 'reacts', 'goes off', 'slams', 'blasts')\n\n"
+        "5. Variation queries with synonyms ('rant', 'reacts', 'goes off', 'slams', 'blasts')\n"
+        "6. Platform-specific queries: try 'site:twitter.com', 'site:x.com', 'site:tiktok.com'\n"
+        "   in addition to YouTube for clips that may be posted on social media\n\n"
         "IMPORTANT:\n"
-        "- Each query should be a Google search query (not a YouTube search)\n"
-        "- Include 'youtube' in some queries to find pages linking to YouTube videos\n"
+        "- Each query should be a Google search query (not a platform-specific search)\n"
+        "- Search across ALL platforms — YouTube, Twitter/X, TikTok, Instagram, Vimeo, etc.\n"
+        "- Include platform-specific 'site:' queries for viral/social clips\n"
         "- Be SPECIFIC — include the person's name, the exact topic/event\n"
         "- Think about what WEBPAGE would link to this clip\n\n"
         "Return ONLY valid JSON: {\"queries\": [\"query1\", \"query2\", ...]}"
@@ -182,12 +194,13 @@ def _fallback_search_queries(clip_query: str, topic: str = "") -> list[str]:
     if topic:
         queries.append(f"{clip_query} {topic}")
     queries.extend([
-        f"{clip_query} youtube clip",
+        f"{clip_query} video clip",
         f"{clip_query} video reaction",
         f"{clip_query} reacts rant",
         f"site:youtube.com {clip_query}",
+        f"site:twitter.com OR site:x.com {clip_query} video",
     ])
-    return queries[:6]
+    return queries[:7]
 
 
 # ── Step 2: Google Web Search via SerpAPI ────────────────────────────────────
@@ -280,55 +293,184 @@ def _google_video_search(
         return []
 
 
-# ── Step 3: Extract YouTube URLs from web pages ─────────────────────────────
+# ── Step 3: Extract video URLs from web pages (any platform) ─────────────────
 
 
+# Regex patterns for known video platforms that yt-dlp supports.
+# Each maps platform_name → compiled regex.
 _YT_URL_RE = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})",
+    r"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/)([a-zA-Z0-9_-]{11})",
     re.IGNORECASE,
 )
 
+# Master regex matching video URLs from any major platform.
+_VIDEO_URL_RE = re.compile(
+    r"https?://(?:"
+    # YouTube
+    r"(?:www\.)?(?:youtube\.com/(?:watch\?[^\s\"'<>]*v=|embed/|shorts/)|youtu\.be/)[a-zA-Z0-9_-]+"
+    r"|"
+    # Twitter / X
+    r"(?:(?:twitter|x)\.com/[a-zA-Z0-9_]+/status/\d+)"
+    r"|"
+    # TikTok
+    r"(?:(?:www\.)?tiktok\.com/@[a-zA-Z0-9_.]+/video/\d+|vm\.tiktok\.com/[a-zA-Z0-9]+)"
+    r"|"
+    # Instagram (Reels & posts)
+    r"(?:(?:www\.)?instagram\.com/(?:reel|p|tv)/[a-zA-Z0-9_-]+)"
+    r"|"
+    # Facebook / FB Watch
+    r"(?:(?:www\.)?facebook\.com/(?:[a-zA-Z0-9.]+/videos/\d+|watch/?\?v=\d+|reel/\d+))"
+    r"|"
+    # Vimeo
+    r"(?:(?:www\.)?vimeo\.com/\d+)"
+    r"|"
+    # Dailymotion
+    r"(?:(?:www\.)?dailymotion\.com/video/[a-zA-Z0-9]+)"
+    r"|"
+    # Reddit video posts
+    r"(?:(?:www\.)?reddit\.com/r/[a-zA-Z0-9_]+/comments/[a-zA-Z0-9]+/[a-zA-Z0-9_]*)"
+    r"|"
+    # Rumble
+    r"(?:(?:www\.)?rumble\.com/v[a-zA-Z0-9]+-[a-zA-Z0-9-]+\.html)"
+    r"|"
+    # Twitch clips
+    r"(?:(?:www\.)?(?:twitch\.tv/[a-zA-Z0-9_]+/clip/|clips\.twitch\.tv/)[a-zA-Z0-9_-]+)"
+    r"|"
+    # Streamable
+    r"(?:(?:www\.)?streamable\.com/[a-zA-Z0-9]+)"
+    r"|"
+    # BitChute
+    r"(?:(?:www\.)?bitchute\.com/video/[a-zA-Z0-9]+)"
+    r")",
+    re.IGNORECASE,
+)
 
-def _normalize_youtube_url(url: str) -> str | None:
-    """Normalize any YouTube URL variant to https://www.youtube.com/watch?v=ID."""
+# Domains that host video content (for identifying video links in scraping).
+_VIDEO_DOMAINS = {
+    "youtube.com", "youtu.be",
+    "twitter.com", "x.com",
+    "tiktok.com", "vm.tiktok.com",
+    "instagram.com",
+    "facebook.com", "fb.watch",
+    "vimeo.com",
+    "dailymotion.com",
+    "reddit.com",
+    "rumble.com",
+    "twitch.tv", "clips.twitch.tv",
+    "streamable.com",
+    "bitchute.com",
+}
+
+
+def _detect_platform(url: str) -> str:
+    """Detect which video platform a URL belongs to."""
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower().lstrip("www.")
+    platform_map = {
+        "youtube.com": "youtube",
+        "youtu.be": "youtube",
+        "twitter.com": "twitter",
+        "x.com": "twitter",
+        "tiktok.com": "tiktok",
+        "vm.tiktok.com": "tiktok",
+        "instagram.com": "instagram",
+        "facebook.com": "facebook",
+        "fb.watch": "facebook",
+        "vimeo.com": "vimeo",
+        "dailymotion.com": "dailymotion",
+        "reddit.com": "reddit",
+        "rumble.com": "rumble",
+        "twitch.tv": "twitch",
+        "clips.twitch.tv": "twitch",
+        "streamable.com": "streamable",
+        "bitchute.com": "bitchute",
+    }
+    for key, platform in platform_map.items():
+        if domain == key or domain.endswith("." + key):
+            return platform
+    return ""
+
+
+def _is_video_url(url: str) -> bool:
+    """Check if a URL is from a known video-hosting platform."""
+    return bool(_detect_platform(url)) or bool(_VIDEO_URL_RE.match(url))
+
+
+def _normalize_video_url(url: str) -> str | None:
+    """Normalize a video URL.
+
+    For YouTube, normalizes to https://www.youtube.com/watch?v=ID.
+    For other platforms, cleans up the URL (strips tracking params, etc.).
+    Returns None if URL is not a recognized video URL.
+    """
+    if not url:
+        return None
+
+    # YouTube — canonical normalization.
     m = _YT_URL_RE.search(url)
     if m:
         return f"https://www.youtube.com/watch?v={m.group(1)}"
+
+    # Other platforms — check if it's a video URL and clean it.
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower()
+
+    if _detect_platform(url):
+        # Strip common tracking params but keep essential query params.
+        clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        # Keep query params for platforms that need them (e.g., Facebook ?v=).
+        if parsed.query:
+            essential_params = {"v", "id", "t", "start"}
+            qs = parse_qs(parsed.query)
+            kept = {k: v[0] for k, v in qs.items() if k in essential_params}
+            if kept:
+                clean += "?" + "&".join(f"{k}={v}" for k, v in kept.items())
+        return clean
+
     return None
 
 
-def _extract_youtube_urls_from_text(text: str) -> list[str]:
-    """Find all YouTube URLs in a block of text."""
-    found = set()
-    for m in _YT_URL_RE.finditer(text):
-        url = f"https://www.youtube.com/watch?v={m.group(1)}"
-        found.add(url)
+def _extract_video_urls_from_text(text: str) -> list[str]:
+    """Find all video URLs (any platform) in a block of text."""
+    found: set[str] = set()
+    for m in _VIDEO_URL_RE.finditer(text):
+        url = m.group(0)
+        norm = _normalize_video_url(url)
+        if norm:
+            found.add(norm)
     return list(found)
 
 
-def _scrape_page_for_youtube_links(
+def _scrape_page_for_video_links(
     url: str,
     *,
     timeout_ms: int = 15000,
 ) -> list[DiscoveredClip]:
-    """Use Playwright to load a page and extract YouTube links with context.
+    """Use Playwright to load a page and extract video links from ANY platform.
 
-    Returns DiscoveredClip entries for each YouTube link found.
+    Looks for:
+    - Video embed iframes (YouTube, Twitter, TikTok, Instagram, Vimeo, etc.)
+    - Links to video platforms in <a> tags
+    - <video> elements with src attributes
+    - Open Graph / Twitter Card video meta tags
+    - Video URLs in raw page HTML
+
+    Returns DiscoveredClip entries for each video link found.
     """
 
     clips: list[DiscoveredClip] = []
 
-    # Skip YouTube pages themselves (we handle those differently).
-    parsed = urlparse(url)
-    if "youtube.com" in parsed.netloc or "youtu.be" in parsed.netloc:
-        norm = _normalize_youtube_url(url)
+    # If the URL itself IS a video platform page, return it directly.
+    if _is_video_url(url):
+        norm = _normalize_video_url(url)
         if norm:
             clips.append(DiscoveredClip(
                 url=norm,
                 title="",
-                context="Direct YouTube URL from search results",
+                context="Direct video URL from search results",
                 source_page=url,
                 source_type="google_search",
+                platform=_detect_platform(norm),
             ))
         return clips
 
@@ -355,67 +497,84 @@ def _scrape_page_for_youtube_links(
                 browser.close()
                 return clips
 
-            # Strategy 1: Find YouTube embeds (iframes).
+            seen_urls_local: set[str] = set()
+
+            def _add_clip(vid_url: str, title: str = "", ctx: str = "", source_type: str = "article_scrape") -> None:
+                norm = _normalize_video_url(vid_url)
+                if norm and norm not in seen_urls_local:
+                    seen_urls_local.add(norm)
+                    clips.append(DiscoveredClip(
+                        url=norm,
+                        title=title[:200],
+                        context=ctx[:300],
+                        source_page=url,
+                        source_type=source_type,
+                        platform=_detect_platform(norm),
+                    ))
+
+            # Strategy 1: Find ALL video embeds (iframes from any platform).
             try:
-                iframes = page.query_selector_all("iframe[src*='youtube.com'], iframe[src*='youtu.be']")
+                iframes = page.query_selector_all("iframe[src]")
                 for iframe in iframes:
                     src = iframe.get_attribute("src") or ""
-                    norm = _normalize_youtube_url(src)
-                    if norm:
-                        # Get surrounding text for context.
+                    if _is_video_url(src):
                         parent = iframe.evaluate_handle("el => el.parentElement")
                         ctx = parent.evaluate("el => el.textContent || ''") if parent else ""
-                        clips.append(DiscoveredClip(
-                            url=norm,
-                            title="",
-                            context=str(ctx).strip()[:300],
-                            source_page=url,
-                            source_type="article_scrape",
-                        ))
+                        _add_clip(src, ctx=str(ctx).strip())
             except Exception:
                 pass
 
-            # Strategy 2: Find YouTube links in <a> tags.
+            # Strategy 2: Find links to ANY video platform in <a> tags.
             try:
-                links = page.query_selector_all("a[href*='youtube.com'], a[href*='youtu.be']")
-                for link in links:
+                all_links = page.query_selector_all("a[href]")
+                for link in all_links:
                     href = link.get_attribute("href") or ""
-                    norm = _normalize_youtube_url(href)
-                    if norm:
+                    if _is_video_url(href):
                         link_text = link.text_content() or ""
-                        # Get parent paragraph or container for context.
                         try:
                             parent_text = link.evaluate(
                                 "el => (el.closest('p') || el.closest('div') || el.parentElement)?.textContent || ''"
                             )
                         except Exception:
                             parent_text = ""
-                        ctx = f"{link_text} — {parent_text}".strip()[:300]
-                        clips.append(DiscoveredClip(
-                            url=norm,
-                            title=link_text.strip()[:200],
-                            context=ctx,
-                            source_page=url,
-                            source_type="article_scrape",
-                        ))
+                        ctx = f"{link_text} — {parent_text}".strip()
+                        _add_clip(href, title=link_text.strip(), ctx=ctx)
             except Exception:
                 pass
 
-            # Strategy 3: Search page text for YouTube URLs.
+            # Strategy 3: Find <video> elements with playable sources.
             try:
-                body_text = page.evaluate("document.body?.innerText || ''")
+                videos = page.query_selector_all("video[src], video source[src]")
+                for vid in videos:
+                    src = vid.get_attribute("src") or ""
+                    if src and src.startswith("http"):
+                        _add_clip(src, ctx="Embedded <video> element")
+            except Exception:
+                pass
+
+            # Strategy 4: Check Open Graph / Twitter Card video meta tags.
+            try:
+                meta_selectors = [
+                    'meta[property="og:video"]',
+                    'meta[property="og:video:url"]',
+                    'meta[property="og:video:secure_url"]',
+                    'meta[name="twitter:player"]',
+                    'meta[name="twitter:player:stream"]',
+                ]
+                for sel in meta_selectors:
+                    metas = page.query_selector_all(sel)
+                    for meta in metas:
+                        content = meta.get_attribute("content") or ""
+                        if content and content.startswith("http"):
+                            _add_clip(content, ctx="Open Graph / Twitter Card video meta tag")
+            except Exception:
+                pass
+
+            # Strategy 5: Search page HTML for video URLs we might have missed.
+            try:
                 page_html = page.content()
-                # Find URLs in raw HTML that we might have missed.
-                for yt_url in _extract_youtube_urls_from_text(page_html):
-                    norm = _normalize_youtube_url(yt_url)
-                    if norm and not any(c.url == norm for c in clips):
-                        clips.append(DiscoveredClip(
-                            url=norm,
-                            title="",
-                            context="Found in page HTML",
-                            source_page=url,
-                            source_type="article_scrape",
-                        ))
+                for vid_url in _extract_video_urls_from_text(page_html):
+                    _add_clip(vid_url, ctx="Found in page HTML")
             except Exception:
                 pass
 
@@ -458,7 +617,8 @@ def _evaluate_clips_with_llm(
     clips = unique[:20]  # limit for LLM context
 
     system = (
-        "You are evaluating YouTube video clips found through web research.\n"
+        "You are evaluating video clips found through web research across multiple platforms\n"
+        "(YouTube, Twitter/X, TikTok, Instagram, Vimeo, Reddit, etc.).\n"
         "For each clip, assign a relevance score from 0.0 to 1.0 based on how well it matches\n"
         "what we're looking for.\n\n"
         "Scoring criteria:\n"
@@ -470,8 +630,10 @@ def _evaluate_clips_with_llm(
         "Key factors:\n"
         "- Does the clip title mention the SPECIFIC PERSON we're looking for?\n"
         "- Is it a REACTION/RESPONSE clip (not a preview or unrelated content)?\n"
-        "- Is it from a CREDIBLE source (news outlet, official channel)?\n"
-        "- Does the context from the web page confirm this is the right clip?\n\n"
+        "- Is it from a CREDIBLE source (news outlet, official channel, verified account)?\n"
+        "- Does the context from the web page confirm this is the right clip?\n"
+        "- Platform quality: YouTube/Vimeo clips are often higher quality; Twitter/TikTok\n"
+        "  clips may be shorter but more timely/viral. Prefer the best match regardless of platform.\n\n"
         "Return ONLY valid JSON: {\"scores\": [{\"index\": 0, \"score\": 0.95, \"reason\": \"...\"}, ...]}"
     )
 
@@ -481,6 +643,7 @@ def _evaluate_clips_with_llm(
             "index": i,
             "url": c.url,
             "title": c.title[:150] if c.title else "(unknown title)",
+            "platform": c.platform or _detect_platform(c.url) or "unknown",
             "context": c.context[:200] if c.context else "",
             "source_page": c.source_page[:100],
             "source_type": c.source_type,
@@ -519,11 +682,11 @@ def _evaluate_clips_with_llm(
     return clips
 
 
-# ── Step 5: Get YouTube video metadata (title etc.) ──────────────────────────
+# ── Step 5: Get video metadata (title etc.) via yt-dlp ───────────────────────
 
 
 def _enrich_clip_metadata(clip: DiscoveredClip) -> DiscoveredClip:
-    """Fetch YouTube video title and metadata if missing."""
+    """Fetch video title and metadata if missing. Works for any yt-dlp-supported site."""
 
     if clip.title:
         return clip
@@ -623,13 +786,13 @@ def research_clip(
         print(f"  Google video: {len(results)} results for {q!r}")
         time.sleep(0.5)
 
-    # ── Step 3: Extract YouTube URLs from search results + scrape pages ──
-    print("\n[researcher] Step 3: Extracting YouTube URLs and scraping pages...")
+    # ── Step 3: Extract video URLs from search results + scrape pages ──
+    print("\n[researcher] Step 3: Extracting video URLs and scraping pages...")
 
-    # Direct YouTube URLs from search results.
+    # Direct video URLs from search results (any platform).
     for sr in all_search_results:
         link = sr.get("link", "")
-        norm = _normalize_youtube_url(link)
+        norm = _normalize_video_url(link)
         if norm:
             result.discovered_clips.append(DiscoveredClip(
                 url=norm,
@@ -637,9 +800,10 @@ def research_clip(
                 context=sr.get("snippet", ""),
                 source_page=link,
                 source_type="google_search",
+                platform=_detect_platform(norm),
             ))
 
-    # Identify non-YouTube pages worth scraping (news articles, Reddit, etc.).
+    # Identify non-video pages worth scraping (news articles, Reddit, etc.).
     pages_to_scrape: list[str] = []
     scraped_domains: set[str] = set()
     for sr in all_search_results:
@@ -648,8 +812,8 @@ def research_clip(
             continue
         parsed = urlparse(link)
         domain = parsed.netloc.lower()
-        # Skip YouTube (we already extracted those).
-        if "youtube.com" in domain or "youtu.be" in domain:
+        # Skip pages that are themselves video platform pages (already handled above).
+        if _is_video_url(link):
             continue
         # Skip domains we've already scraped.
         if domain in scraped_domains:
@@ -669,7 +833,7 @@ def research_clip(
             pages_to_scrape.append(link)
             scraped_domains.add(domain)
 
-    # If we don't have enough priority pages, add any non-YouTube page.
+    # If we don't have enough priority pages, add any non-video-platform page.
     for sr in all_search_results:
         if len(pages_to_scrape) >= max_scrape_pages:
             break
@@ -678,20 +842,21 @@ def research_clip(
             continue
         parsed = urlparse(link)
         domain = parsed.netloc.lower()
-        if "youtube.com" in domain or "youtu.be" in domain:
+        if _is_video_url(link):
             continue
         if domain in scraped_domains:
             continue
         pages_to_scrape.append(link)
         scraped_domains.add(domain)
 
-    # Scrape pages for embedded YouTube links.
+    # Scrape pages for embedded video links (any platform).
     for page_url in pages_to_scrape:
         print(f"  Scraping: {page_url[:80]}...")
-        scraped = _scrape_page_for_youtube_links(page_url)
+        scraped = _scrape_page_for_video_links(page_url)
         result.discovered_clips.extend(scraped)
         result.pages_scraped.append(page_url)
-        print(f"    Found {len(scraped)} YouTube links")
+        platforms_found = set(c.platform for c in scraped if c.platform)
+        print(f"    Found {len(scraped)} video links ({', '.join(platforms_found) or 'none'})")
 
     # ── Step 3b: Also do a direct YouTube search as fallback ──
     print("\n[researcher] Step 3b: YouTube search fallback...")
@@ -703,18 +868,23 @@ def research_clip(
             context=f"YouTube search result ({r.view_count or 0:,} views)",
             source_page="youtube.com",
             source_type="youtube_search",
+            platform="youtube",
             view_count=r.view_count,
             duration_seconds=r.duration_seconds,
         ))
 
-    # Deduplicate by URL.
+    # Deduplicate by normalized URL (works across all platforms).
     seen: set[str] = set(seen_urls or set())
     unique: list[DiscoveredClip] = []
     for c in result.discovered_clips:
-        norm = _normalize_youtube_url(c.url)
-        if norm and norm not in seen:
-            seen.add(norm)
-            c.url = norm
+        norm = _normalize_video_url(c.url)
+        key = norm or c.url  # fall back to raw URL if normalization fails
+        if key not in seen:
+            seen.add(key)
+            if norm:
+                c.url = norm
+            if not c.platform:
+                c.platform = _detect_platform(c.url)
             unique.append(c)
     result.discovered_clips = unique
 
@@ -823,7 +993,7 @@ def research_and_prepare_clip(
                 try:
                     import requests as _req
                     system = (
-                        "You are helping select the best segment from a YouTube video to use as a clip.\n"
+                        "You are helping select the best segment from a video to use as a clip.\n"
                         "Given the video title, total duration, what we searched for, and how long the clip should be,\n"
                         "pick the best START time (in seconds) so the clip shows the most relevant/interesting part.\n\n"
                         "Guidelines:\n"
@@ -833,6 +1003,7 @@ def research_and_prepare_clip(
                         "- For interviews: jump to the key quote or heated exchange.\n"
                         "- For podcast episodes / long shows: estimate where in the episode the topic\n"
                         "  would be discussed (often 10-30% in, after intro/ads).\n"
+                        "- For social media clips (Twitter, TikTok): they're usually short — start near 0.\n"
                         "- Make sure start + duration doesn't exceed the total video duration.\n\n"
                         'Return ONLY valid JSON: {"start": <float>}'
                     )
