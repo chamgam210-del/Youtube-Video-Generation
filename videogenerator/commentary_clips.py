@@ -65,7 +65,7 @@ def suggest_commentary_clips(
     title: str | None = None,
     audio_duration: float = 0.0,
     max_clips: int = 8,
-    min_clip_seconds: float = 8.0,
+    min_clip_seconds: float = 10.0,
     max_clip_seconds: float = 25.0,
     model: str = "gpt-4o-mini",
 ) -> list[CommentaryClipSuggestion]:

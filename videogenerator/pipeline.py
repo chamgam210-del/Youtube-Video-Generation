@@ -1960,6 +1960,7 @@ def run(
             ])
 
             prepared_clips: list[PreparedClip] = []
+            _seen_clip_urls: set[str] = set()  # avoid downloading same video for different queries
             for ci, sug in enumerate(csug):
                 try:
                     if sug.clip_type == "compilation":
@@ -1991,6 +1992,7 @@ def run(
                             llm_model=llm_model,
                             sort_by_views=True,
                             mode="commentary",
+                            seen_urls=_seen_clip_urls,
                         )
                     if pc is not None:
                         prepared_clips.append(pc)

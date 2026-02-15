@@ -458,11 +458,14 @@ def find_best_clip_segment(
     *,
     target_duration: float,
     model: str = "gpt-4o-mini",
+    search_query: str = "",
+    video_title: str = "",
 ) -> tuple[float, float]:
     """Determine the best start offset within a downloaded clip.
 
     For short clips (< 2x target), just use the beginning.
-    For longer clips, pick a segment with likely action/interest.
+    For longer clips, use the LLM with the video title and search context
+    to pick the most relevant segment.
     Returns (start_seconds, duration_seconds).
     """
 
@@ -474,8 +477,52 @@ def find_best_clip_segment(
         # Clip is about the right length; use from start, capped.
         return 0.0, min(clip_dur, target_duration)
 
-    # For longer clips, pick a segment roughly 1/3 to 2/3 in (avoid intros/outros).
-    # Simple heuristic: start at ~25% of clip.
+    # Use LLM to pick the best segment when we have context.
+    api_key = os.getenv("OPENAI_API_KEY")
+    if api_key and (search_query or video_title):
+        try:
+            import requests as _req
+            system = (
+                "You are helping select the best segment from a YouTube video to use as a clip.\n"
+                "Given the video title, total duration, what we searched for, and how long the clip should be,\n"
+                "pick the best START time (in seconds) so the clip shows the most relevant/interesting part.\n\n"
+                "Guidelines:\n"
+                "- Skip intros, outros, channel branding (usually first 5-15s and last 10s).\n"
+                "- For news clips: jump to where the person of interest is actually speaking.\n"
+                "- For reaction videos: jump to the peak reaction moment.\n"
+                "- For interviews: jump to the key quote or heated exchange.\n"
+                "- Make sure start + duration doesn't exceed the total video duration.\n\n"
+                'Return ONLY valid JSON: {"start": <float>}'
+            )
+            user_msg = {
+                "video_title": video_title,
+                "video_duration_seconds": round(clip_dur, 1),
+                "search_query": search_query,
+                "desired_clip_duration": round(target_duration, 1),
+            }
+            resp = _req.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": model, "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(user_msg, ensure_ascii=False)},
+                ], "temperature": 0.2, "max_tokens": 60},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"].strip()
+            if content.startswith("```"):
+                content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            parsed = json.loads(content)
+            start = float(parsed.get("start", 0))
+            start = max(0.0, min(start, clip_dur - target_duration))
+            dur = min(target_duration, clip_dur - start)
+            print(f"[clip_segment] LLM picked start={start:.1f}s for '{video_title[:60]}' (total {clip_dur:.1f}s)")
+            return start, dur
+        except Exception:
+            pass  # fall back to heuristic
+
+    # Fallback: pick a segment roughly 1/3 in (avoid intros/outros).
     start = max(0.0, clip_dur * 0.25)
     if start + target_duration > clip_dur:
         start = max(0.0, clip_dur - target_duration)
@@ -509,6 +556,7 @@ def prepare_clip_for_suggestion(
     llm_model: str = "gpt-4o-mini",
     sort_by_views: bool = False,
     mode: str = "review",
+    seen_urls: set[str] | None = None,
 ) -> PreparedClip | None:
     """End-to-end: search → pick best → download → trim → return prepared clip.
 
@@ -538,6 +586,10 @@ def prepare_clip_for_suggestion(
     if not results:
         return None
 
+    # Filter out already-used URLs to avoid duplicates across clips.
+    if seen_urls:
+        results = [r for r in results if r.url not in seen_urls] or results[:1]
+
     # 2) Pick best with LLM.
     best_idx = _pick_best_clip_with_llm(
         results,
@@ -547,6 +599,8 @@ def prepare_clip_for_suggestion(
         mode=mode,
     )
     chosen = results[best_idx]
+    if seen_urls is not None:
+        seen_urls.add(chosen.url)
 
     # 3) Download.
     raw_dir = dest_dir / "raw"
@@ -578,6 +632,8 @@ def prepare_clip_for_suggestion(
         raw_path,
         target_duration=target_duration,
         model=llm_model,
+        search_query=suggestion.search_query,
+        video_title=chosen.title,
     )
 
     # 5) Trim + scale + optionally mute.
@@ -748,6 +804,8 @@ def prepare_compilation_clip(
                 raw_path,
                 target_duration=per_clip_dur,
                 model=llm_model,
+                search_query=query,
+                video_title=chosen.title,
             )
 
             part_path = dest_dir / f"comp{clip_index:02d}_part{qi:02d}.mp4"
