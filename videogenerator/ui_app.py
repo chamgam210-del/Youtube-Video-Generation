@@ -332,6 +332,20 @@ with col_left:
             step=1,
             help="Maximum number of video clips the AI can insert.",
         )
+
+    clip_queries_text = st.text_area(
+        "Manual clip queries (one per line)",
+        value="",
+        height=100,
+        help=(
+            "Specify exact YouTube search queries for clips to insert. One per line. "
+            "For commentary videos these REPLACE the AI-generated queries. "
+            "Example:\nMegyn Kelly reaction Bad Bunny halftime\nBen Shapiro reaction Bad Bunny\nDonald Trump Bad Bunny halftime show"
+        ),
+    )
+    clip_queries: list[str] | None = None
+    if clip_queries_text.strip():
+        clip_queries = [q.strip() for q in clip_queries_text.strip().splitlines() if q.strip()]
     youtube_metadata = st.checkbox("Generate YouTube metadata + thumbnail", value=True)
     verify_video = st.checkbox("Verify MP4 (local)", value=True)
 
@@ -468,6 +482,7 @@ with col_right:
                 reuse_images=bool(effective_reuse_images),
                 mix_video_clips=bool(mix_video_clips),
                 max_video_clips=int(max_video_clips),
+                clip_queries=clip_queries,
             )
 
             # Show reuse decision (if any) from pipeline metadata.

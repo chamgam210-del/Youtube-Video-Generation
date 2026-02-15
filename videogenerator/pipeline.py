@@ -40,6 +40,7 @@ def run(
     reuse_images: bool = True,
     mix_video_clips: bool = False,
     max_video_clips: int = 6,
+    clip_queries: list[str] | None = None,
 ) -> Path:
     audio_path = Path(audio_path)
     out_dir = Path(out_dir)
@@ -1864,6 +1865,9 @@ def run(
     if vt == "commentary":
         # Commentary always uses the commentary-specific LLM to find reference clips
         # and build compilation montages.
+        # If the user supplied manual `clip_queries`, those REPLACE the LLM-generated
+        # search queries.  The LLM still determines WHERE to insert clips in the
+        # timeline, but the *what* is controlled by the user.
         try:
             from .commentary_clips import suggest_commentary_clips
             from .clip_tools import (
@@ -1872,18 +1876,75 @@ def run(
                 get_video_duration as _clip_dur,
                 PreparedClip,
             )
-            from .models import VideoClipSuggestion as _VCS
+            from .models import VideoClipSuggestion as _VCS, CommentaryClipSuggestion as _CCS
 
             clip_dir = ensure_dir(out_dir / "clips")
 
-            csug = suggest_commentary_clips(
-                segments=segments,
-                topic=effective_topic or audio_path.stem,
-                title=audio_path.stem,
-                audio_duration=timeline_duration,
-                max_clips=max_video_clips,
-                model=llm_model,
-            )
+            if clip_queries:
+                # ── Manual clip queries: user specifies exactly what to search ──
+                # Still use LLM to find insertion timestamps, but override queries.
+                csug = suggest_commentary_clips(
+                    segments=segments,
+                    topic=effective_topic or audio_path.stem,
+                    title=audio_path.stem,
+                    audio_duration=timeline_duration,
+                    max_clips=max(max_video_clips, len(clip_queries)),
+                    model=llm_model,
+                )
+
+                # If LLM found fewer insertion points than the user has queries,
+                # create evenly-spaced insertion points for the remaining ones.
+                if len(csug) < len(clip_queries):
+                    used_times = {s.timeline_start for s in csug}
+                    spacing = timeline_duration / (len(clip_queries) + 1)
+                    for extra_i in range(len(clip_queries) - len(csug)):
+                        t = spacing * (len(csug) + extra_i + 1)
+                        # Don't overlap with existing suggestions.
+                        while any(abs(t - ut) < 15.0 for ut in used_times) and t + 15 < timeline_duration:
+                            t += 15.0
+                        csug.append(_CCS(
+                            timeline_start=round(t, 1),
+                            timeline_end=round(t + 15.0, 1),
+                            search_query="",  # will be replaced
+                            reason="user-specified clip",
+                            clip_type="reference",
+                            num_clips=1,
+                            extra_queries=None,
+                            mute=False,
+                        ))
+                    csug.sort(key=lambda s: s.timeline_start)
+
+                # Override search queries with user's manual queries.
+                # CommentaryClipSuggestion is frozen, so we create new instances.
+                overridden: list[_CCS] = []
+                for qi, q in enumerate(clip_queries):
+                    if qi < len(csug):
+                        base = csug[qi]
+                        dur = base.timeline_end - base.timeline_start
+                        end = base.timeline_end if dur >= 8.0 else base.timeline_start + 15.0
+                        overridden.append(_CCS(
+                            timeline_start=base.timeline_start,
+                            timeline_end=end,
+                            search_query=q,
+                            reason=f"user-specified: {q}",
+                            clip_type="reference",
+                            num_clips=1,
+                            extra_queries=None,
+                            mute=False,
+                        ))
+                csug = overridden
+
+            else:
+                # ── Fully LLM-driven clip detection ──
+                csug = suggest_commentary_clips(
+                    segments=segments,
+                    topic=effective_topic or audio_path.stem,
+                    title=audio_path.stem,
+                    audio_duration=timeline_duration,
+                    max_clips=max_video_clips,
+                    model=llm_model,
+                )
+
             write_json(out_dir / "commentary_clip_suggestions.json", [
                 {"timeline_start": s.timeline_start, "timeline_end": s.timeline_end,
                  "search_query": s.search_query, "reason": s.reason,

@@ -169,6 +169,16 @@ def main() -> None:
         help="Maximum number of video clips the AI can insert (default: 6).",
     )
     p.add_argument(
+        "--clip-queries",
+        nargs="+",
+        default=None,
+        help=(
+            "Manual clip search queries for commentary videos. "
+            "Each query becomes a clip that gets searched on YouTube. "
+            "Example: --clip-queries 'Megyn Kelly reaction Bad Bunny' 'Ben Shapiro reaction Bad Bunny'"
+        ),
+    )
+    p.add_argument(
         "--verify-video",
         action="store_true",
         help="After render, verify audio presence and whether frames change",
@@ -370,6 +380,7 @@ def main() -> None:
         reuse_images=(not args.no_reuse_images),
         mix_video_clips=bool(args.mix_video_clips),
         max_video_clips=int(args.max_video_clips),
+        clip_queries=args.clip_queries,
     )
 
     # Load slides back from timeline.json for rendering
