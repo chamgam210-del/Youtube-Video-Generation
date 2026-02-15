@@ -233,15 +233,24 @@ def _pick_best_clip_with_llm(
     if mode == "commentary":
         system = (
             "You are selecting the best video clip for a YouTube **commentary** video.\n"
-            "The goal is to show the audience the MOST POPULAR / VIRAL clip on this topic.\n\n"
-            "Selection criteria (in priority order):\n"
-            "1. **Highest view count** — the clip that most people have already watched.\n"
-            "2. **Major news outlets / well-known channels** (CNN, Fox News, MSNBC, BBC, "
-            "NBC, ABC, CBS, Reuters, AP, etc.) over unknown or small channels.\n"
-            "3. **Relevance** — the clip must match the search query topic.\n"
-            "4. **Appropriate length** — prefer clips between 30 seconds and 5 minutes "
-            "(not too short, not full-length shows).\n\n"
-            "Avoid: music videos, full movies, unrelated content, very short trailers.\n"
+            "The goal is to find the clip where the SPECIFIC PERSON named in the search query "
+            "is actually speaking, reacting, or being featured.\n\n"
+            "Selection criteria (in STRICT priority order):\n"
+            "1. **The specific person MUST be in the title** — if the search query says "
+            "'Megyn Kelly', the clip title MUST mention Megyn Kelly. Do NOT pick a clip "
+            "about a different person.\n"
+            "2. **Reaction/response clips** — prefer clips where the person is REACTING, "
+            "RESPONDING, or RANTING about the topic (words like 'reacts', 'responds', "
+            "'slams', 'blasts', 'rant', 'goes off').\n"
+            "3. **Post-event over pre-event** — prefer clips recorded AFTER the event "
+            "happened (reactions) over clips from BEFORE (previews, plans, announcements).\n"
+            "4. **Major news outlets** (Fox News, CNN, MSNBC, BBC, NBC, Daily Wire, etc.)\n"
+            "5. **View count** — higher views preferred, but relevance beats popularity.\n"
+            "6. **Appropriate length** — 30 seconds to 10 minutes.\n\n"
+            "CRITICAL: If the search query names a specific person (e.g., 'Megyn Kelly', "
+            "'Ben Shapiro', 'Trump') you MUST pick a clip that features THAT person. "
+            "Never pick a clip about a different person just because it has more views.\n\n"
+            "Avoid: music videos, full movies, unrelated content, performance clips.\n"
             "Return ONLY valid JSON: {\"index\": <int>}"
         )
     else:
@@ -576,13 +585,31 @@ def prepare_clip_for_suggestion(
     if target_duration <= 0:
         return None
 
-    # 1) Search.
+    # 1) Search — try multiple query variations for commentary mode to find the right clip.
+    max_dur = max(120.0, target_duration * 10)
     results = search_video_clips(
         suggestion.search_query,
         max_results=8,
-        preferred_max_duration=max(120.0, target_duration * 10),
+        preferred_max_duration=max_dur,
         sort_by_views=sort_by_views,
     )
+    if mode == "commentary":
+        # Also search with reaction-focused variations to find actual reaction clips.
+        base_q = suggestion.search_query
+        seen_result_urls = {r.url for r in results}
+        for suffix in [" reacts", " reaction", " responds", " rant"]:
+            if suffix.strip() in base_q.lower():
+                continue  # already contains this word
+            extra = search_video_clips(
+                base_q + suffix,
+                max_results=5,
+                preferred_max_duration=max_dur,
+                sort_by_views=sort_by_views,
+            )
+            for r in extra:
+                if r.url not in seen_result_urls:
+                    results.append(r)
+                    seen_result_urls.add(r.url)
     if not results:
         return None
 
