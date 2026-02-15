@@ -1903,6 +1903,8 @@ def run(
                             width=video_width,
                             height=video_height,
                             llm_model=llm_model,
+                            sort_by_views=True,
+                            mode="commentary",
                         )
                     else:
                         # Reference clip: use existing single-clip flow.
@@ -1920,6 +1922,8 @@ def run(
                             width=video_width,
                             height=video_height,
                             llm_model=llm_model,
+                            sort_by_views=True,
+                            mode="commentary",
                         )
                     if pc is not None:
                         prepared_clips.append(pc)

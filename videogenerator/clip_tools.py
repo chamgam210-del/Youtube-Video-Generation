@@ -30,6 +30,7 @@ class VideoSearchResult:
     source: str  # "youtube", "vimeo", etc.
     duration_seconds: float | None = None
     thumbnail: str | None = None
+    view_count: int | None = None  # approximate views for popularity ranking
 
 
 def _parse_duration(text: str | None) -> float | None:
@@ -50,13 +51,36 @@ def _parse_duration(text: str | None) -> float | None:
     return None
 
 
+def _parse_view_count(raw: Any) -> int | None:
+    """Parse view count from SerpAPI result (e.g. '1,234,567 views', '1.2M views')."""
+    if raw is None:
+        return None
+    text = str(raw).lower().replace(",", "").strip()
+    m = re.match(r"([\d.]+)\s*(k|m|b)?", text)
+    if not m:
+        return None
+    num = float(m.group(1))
+    suffix = m.group(2) or ""
+    if suffix == "k":
+        num *= 1_000
+    elif suffix == "m":
+        num *= 1_000_000
+    elif suffix == "b":
+        num *= 1_000_000_000
+    return int(num)
+
+
 def search_video_clips(
     query: str,
     *,
     max_results: int = 5,
     preferred_max_duration: float = 300.0,
+    sort_by_views: bool = False,
 ) -> list[VideoSearchResult]:
     """Search for video clips using SerpAPI YouTube search.
+
+    When *sort_by_views* is True the results are requested sorted by view-count
+    so the most popular / viral clips appear first.
 
     Falls back to Google Video search if YouTube-specific search isn't available.
     """
@@ -76,6 +100,9 @@ def search_video_clips(
             "search_query": query,
             "api_key": api_key,
         }
+        # sp=CAMSAhAB → sort by view count (most popular first)
+        if sort_by_views:
+            params["sp"] = "CAMSAhAB"
         resp = requests.get("https://serpapi.com/search.json", params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
@@ -91,6 +118,9 @@ def search_video_clips(
             elif isinstance(thumbnails, str):
                 thumb = thumbnails
 
+            # Parse view count for popularity ranking.
+            views = _parse_view_count(item.get("views"))
+
             if not url or "youtube.com" not in url:
                 continue
             if dur and dur > preferred_max_duration:
@@ -103,6 +133,7 @@ def search_video_clips(
                     source="youtube",
                     duration_seconds=dur,
                     thumbnail=thumb,
+                    view_count=views,
                 )
             )
             if len(results) >= max_results:
@@ -163,8 +194,15 @@ def _pick_best_clip_with_llm(
     search_query: str,
     reason: str,
     model: str = "gpt-4o-mini",
+    mode: str = "review",
 ) -> int:
-    """Use the LLM to pick the best clip from search results. Returns index."""
+    """Use the LLM to pick the best clip from search results. Returns index.
+
+    *mode* controls the selection criteria:
+    - ``"review"`` – prefer official trailers, movie scene clips, behind-the-scenes.
+    - ``"commentary"`` – prefer the **most popular / viral** clip (highest views,
+      from major news outlets or well-known channels).
+    """
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key or not candidates:
@@ -174,21 +212,39 @@ def _pick_best_clip_with_llm(
 
     compact = []
     for i, c in enumerate(candidates[:10]):
-        compact.append({
+        entry: dict[str, Any] = {
             "i": i,
             "title": c.title[:120],
             "url": c.url,
             "source": c.source,
             "duration": c.duration_seconds,
-        })
+        }
+        if c.view_count is not None:
+            entry["views"] = c.view_count
+        compact.append(entry)
 
-    system = (
-        "You are selecting the best video clip for a movie review B-roll insertion.\n"
-        "Pick the clip that best matches the search query and reason.\n"
-        "Prefer: official trailers, movie scene clips, behind-the-scenes footage.\n"
-        "Avoid: fan edits, reaction videos, unrelated content, full movies.\n"
-        "Return ONLY valid JSON: {\"index\": <int>}"
-    )
+    if mode == "commentary":
+        system = (
+            "You are selecting the best video clip for a YouTube **commentary** video.\n"
+            "The goal is to show the audience the MOST POPULAR / VIRAL clip on this topic.\n\n"
+            "Selection criteria (in priority order):\n"
+            "1. **Highest view count** — the clip that most people have already watched.\n"
+            "2. **Major news outlets / well-known channels** (CNN, Fox News, MSNBC, BBC, "
+            "NBC, ABC, CBS, Reuters, AP, etc.) over unknown or small channels.\n"
+            "3. **Relevance** — the clip must match the search query topic.\n"
+            "4. **Appropriate length** — prefer clips between 30 seconds and 5 minutes "
+            "(not too short, not full-length shows).\n\n"
+            "Avoid: music videos, full movies, unrelated content, very short trailers.\n"
+            "Return ONLY valid JSON: {\"index\": <int>}"
+        )
+    else:
+        system = (
+            "You are selecting the best video clip for a movie review B-roll insertion.\n"
+            "Pick the clip that best matches the search query and reason.\n"
+            "Prefer: official trailers, movie scene clips, behind-the-scenes footage.\n"
+            "Avoid: fan edits, reaction videos, unrelated content, full movies.\n"
+            "Return ONLY valid JSON: {\"index\": <int>}"
+        )
     user = {
         "search_query": search_query,
         "reason": reason,
@@ -444,8 +500,14 @@ def prepare_clip_for_suggestion(
     width: int = 1920,
     height: int = 1080,
     llm_model: str = "gpt-4o-mini",
+    sort_by_views: bool = False,
+    mode: str = "review",
 ) -> PreparedClip | None:
     """End-to-end: search → pick best → download → trim → return prepared clip.
+
+    When *sort_by_views* is True, YouTube results are sorted by view count
+    so the most popular / viral clip is preferred.
+    *mode* is passed to the LLM clip picker (``"review"`` or ``"commentary"``).
 
     Returns None if any step fails (non-fatal).
     """
@@ -462,8 +524,9 @@ def prepare_clip_for_suggestion(
     # 1) Search.
     results = search_video_clips(
         suggestion.search_query,
-        max_results=5,
+        max_results=8,
         preferred_max_duration=max(120.0, target_duration * 10),
+        sort_by_views=sort_by_views,
     )
     if not results:
         return None
@@ -474,6 +537,7 @@ def prepare_clip_for_suggestion(
         search_query=suggestion.search_query,
         reason=suggestion.reason,
         model=llm_model,
+        mode=mode,
     )
     chosen = results[best_idx]
 
@@ -590,6 +654,8 @@ def prepare_compilation_clip(
     width: int = 1920,
     height: int = 1080,
     llm_model: str = "gpt-4o-mini",
+    sort_by_views: bool = False,
+    mode: str = "commentary",
 ) -> PreparedClip | None:
     """Search, download, trim, and concatenate multiple clips into a montage.
 
@@ -629,8 +695,9 @@ def prepare_compilation_clip(
         try:
             results = search_video_clips(
                 query,
-                max_results=5,
+                max_results=8,
                 preferred_max_duration=300.0,
+                sort_by_views=sort_by_views,
             )
             if not results:
                 continue
@@ -641,6 +708,7 @@ def prepare_compilation_clip(
                 search_query=query,
                 reason=suggestion.reason,
                 model=llm_model,
+                mode=mode,
             )
 
             # Find first non-duplicate.

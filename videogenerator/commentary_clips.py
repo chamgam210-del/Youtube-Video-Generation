@@ -65,7 +65,7 @@ def suggest_commentary_clips(
     title: str | None = None,
     audio_duration: float = 0.0,
     max_clips: int = 8,
-    min_clip_seconds: float = 4.0,
+    min_clip_seconds: float = 8.0,
     max_clip_seconds: float = 25.0,
     model: str = "gpt-4o-mini",
 ) -> list[CommentaryClipSuggestion]:
@@ -101,29 +101,37 @@ def suggest_commentary_clips(
         "the interview moment, the news segment, etc.).\n"
         "   - Use the surrounding transcript context to determine WHAT clip the host is "
         "referring to, then craft a specific search query.\n"
-        "   - Usually 1 clip, 4–15 seconds.\n\n"
+        "   - Duration: **10–20 seconds** — long enough for viewers to watch the referenced moment.\n\n"
         '2. **compilation** – The host describes a broad reaction or event:\n'
         '   - Trigger phrases: "everyone is losing their minds", "people are going crazy", '
         '"here\'s what people are saying", "reactions have been insane", '
         '"they went off", "they all lost their mind", '
         '"republicans/democrats are freaking out", "they just went off like one after the other", etc.\n'
-        "   - You should grab MULTIPLE popular clips on that topic and compile them into a montage.\n"
-        "   - Usually 3–5 clips, total 10–25 seconds.\n"
-        "   - Provide the main search_query AND extra_queries (one per clip variant).\n\n"
+        "   - You should grab MULTIPLE **MOST POPULAR** clips on that topic and compile them.\n"
+        "   - Duration: **15–25 seconds total** — enough to show a montage of reactions.\n"
+        "   - Usually 3–5 clips. Provide the main search_query AND extra_queries.\n"
+        "   - extra_queries should target the MOST VIRAL / MOST VIEWED clips from different\n"
+        "     sources (major news outlets like CNN, Fox News, MSNBC, BBC; popular YouTubers;\n"
+        "     trending reaction clips).\n\n"
         "CRITICAL RULES:\n"
         "- **SCAN EVERY LINE** of the transcript for trigger phrases. Do NOT miss any.\n"
         "- The clip insertion 'start' should be the EXACT timestamp where the host says "
         "the trigger phrase. The clip plays IMMEDIATELY after the cue.\n"
         f"- Suggest AT MOST {max_clips} insertions total.\n"
         f"- Each insertion should be {min_clip_seconds:.0f}–{max_clip_seconds:.0f} seconds.\n"
+        "- Reference clips: aim for 10–20 seconds. Compilation montages: aim for 15–25 seconds.\n"
         "- Clips must NOT overlap.\n"
-        "- For **reference** clips: search_query should be very specific "
-        "(person name + what they said/did + context). Use the surrounding transcript "
-        "to figure out what the host is talking about.\n"
-        "- For **compilation** clips: search_query is the broad topic; "
-        "extra_queries are specific source variations (different news outlets, reaction videos, etc.).\n"
-        "- Set mute=false for news clips where keeping audio adds value (interviews, "
-        "press conferences, news segments). Set mute=true for music/entertainment clips.\n"
+        "- For **reference** clips: search_query should target the TOP / MOST POPULAR clip\n"
+        "  on that topic. Include the person's name, what they said/did, and context.\n"
+        "  Example: 'Republican senator reacts to Bad Bunny halftime show CNN' — add a\n"
+        "  news outlet or 'viral' to find the most-watched clip.\n"
+        "- For **compilation** clips: search_query is the broad topic with 'popular' or 'viral';\n"
+        "  extra_queries should each target a SPECIFIC major source:\n"
+        "  e.g. 'Fox News Bad Bunny reaction', 'CNN Bad Bunny halftime controversy',\n"
+        "  'MSNBC conservative reaction Bad Bunny', etc.\n"
+        "- Set mute=false for ALL clips — the audience should hear the original audio of\n"
+        "  news clips, reaction clips, interviews, etc. Only set mute=true for pure\n"
+        "  music/performance clips where the host's voiceover should continue.\n"
         "- Space insertions out; don't cluster.\n"
         "- If the narrator never cues a clip or describes reactions, return an empty list [].\n\n"
         "Return ONLY valid JSON (no markdown). Schema:\n"
