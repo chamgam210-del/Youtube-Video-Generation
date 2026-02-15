@@ -334,18 +334,26 @@ with col_left:
         )
 
     clip_queries_text = st.text_area(
-        "Manual clip queries (one per line)",
+        "Manual clip queries (one per line, or comma-separated)",
         value="",
         height=100,
         help=(
-            "Specify exact YouTube search queries for clips to insert. One per line. "
+            "Specify exact YouTube search queries for clips to insert. "
+            "One per line OR comma-separated. "
             "For commentary videos these REPLACE the AI-generated queries. "
             "Example:\nMegyn Kelly reaction Bad Bunny halftime\nBen Shapiro reaction Bad Bunny\nDonald Trump Bad Bunny halftime show"
         ),
     )
     clip_queries: list[str] | None = None
     if clip_queries_text.strip():
-        clip_queries = [q.strip() for q in clip_queries_text.strip().splitlines() if q.strip()]
+        # Split on newlines first, then on commas within each line.
+        raw_parts: list[str] = []
+        for line in clip_queries_text.strip().splitlines():
+            if "," in line:
+                raw_parts.extend(line.split(","))
+            else:
+                raw_parts.append(line)
+        clip_queries = [q.strip() for q in raw_parts if q.strip()]
     youtube_metadata = st.checkbox("Generate YouTube metadata + thumbnail", value=True)
     verify_video = st.checkbox("Verify MP4 (local)", value=True)
 

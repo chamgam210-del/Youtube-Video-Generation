@@ -78,6 +78,10 @@ def suggest_commentary_clips(
     if not api_key or not segments:
         return []
 
+    # Use gpt-4o for commentary analysis — transcript understanding is critical.
+    # Override only if the caller passed the default mini model.
+    commentary_model = "gpt-4o" if model == "gpt-4o-mini" else model
+
     # Build compact transcript.
     lines = [f"[{s.start:.1f}-{s.end:.1f}] {s.text}" for s in segments]
     transcript = "\n".join(lines)
@@ -87,63 +91,70 @@ def suggest_commentary_clips(
     system = (
         "You are a professional video editor planning clip insertions for a YouTube "
         "**commentary** video.\n\n"
-        "The host records a voiceover reacting to / commenting on news, drama, or events. "
-        "At certain moments the viewer should SEE the clip(s) being discussed.\n\n"
-        "There are TWO types of clip insertion:\n\n"
-        '1. **reference** – The host explicitly cues a specific clip:\n'
-        '   - Trigger phrases (MUST detect ALL of these): "let\'s take a look at the clip", '
-        '"here\'s the clip", "take a look", "watch this", "let\'s watch", '
-        '"let\'s see", "check this out", "play the clip", "this is what she said", '
-        '"this is what he said", "look at this", "roll the clip", etc.\n'
-        '   - CRITICAL: Every time the host says one of these trigger phrases, you MUST '
-        "create a reference clip insertion at that EXACT timestamp. Do NOT skip any.\n"
-        '   - You must find the EXACT clip the host is referencing (the controversial statement, '
-        "the interview moment, the news segment, etc.).\n"
-        "   - Use the surrounding transcript context to determine WHAT clip the host is "
-        "referring to, then craft a specific search query.\n"
-        "   - Duration: **10–20 seconds** — long enough for viewers to watch the referenced moment.\n\n"
-        '2. **compilation** – The host describes a broad reaction or event:\n'
-        '   - Trigger phrases: "everyone is losing their minds", "people are going crazy", '
-        '"here\'s what people are saying", "reactions have been insane", '
-        '"they went off", "they all lost their mind", '
-        '"republicans/democrats are freaking out", "they just went off like one after the other", etc.\n'
-        "   - You should grab MULTIPLE **MOST POPULAR** clips on that topic and compile them.\n"
-        "   - Duration: **15–25 seconds total** — enough to show a montage of reactions.\n"
-        "   - Usually 3–5 clips. Provide the main search_query AND extra_queries.\n"
-        "   - extra_queries should target the MOST VIRAL / MOST VIEWED clips from different\n"
-        "     sources (major news outlets like CNN, Fox News, MSNBC, BBC; popular YouTubers;\n"
-        "     trending reaction clips).\n\n"
-        "CRITICAL RULES:\n"
-        "- **SCAN EVERY LINE** of the transcript for trigger phrases. Do NOT miss any.\n"
-        "- The clip insertion 'start' should be the EXACT timestamp where the host says "
-        "the trigger phrase. The clip plays IMMEDIATELY after the cue.\n"
+        "## YOUR JOB\n"
+        "1. **Read and DEEPLY UNDERSTAND the transcript.** Figure out WHO and WHAT the "
+        "host is talking about — the people, events, controversies, reactions.\n"
+        "2. **Decide what clips the viewer needs to SEE** at each moment to make the "
+        "video engaging. Think like a TV producer cutting to news footage.\n"
+        "3. **Generate highly specific YouTube search queries** that will find the "
+        "EXACT clips viewers would want to see.\n\n"
+        "## TWO TYPES OF CLIP INSERTION\n\n"
+        '### 1. **reference** – The host cues a specific clip\n'
+        '   Trigger phrases: "let\'s take a look", "here\'s the clip", "watch this", '
+        '"let\'s watch", "check this out", "play the clip", "look at this", '
+        '"this is what he/she said", "roll the clip", etc.\n'
+        "   → Find THE specific clip being referenced.\n"
+        "   → search_query must be VERY specific: include the person's full name + "
+        "what they said/did + the show/event name.\n"
+        "   → Example: instead of 'Republican reactions halftime show', use "
+        "'Megyn Kelly rant about Bad Bunny Super Bowl halftime show'\n"
+        "   → Duration: **10–20 seconds**\n\n"
+        '### 2. **compilation** – The host describes a GROUP of reactions/events\n'
+        '   Trigger phrases: "they all lost their mind", "people are going crazy", '
+        '"everyone is losing their minds", "they went off one after the other", '
+        '"reactions have been insane", "republicans/democrats are freaking out", etc.\n'
+        "   → You must create a MONTAGE of 3–4 clips from DIFFERENT specific people.\n"
+        "   → **CRITICAL**: Think about WHO would be reacting to this topic. Use your "
+        "knowledge of current events and public figures to name SPECIFIC people.\n"
+        "   → For political reactions: think of specific commentators, politicians, "
+        "news anchors (e.g., Megyn Kelly, Ben Shapiro, Tucker Carlson, Donald Trump, "
+        "AOC, Rachel Maddow, etc.)\n"
+        "   → For entertainment: think of specific celebrities, YouTubers, critics.\n"
+        "   → Each extra_query MUST name a SPECIFIC person or outlet:\n"
+        '     BAD:  "conservative reaction halftime show"\n'
+        '     GOOD: "Megyn Kelly reaction Bad Bunny halftime show"\n'
+        '     GOOD: "Ben Shapiro Bad Bunny Super Bowl rant"\n'
+        '     GOOD: "Donald Trump Bad Bunny halftime Truth Social"\n'
+        '     GOOD: "Fox News Bad Bunny halftime show segment"\n'
+        "   → num_clips: **3–4** (each from a different person/source)\n"
+        "   → Duration: **15–25 seconds total**\n\n"
+        "## UNDERSTANDING THE TRANSCRIPT\n"
+        "Before generating insertions, analyze:\n"
+        "- What is the MAIN TOPIC? (e.g., Bad Bunny Super Bowl halftime show)\n"
+        "- What SIDE or ANGLE is the host discussing? (e.g., conservative backlash)\n"
+        "- WHO are the key figures involved? (e.g., Trump, Megyn Kelly, Ben Shapiro)\n"
+        "- What SPECIFIC moments or clips would viewers want to see?\n"
+        "- When the host says people 'lost their mind' or 'went off', WHO specifically?\n\n"
+        "## RULES\n"
+        "- **SCAN EVERY LINE** for trigger phrases. Do NOT miss any.\n"
+        "- Clip insertion starts at the EXACT timestamp of the trigger phrase.\n"
         f"- Suggest AT MOST {max_clips} insertions total.\n"
-        f"- Each insertion should be {min_clip_seconds:.0f}–{max_clip_seconds:.0f} seconds.\n"
-        "- Reference clips: aim for 10–20 seconds. Compilation montages: aim for 15–25 seconds.\n"
+        f"- Each insertion: {min_clip_seconds:.0f}–{max_clip_seconds:.0f} seconds.\n"
         "- Clips must NOT overlap.\n"
-        "- For **reference** clips: search_query should target the TOP / MOST POPULAR clip\n"
-        "  on that topic. Include the person's name, what they said/did, and context.\n"
-        "  Example: 'Republican senator reacts to Bad Bunny halftime show CNN' — add a\n"
-        "  news outlet or 'viral' to find the most-watched clip.\n"
-        "- For **compilation** clips: search_query is the broad topic with 'popular' or 'viral';\n"
-        "  extra_queries should each target a SPECIFIC major source:\n"
-        "  e.g. 'Fox News Bad Bunny reaction', 'CNN Bad Bunny halftime controversy',\n"
-        "  'MSNBC conservative reaction Bad Bunny', etc.\n"
-        "- Set mute=false for ALL clips — the audience should hear the original audio of\n"
-        "  news clips, reaction clips, interviews, etc. Only set mute=true for pure\n"
-        "  music/performance clips where the host's voiceover should continue.\n"
+        "- Set mute=false for ALL clips (audience should hear the original audio). "
+        "Only mute=true for pure music/performance clips.\n"
         "- Space insertions out; don't cluster.\n"
-        "- If the narrator never cues a clip or describes reactions, return an empty list [].\n\n"
+        "- If the narrator never cues a clip, return an empty list [].\n\n"
         "Return ONLY valid JSON (no markdown). Schema:\n"
         "[\n"
         "  {\n"
         '    "start": <float>,\n'
         '    "end": <float>,\n'
-        '    "search_query": "<string>",\n'
+        '    "search_query": "<string — SPECIFIC person/event, not generic>",\n'
         '    "reason": "<string>",\n'
         '    "clip_type": "reference" | "compilation",\n'
-        '    "num_clips": <int>,\n'
-        '    "extra_queries": ["<string>", ...] | null,\n'
+        '    "num_clips": <int — 1 for reference, 3-4 for compilation>,\n'
+        '    "extra_queries": ["<SPECIFIC person + topic>", ...] | null,\n'
         '    "mute": <bool>\n'
         "  }\n"
         "]\n"
@@ -159,7 +170,7 @@ def suggest_commentary_clips(
 
     content = _openai_chat(
         api_key=api_key,
-        model=model,
+        model=commentary_model,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(user_content, ensure_ascii=False)},

@@ -87,10 +87,12 @@ def search_video_clips(
 
     api_key = os.getenv("SERPAPI_API_KEY")
     if not api_key:
+        print(f"[clip_search] SERPAPI_API_KEY not set — skipping search for: {query}")
         return []
 
     import requests
 
+    print(f"[clip_search] Searching YouTube: {query!r}  (sort_by_views={sort_by_views})")
     results: list[VideoSearchResult] = []
 
     # Strategy 1: SerpAPI YouTube search.
@@ -184,6 +186,11 @@ def search_video_clips(
                     break
         except Exception:
             pass
+
+    print(f"[clip_search] Found {len(results)} results for {query!r}")
+    for r in results[:5]:
+        views_str = f" ({r.view_count:,} views)" if r.view_count else ""
+        print(f"  - {r.title[:80]}{views_str}  [{r.url}]")
 
     return results
 
@@ -684,6 +691,9 @@ def prepare_compilation_clip(
     # Pad to num_clips by repeating main query with variations.
     while len(queries) < num_clips:
         queries.append(suggestion.search_query)
+
+    print(f"[compilation] Building montage: {num_clips} clips, {per_clip_dur:.1f}s each, {total_duration:.1f}s total")
+    print(f"[compilation] Queries: {queries}")
 
     trimmed_parts: list[Path] = []
     source_urls: list[str] = []
