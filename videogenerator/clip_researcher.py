@@ -939,11 +939,13 @@ def research_and_prepare_clip(
     llm_model: str = "gpt-4o",
     seen_urls: set[str] | None = None,
     max_scrape_pages: int = 5,
-) -> PreparedClip | None:
-    """Full pipeline: research → download → trim → return prepared clip.
+    max_clips: int = 1,
+) -> list[PreparedClip]:
+    """Full pipeline: research → download → trim → return prepared clips.
 
     This replaces ``prepare_clip_for_suggestion`` with an agentic research approach.
-    Returns None if any step fails (non-fatal).
+    Returns a list of PreparedClip (possibly empty).  When *max_clips* > 1,
+    multiple top-ranked clips are downloaded and returned sequentially.
     """
 
     dest_dir = Path(dest_dir)
@@ -951,7 +953,7 @@ def research_and_prepare_clip(
 
     target_duration = float(suggestion.timeline_end - suggestion.timeline_start)
     if target_duration <= 0:
-        return None
+        return []
 
     # Run agentic research.
     research = research_clip(
@@ -964,16 +966,17 @@ def research_and_prepare_clip(
     )
 
     if not research.best_clip:
-        return None
+        return []
 
     # Try the best clips in order: get info → pick segment → download only that section.
     raw_dir = dest_dir / "raw"
-    raw_path = None
-    chosen = None
-    clip_start = 0.0
-    clip_dur = target_duration
+    mute = getattr(suggestion, "mute", False)
+    results: list[PreparedClip] = []
+    clips_downloaded = 0
 
-    for rank, clip in enumerate(research.discovered_clips[:5]):
+    for rank, clip in enumerate(research.discovered_clips[:5 + max_clips]):
+        if clips_downloaded >= max_clips:
+            break
         if clip.relevance_score < 0.3 and rank > 0:
             break  # don't try low-relevance clips
         print(f"[researcher] Trying clip #{rank+1}: {clip.title[:60] or clip.url}")
@@ -991,6 +994,8 @@ def research_and_prepare_clip(
             print(f"  Could not get video info, trying download anyway")
 
         # Step B: Use LLM to pick the best segment within the video.
+        clip_start = 0.0
+        clip_dur = target_duration
         if video_duration > 0:
             from .clip_tools import find_best_clip_segment as _find_seg
             # We don't have the file yet — use the LLM with title/duration only.
@@ -1051,52 +1056,53 @@ def research_and_prepare_clip(
 
         # Step C: Download only the relevant section.
         section_end = clip_start + clip_dur
+        sub_index = clip_index + clips_downloaded
         raw_path = download_clip_section(
             clip.url,
             raw_dir,
             start=clip_start,
             end=section_end,
-            prefix=f"clip{clip_index:02d}",
+            prefix=f"clip{sub_index:02d}",
         )
-        if raw_path is not None:
-            chosen = clip
-            if seen_urls is not None:
-                seen_urls.add(clip.url)
-            break
-        print(f"  Download failed, trying next...")
+        if raw_path is None:
+            print(f"  Download failed, trying next...")
+            continue
 
-    if raw_path is None or chosen is None:
-        return None
+        if seen_urls is not None:
+            seen_urls.add(clip.url)
 
-    # The downloaded section is already roughly the right segment.
-    # Do a final trim + scale to exact dimensions.
-    mute = getattr(suggestion, "mute", False)
-    actual_dur = get_video_duration(raw_path)
-    # The section download has ~5s padding on each side, so trim to center.
-    trim_start = 5.0 if actual_dur > clip_dur + 3.0 else 0.0
-    trim_dur = min(clip_dur, actual_dur - trim_start) if actual_dur > 0 else clip_dur
+        # The downloaded section is already roughly the right segment.
+        # Do a final trim + scale to exact dimensions.
+        actual_dur = get_video_duration(raw_path)
+        # The section download has ~5s padding on each side, so trim to center.
+        trim_start = 5.0 if actual_dur > clip_dur + 3.0 else 0.0
+        trim_dur = min(clip_dur, actual_dur - trim_start) if actual_dur > 0 else clip_dur
 
-    trimmed_path = dest_dir / f"prepared_{clip_index:02d}.mp4"
-    try:
-        trim_clip(
-            raw_path,
-            trimmed_path,
-            start=trim_start,
-            duration=trim_dur,
-            width=width,
-            height=height,
-            mute=mute,
-        )
-    except Exception as e:
-        print(f"[researcher] Trim failed: {e}")
-        return None
+        trimmed_path = dest_dir / f"prepared_{sub_index:02d}.mp4"
+        try:
+            trim_clip(
+                raw_path,
+                trimmed_path,
+                start=trim_start,
+                duration=trim_dur,
+                width=width,
+                height=height,
+                mute=mute,
+            )
+        except Exception as e:
+            print(f"[researcher] Trim failed: {e}")
+            continue
 
-    return PreparedClip(
-        path=trimmed_path,
-        timeline_start=suggestion.timeline_start,
-        timeline_end=suggestion.timeline_end,
-        source_url=chosen.url,
-        source_title=chosen.title or "",
-        search_query=suggestion.search_query,
-        muted=mute,
-    )
+        results.append(PreparedClip(
+            path=trimmed_path,
+            timeline_start=suggestion.timeline_start,
+            timeline_end=suggestion.timeline_end,
+            source_url=clip.url,
+            source_title=clip.title or "",
+            search_query=suggestion.search_query,
+            muted=mute,
+        ))
+        clips_downloaded += 1
+        print(f"  ✓ Clip {clips_downloaded}/{max_clips} prepared: {trimmed_path.name}")
+
+    return results

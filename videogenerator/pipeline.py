@@ -1974,6 +1974,7 @@ def run(
 
             prepared_clips: list[PreparedClip] = []
             _seen_clip_urls: set[str] = set()  # avoid downloading same video for different queries
+            _clip_sub_idx = 0  # running counter for unique clip file names
             for ci, sug in enumerate(csug):
                 try:
                     if _use_research:
@@ -1987,10 +1988,11 @@ def run(
                             if s.start >= ctx_start and s.end <= ctx_end
                         ]
                         transcript_ctx = "\n".join(ctx_lines)
-                        pc = _prep_research(
+                        # research_and_prepare_clip now returns a *list* of PreparedClip
+                        pcs = _prep_research(
                             sug,
                             dest_dir=clip_dir,
-                            clip_index=ci,
+                            clip_index=_clip_sub_idx,
                             width=video_width,
                             height=video_height,
                             topic=effective_topic or audio_path.stem,
@@ -1998,7 +2000,11 @@ def run(
                             llm_model="gpt-4o",
                             seen_urls=_seen_clip_urls,
                             max_scrape_pages=5,
+                            max_clips=max(1, int(getattr(sug, "num_clips", 1))),
                         )
+                        if pcs:
+                            prepared_clips.extend(pcs)
+                            _clip_sub_idx += len(pcs)
                     elif sug.clip_type == "compilation":
                         pc = _prep_comp(
                             sug,
@@ -2010,6 +2016,8 @@ def run(
                             sort_by_views=True,
                             mode="commentary",
                         )
+                        if pc is not None:
+                            prepared_clips.append(pc)
                     else:
                         # Reference clip: use existing single-clip flow.
                         ref_sug = _VCS(
@@ -2030,49 +2038,80 @@ def run(
                             mode="commentary",
                             seen_urls=_seen_clip_urls,
                         )
-                    if pc is not None:
-                        prepared_clips.append(pc)
+                        if pc is not None:
+                            prepared_clips.append(pc)
                 except Exception:
                     pass
 
-            # Assign prepared clips to matching slides (same logic as review mixing).
-            for pc in prepared_clips:
+            # ── INSERT mode: clips pause narration and extend the video ──
+            # Sort clips by their original insertion point so we can process
+            # them in order and accumulate the total timeline shift.
+            prepared_clips.sort(key=lambda p: p.timeline_start)
+
+            # Group clips that share the same insertion point (e.g., multiple
+            # reaction clips for one commentary suggestion).
+            from itertools import groupby as _groupby
+
+            clip_groups: list[tuple[float, list[PreparedClip]]] = []
+            for _tls, grp in _groupby(prepared_clips, key=lambda p: p.timeline_start):
+                clip_groups.append((float(_tls), list(grp)))
+
+            total_shift = 0.0  # accumulated timeline extension so far
+
+            for insert_at_orig, group in clip_groups:
+                # Compute each clip's actual on-disk duration.
+                clip_durations: list[float] = []
+                for pc in group:
+                    d = _clip_dur(pc.path)
+                    if d <= 0:
+                        d = pc.timeline_end - pc.timeline_start
+                    clip_durations.append(max(0.5, d))
+                group_dur = sum(clip_durations)
+
+                # The narration time at which to insert silence (original audio time).
+                audio_insert_time = insert_at_orig
+                audio_pause_insertions.append((audio_insert_time, group_dur))
+
+                # The video-timeline position (accounting for previous insertions).
+                insert_at_video = insert_at_orig + total_shift
+
+                # Find the slide that contains the insertion point and split it.
                 best_idx = -1
-                best_overlap = 0.0
                 for si, sl in enumerate(slides):
                     if sl.video_clip_path:
                         continue
-                    overlap_start = max(sl.start, pc.timeline_start)
-                    overlap_end = min(sl.end, pc.timeline_end)
-                    overlap = max(0.0, overlap_end - overlap_start)
-                    if overlap > best_overlap:
-                        best_overlap = overlap
+                    if sl.start <= insert_at_video < sl.end:
                         best_idx = si
+                        break
+                if best_idx < 0:
+                    # Fallback: insert after the last slide before the insertion point.
+                    for si, sl in enumerate(slides):
+                        if sl.start <= insert_at_video:
+                            best_idx = si
+                    if best_idx < 0:
+                        best_idx = 0
 
-                if best_idx >= 0 and best_overlap > 0.5:
-                    sl = slides[best_idx]
-                    actual_clip_dur = _clip_dur(pc.path)
-                    if actual_clip_dur <= 0:
-                        actual_clip_dur = pc.timeline_end - pc.timeline_start
-                    clip_dur = min(actual_clip_dur, sl.end - sl.start)
-                    clip_start_in_tl = max(sl.start, pc.timeline_start)
-                    clip_end_in_tl = min(sl.end, clip_start_in_tl + clip_dur)
-                    clip_dur = clip_end_in_tl - clip_start_in_tl
+                sl = slides[best_idx]
+                new_slides: list[Slide] = []
 
-                    new_slides: list[Slide] = []
-                    if clip_start_in_tl - sl.start > 0.5:
-                        new_slides.append(Slide(
-                            start=sl.start, end=clip_start_in_tl,
-                            image_path=sl.image_path, query=sl.query,
-                            headline=sl.headline, subhead=sl.subhead,
-                            source_page=sl.source_page, image_url=sl.image_url,
-                            license_name=sl.license_name, license_url=sl.license_url,
-                            attribution=sl.attribution, motion=sl.motion,
-                            window_text=sl.window_text, window_keywords=sl.window_keywords,
-                            queries_tried=sl.queries_tried,
-                        ))
+                # Part A: image before the clip insertion point.
+                if insert_at_video - sl.start > 0.2:
                     new_slides.append(Slide(
-                        start=clip_start_in_tl, end=clip_end_in_tl,
+                        start=sl.start, end=insert_at_video,
+                        image_path=sl.image_path, query=sl.query,
+                        headline=sl.headline, subhead=sl.subhead,
+                        source_page=sl.source_page, image_url=sl.image_url,
+                        license_name=sl.license_name, license_url=sl.license_url,
+                        attribution=sl.attribution, motion=sl.motion,
+                        window_text=sl.window_text, window_keywords=sl.window_keywords,
+                        queries_tried=sl.queries_tried,
+                    ))
+
+                # Part B: each clip slide plays sequentially.
+                cursor = insert_at_video
+                for pc, cd in zip(group, clip_durations):
+                    new_slides.append(Slide(
+                        start=cursor, end=cursor + cd,
                         image_path=sl.image_path, query=sl.query,
                         headline=sl.headline, subhead=sl.subhead,
                         source_page=sl.source_page, image_url=sl.image_url,
@@ -2082,21 +2121,52 @@ def run(
                         queries_tried=sl.queries_tried,
                         video_clip_path=str(pc.path),
                         video_clip_start=0.0,
-                        video_clip_end=clip_dur,
+                        video_clip_end=cd,
                         video_clip_mute=pc.muted,
                     ))
-                    if sl.end - clip_end_in_tl > 0.5:
-                        new_slides.append(Slide(
-                            start=clip_end_in_tl, end=sl.end,
-                            image_path=sl.image_path, query=sl.query,
-                            headline=sl.headline, subhead=sl.subhead,
-                            source_page=sl.source_page, image_url=sl.image_url,
-                            license_name=sl.license_name, license_url=sl.license_url,
-                            attribution=sl.attribution, motion=sl.motion,
-                            window_text=sl.window_text, window_keywords=sl.window_keywords,
-                            queries_tried=sl.queries_tried,
-                        ))
-                    slides[best_idx:best_idx + 1] = new_slides
+                    cursor += cd
+
+                # Part C: remainder of the split slide, shifted forward.
+                remainder = sl.end - insert_at_video
+                if remainder > 0.2:
+                    new_slides.append(Slide(
+                        start=cursor, end=cursor + remainder,
+                        image_path=sl.image_path, query=sl.query,
+                        headline=sl.headline, subhead=sl.subhead,
+                        source_page=sl.source_page, image_url=sl.image_url,
+                        license_name=sl.license_name, license_url=sl.license_url,
+                        attribution=sl.attribution, motion=sl.motion,
+                        window_text=sl.window_text, window_keywords=sl.window_keywords,
+                        queries_tried=sl.queries_tried,
+                    ))
+
+                slides[best_idx:best_idx + 1] = new_slides
+
+                # Shift ALL subsequent slides (those after the insertion splice)
+                # forward by the clip group duration.
+                splice_end_idx = best_idx + len(new_slides)
+                for si in range(splice_end_idx, len(slides)):
+                    s = slides[si]
+                    slides[si] = Slide(
+                        start=s.start + group_dur, end=s.end + group_dur,
+                        image_path=s.image_path, query=s.query,
+                        headline=s.headline, subhead=s.subhead,
+                        source_page=s.source_page, image_url=s.image_url,
+                        license_name=s.license_name, license_url=s.license_url,
+                        attribution=s.attribution, motion=s.motion,
+                        window_text=s.window_text, window_keywords=s.window_keywords,
+                        queries_tried=s.queries_tried,
+                        video_clip_path=s.video_clip_path,
+                        video_clip_start=s.video_clip_start,
+                        video_clip_end=s.video_clip_end,
+                        video_clip_mute=s.video_clip_mute,
+                    )
+
+                total_shift += group_dur
+                timeline_duration += group_dur
+
+            if total_shift > 0:
+                print(f"[pipeline] INSERT mode: video extended by {total_shift:.1f}s for clip pauses")
 
             write_json(out_dir / "prepared_clips.json", [
                 {"path": str(pc.path), "timeline_start": pc.timeline_start,
@@ -2109,12 +2179,13 @@ def run(
             import traceback
             traceback.print_exc()
 
-    # If we inserted pivot pauses, generate a padded audio file for rendering.
-    if vt == "shorts_review" and audio_pause_insertions:
+    # If we inserted clip pauses or pivot pauses, generate a padded audio file for rendering.
+    if audio_pause_insertions:
         try:
             padded = _ensure_audio_with_pauses(audio_in=audio_path, insertions=audio_pause_insertions)
             if padded is not None and padded.exists() and padded.stat().st_size > 4096:
                 render_audio_override = padded
+                print(f"[pipeline] Padded audio with {len(audio_pause_insertions)} pause(s) → {padded.name}")
         except Exception:
             render_audio_override = None
 
