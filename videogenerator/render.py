@@ -1176,15 +1176,89 @@ def render_slideshow(
 
         v_filters.append("".join(v_labels) + f"concat=n={len(v_labels)}:v=1:a=0[vout]")
 
+        # ── Compute clip timeline ranges (for ducking narrator during clips) ──
+        clip_ranges: list[tuple[float, float, int, bool]] = []  # (tl_start, tl_dur, input_idx, muted)
+        cumulative_t = 0.0
+        for i, dur in enumerate(durations):
+            dur_f = float(dur)
+            if slide_is_clip[i]:
+                clip_ranges.append((cumulative_t, dur_f, i, slides[i].video_clip_mute))
+            cumulative_t += dur_f
+
         # Audio filter chain.
         voice_label = f"{voice_index}:a"
         bgm_label = f"{bgm_index}:a" if bgm_index is not None else None
+        pre_a_filters: list[str] = []  # extra audio filters added before _audio_filters
+        clip_audio_labels: list[str] = []
+
+        if clip_ranges:
+            # 1) Mute narrator voice during clip playback ranges.
+            #    volume=0 is enabled only while any clip is playing; otherwise full volume.
+            between_parts = "+".join(
+                f"between(t,{ts:.3f},{ts + td:.3f})" for ts, td, _, _ in clip_ranges
+            )
+            pre_a_filters.append(
+                f"[{voice_label}]volume=0:enable='{between_parts}'[vduck]"
+            )
+            voice_label = "vduck"
+
+            # 2) For non-muted clips, extract their audio and position on the timeline.
+            for ci, (tl_start, tl_dur, inp_idx, muted) in enumerate(clip_ranges):
+                if muted:
+                    continue  # clip was trimmed with -an, no audio stream
+                cs = float(slides[inp_idx].video_clip_start or 0.0)
+                ce = float(slides[inp_idx].video_clip_end or tl_dur)
+                cd = min(tl_dur, ce)
+                delay_ms = int(round(tl_start * 1000.0))
+                lbl = f"ca{ci}"
+                pre_a_filters.append(
+                    f"[{inp_idx}:a]"
+                    f"atrim=start={cs:.3f}:duration={cd:.3f},asetpts=PTS-STARTPTS,"
+                    f"aformat=sample_fmts=fltp:sample_rates=44100,"
+                    f"adelay={delay_ms}|{delay_ms},"
+                    f"apad=whole_dur={total_duration:.3f},"
+                    f"atrim=duration={total_duration:.3f}"
+                    f"[{lbl}]"
+                )
+                clip_audio_labels.append(f"[{lbl}]")
+
         a_frag, a_map = _audio_filters(use_duck=use_duck, voice_label=voice_label, bgm_label=bgm_label)
 
-        filter_parts: list[str] = []
-        filter_parts.extend(v_filters)
+        # Assemble all filter fragments.
+        filter_parts: list[str] = list(v_filters)
+        if pre_a_filters:
+            filter_parts.extend(pre_a_filters)
         if a_frag:
             filter_parts.append(a_frag)
+
+        has_filter_audio = bool(a_frag)
+
+        # 3) Mix clip audio into the final audio output.
+        if clip_audio_labels:
+            main_lbl = a_map if has_filter_audio else voice_label
+            if not has_filter_audio:
+                # Voice hasn't been formatted yet — prepare it for amix.
+                filter_parts.append(
+                    f"[{main_lbl}]aformat=sample_fmts=fltp:sample_rates=44100,"
+                    f"apad,atrim=duration={total_duration:.3f}[vmain]"
+                )
+                main_lbl = "vmain"
+            n = 1 + len(clip_audio_labels)
+            filter_parts.append(
+                f"[{main_lbl}]{''.join(clip_audio_labels)}"
+                f"amix=inputs={n}:duration=first:dropout_transition=2:normalize=0,"
+                f"alimiter=limit=0.97[afinal]"
+            )
+            a_map = "afinal"
+            has_filter_audio = True
+        elif clip_ranges and not has_filter_audio:
+            # Voice was ducked but no clip audio to mix — still need filter output.
+            filter_parts.append(
+                f"[{voice_label}]aformat=sample_fmts=fltp:sample_rates=44100,"
+                f"apad,atrim=duration={total_duration:.3f},alimiter=limit=0.97[afinal]"
+            )
+            a_map = "afinal"
+            has_filter_audio = True
 
         cmd += [
             "-filter_complex",
@@ -1193,7 +1267,7 @@ def render_slideshow(
             "[vout]",
         ]
 
-        if a_frag:
+        if has_filter_audio:
             cmd += ["-map", f"[{a_map}]"]
         else:
             cmd += ["-map", f"{voice_index}:a:0"]

@@ -197,7 +197,7 @@ def suggest_commentary_clips(
                 extra_queries = [str(q).strip() for q in extra_queries if str(q).strip()]
             else:
                 extra_queries = None
-            mute = bool(item.get("mute", True))
+            mute = bool(item.get("mute", False))  # commentary clips default unmuted
 
             dur = end - start
             if dur < min_clip_seconds * 0.5 or dur > max_clip_seconds * 2.0:
