@@ -1917,7 +1917,10 @@ def run(
                 # Override search queries with user's manual queries.
                 # CommentaryClipSuggestion is frozen, so we create new instances.
                 # Enrich short queries with topic context so YouTube finds relevant results.
-                topic_ctx = (effective_topic or audio_path.stem or "").strip()
+                # Clean topic: take first phrase only (before comma), limit to 6 words max.
+                _raw_topic = (effective_topic or audio_path.stem or "").strip()
+                _first_phrase = _raw_topic.split(",")[0].strip()
+                topic_ctx = " ".join(_first_phrase.split()[:6])
                 overridden: list[_CCS] = []
                 for qi, q in enumerate(clip_queries):
                     if qi < len(csug):
