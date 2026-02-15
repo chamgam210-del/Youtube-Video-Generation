@@ -305,6 +305,142 @@ def _find_ytdlp() -> str | None:
     return None
 
 
+def _ensure_ffmpeg_shim() -> str:
+    """Ensure yt-dlp can find ffmpeg. Returns the ffmpeg directory."""
+    ffmpeg_path = Path(_ffmpeg_exe())
+    ffmpeg_dir = str(ffmpeg_path.parent)
+    expected_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    shim = ffmpeg_path.parent / expected_name
+    if not shim.exists():
+        try:
+            shim.symlink_to(ffmpeg_path)
+        except OSError:
+            import shutil as _shutil
+            _shutil.copy2(ffmpeg_path, shim)
+    return ffmpeg_dir
+
+
+def get_video_info(url: str) -> dict[str, Any] | None:
+    """Get video metadata (title, duration) without downloading.
+
+    Returns dict with 'title', 'duration' (seconds), or None on failure.
+    """
+    ytdlp = _find_ytdlp()
+    if not ytdlp:
+        return None
+
+    try:
+        cmd = [
+            ytdlp,
+            "--no-playlist",
+            "--print", "%(title)s\n%(duration)s",
+            "--no-download",
+            "--no-warnings",
+            url,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            return None
+        lines = proc.stdout.strip().split("\n")
+        if len(lines) >= 2:
+            title = lines[0].strip()
+            try:
+                duration = float(lines[1].strip())
+            except (ValueError, TypeError):
+                duration = 0.0
+            return {"title": title, "duration": duration}
+    except Exception:
+        pass
+    return None
+
+
+def download_clip_section(
+    url: str,
+    dest_dir: str | Path,
+    *,
+    start: float = 0.0,
+    end: float = 30.0,
+    prefix: str = "clip",
+) -> Path | None:
+    """Download only a specific section of a video using yt-dlp.
+
+    Uses ``--download-sections`` to avoid downloading the entire video.
+    Works for any video length — even multi-hour podcasts.
+    Returns the downloaded file path, or None on failure.
+    """
+    ytdlp = _find_ytdlp()
+    if not ytdlp:
+        raise RuntimeError("yt-dlp is not installed.")
+
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    ffmpeg_dir = _ensure_ffmpeg_shim()
+
+    out_template = str(dest_dir / f"{prefix}_%(id)s.%(ext)s")
+
+    # --download-sections "*START-END" tells yt-dlp to download only that range.
+    # Add 5s padding on each side for better keyframe alignment.
+    padded_start = max(0.0, start - 5.0)
+    padded_end = end + 5.0
+    section_spec = f"*{padded_start:.1f}-{padded_end:.1f}"
+
+    cmd = [
+        ytdlp,
+        "--no-playlist",
+        "--ffmpeg-location", ffmpeg_dir,
+        "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best",
+        "--merge-output-format", "mp4",
+        "-o", out_template,
+        "--socket-timeout", "30",
+        "--retries", "3",
+        "--no-overwrites",
+        "--no-post-overwrites",
+        "--download-sections", section_spec,
+        "--force-keyframes-at-cuts",
+        url,
+    ]
+
+    print(f"[download] Downloading section {padded_start:.0f}s-{padded_end:.0f}s from {url}")
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        print(f"[download] Timeout downloading section")
+        return None
+
+    if proc.returncode != 0:
+        stderr = proc.stderr or ""
+        print(f"[download] Section download failed: {stderr[:200]}")
+        # Fallback: try without --download-sections (full download) with match-filter
+        cmd_fallback = [
+            ytdlp,
+            "--no-playlist",
+            "--ffmpeg-location", ffmpeg_dir,
+            "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best",
+            "--merge-output-format", "mp4",
+            "-o", out_template,
+            "--max-filesize", "200M",
+            "--socket-timeout", "30",
+            "--retries", "2",
+            "--no-overwrites",
+            "--no-post-overwrites",
+            url,
+        ]
+        try:
+            proc2 = subprocess.run(cmd_fallback, capture_output=True, text=True, timeout=600)
+            if proc2.returncode != 0:
+                return None
+        except subprocess.TimeoutExpired:
+            return None
+
+    # Find the downloaded file.
+    for p in sorted(dest_dir.glob(f"{prefix}_*"), key=lambda x: x.stat().st_mtime, reverse=True):
+        if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm", ".m4v"}:
+            return p
+
+    return None
+
+
 def download_clip(
     url: str,
     dest_dir: str | Path,
@@ -325,20 +461,8 @@ def download_clip(
 
     out_template = str(dest_dir / f"{prefix}_%(id)s.%(ext)s")
 
-    # Point yt-dlp at the imageio-ffmpeg bundled binary so it can merge streams.
-    # imageio-ffmpeg names the binary e.g. "ffmpeg-win-x86_64-v7.1.exe" — yt-dlp
-    # expects "ffmpeg" or "ffmpeg.exe", so we create a shim copy/symlink.
-    ffmpeg_path = Path(_ffmpeg_exe())
-    ffmpeg_dir = str(ffmpeg_path.parent)
-    expected_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
-    shim = ffmpeg_path.parent / expected_name
-    if not shim.exists():
-        try:
-            shim.symlink_to(ffmpeg_path)
-        except OSError:
-            # Symlinks may require developer mode on Windows; fall back to copy.
-            import shutil as _shutil
-            _shutil.copy2(ffmpeg_path, shim)
+    # Point yt-dlp at the imageio-ffmpeg bundled binary.
+    ffmpeg_dir = _ensure_ffmpeg_shim()
 
     cmd = [
         ytdlp,

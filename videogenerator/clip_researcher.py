@@ -33,6 +33,8 @@ from .clip_tools import (
     VideoSearchResult,
     PreparedClip,
     download_clip,
+    download_clip_section,
+    get_video_info,
     find_best_clip_segment,
     get_video_duration,
     trim_clip,
@@ -787,22 +789,96 @@ def research_and_prepare_clip(
     if not research.best_clip:
         return None
 
-    # Try downloading the best clip, falling back to next best.
+    # Try the best clips in order: get info → pick segment → download only that section.
     raw_dir = dest_dir / "raw"
     raw_path = None
     chosen = None
+    clip_start = 0.0
+    clip_dur = target_duration
 
     for rank, clip in enumerate(research.discovered_clips[:5]):
         if clip.relevance_score < 0.3 and rank > 0:
             break  # don't try low-relevance clips
-        print(f"[researcher] Trying to download #{rank+1}: {clip.title[:60] or clip.url}")
-        # Allow downloading long videos (e.g., full podcast episodes) since we
-        # trim to a short segment later.  Use 7200s (2hr) as the upper limit.
-        raw_path = download_clip(
+        print(f"[researcher] Trying clip #{rank+1}: {clip.title[:60] or clip.url}")
+
+        # Step A: Get video info (duration, title) without downloading.
+        info = get_video_info(clip.url)
+        video_duration = 0.0
+        video_title = clip.title or ""
+        if info:
+            video_duration = info.get("duration", 0.0)
+            if not video_title:
+                video_title = info.get("title", "")
+            print(f"  Duration: {video_duration:.0f}s, Title: {video_title[:60]}")
+        else:
+            print(f"  Could not get video info, trying download anyway")
+
+        # Step B: Use LLM to pick the best segment within the video.
+        if video_duration > 0:
+            from .clip_tools import find_best_clip_segment as _find_seg
+            # We don't have the file yet — use the LLM with title/duration only.
+            import os as _os, json as _json
+            api_key = _os.getenv("OPENAI_API_KEY")
+            if api_key and video_duration > target_duration * 1.5:
+                try:
+                    import requests as _req
+                    system = (
+                        "You are helping select the best segment from a YouTube video to use as a clip.\n"
+                        "Given the video title, total duration, what we searched for, and how long the clip should be,\n"
+                        "pick the best START time (in seconds) so the clip shows the most relevant/interesting part.\n\n"
+                        "Guidelines:\n"
+                        "- Skip intros, outros, channel branding (usually first 5-15s and last 10s).\n"
+                        "- For news clips: jump to where the person of interest is actually speaking.\n"
+                        "- For reaction videos: jump to the peak reaction moment.\n"
+                        "- For interviews: jump to the key quote or heated exchange.\n"
+                        "- For podcast episodes / long shows: estimate where in the episode the topic\n"
+                        "  would be discussed (often 10-30% in, after intro/ads).\n"
+                        "- Make sure start + duration doesn't exceed the total video duration.\n\n"
+                        'Return ONLY valid JSON: {"start": <float>}'
+                    )
+                    user_msg = {
+                        "video_title": video_title,
+                        "video_duration_seconds": round(video_duration, 1),
+                        "search_query": suggestion.search_query,
+                        "desired_clip_duration": round(target_duration, 1),
+                    }
+                    resp = _req.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        json={"model": llm_model, "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": _json.dumps(user_msg, ensure_ascii=False)},
+                        ], "temperature": 0.2, "max_tokens": 60},
+                        timeout=20,
+                    )
+                    resp.raise_for_status()
+                    content = resp.json()["choices"][0]["message"]["content"].strip()
+                    if content.startswith("```"):
+                        content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                    parsed = _json.loads(content)
+                    clip_start = float(parsed.get("start", 0))
+                    clip_start = max(0.0, min(clip_start, video_duration - target_duration))
+                    clip_dur = min(target_duration, video_duration - clip_start)
+                    print(f"  LLM picked segment: {clip_start:.1f}s - {clip_start + clip_dur:.1f}s")
+                except Exception as e:
+                    print(f"  LLM segment selection failed: {e}")
+                    clip_start = max(0.0, video_duration * 0.15)
+                    clip_dur = min(target_duration, video_duration - clip_start)
+            else:
+                clip_start = 0.0
+                clip_dur = min(target_duration, video_duration)
+        else:
+            clip_start = 0.0
+            clip_dur = target_duration
+
+        # Step C: Download only the relevant section.
+        section_end = clip_start + clip_dur
+        raw_path = download_clip_section(
             clip.url,
             raw_dir,
+            start=clip_start,
+            end=section_end,
             prefix=f"clip{clip_index:02d}",
-            max_duration=7200.0,
         )
         if raw_path is not None:
             chosen = clip
@@ -814,24 +890,21 @@ def research_and_prepare_clip(
     if raw_path is None or chosen is None:
         return None
 
-    # Find best segment within the clip.
-    clip_start, clip_dur = find_best_clip_segment(
-        raw_path,
-        target_duration=target_duration,
-        model=llm_model,
-        search_query=suggestion.search_query,
-        video_title=chosen.title or "",
-    )
-
-    # Trim + scale.
+    # The downloaded section is already roughly the right segment.
+    # Do a final trim + scale to exact dimensions.
     mute = getattr(suggestion, "mute", False)
+    actual_dur = get_video_duration(raw_path)
+    # The section download has ~5s padding on each side, so trim to center.
+    trim_start = 5.0 if actual_dur > clip_dur + 3.0 else 0.0
+    trim_dur = min(clip_dur, actual_dur - trim_start) if actual_dur > 0 else clip_dur
+
     trimmed_path = dest_dir / f"prepared_{clip_index:02d}.mp4"
     try:
         trim_clip(
             raw_path,
             trimmed_path,
-            start=clip_start,
-            duration=clip_dur,
+            start=trim_start,
+            duration=trim_dur,
             width=width,
             height=height,
             mute=mute,
