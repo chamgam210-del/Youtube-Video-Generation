@@ -23,9 +23,11 @@ or a viral Twitter/X clip that was never uploaded to YouTube.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -476,6 +478,11 @@ def _scrape_page_for_video_links(
 
     try:
         from playwright.sync_api import sync_playwright
+
+        # On Windows the default SelectorEventLoop cannot spawn subprocesses;
+        # Playwright needs ProactorEventLoop to launch its browser driver.
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
