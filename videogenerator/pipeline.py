@@ -1993,7 +1993,7 @@ def run(
                             width=video_width,
                             height=video_height,
                             llm_model=llm_model,
-                            sort_by_views=True,
+                            sort_by_views=False,
                             mode="commentary",
                             seen_urls=_seen_clip_urls,
                         )
