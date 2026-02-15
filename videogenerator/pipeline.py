@@ -1916,16 +1916,22 @@ def run(
 
                 # Override search queries with user's manual queries.
                 # CommentaryClipSuggestion is frozen, so we create new instances.
+                # Enrich short queries with topic context so YouTube finds relevant results.
+                topic_ctx = (effective_topic or audio_path.stem or "").strip()
                 overridden: list[_CCS] = []
                 for qi, q in enumerate(clip_queries):
                     if qi < len(csug):
                         base = csug[qi]
                         dur = base.timeline_end - base.timeline_start
                         end = base.timeline_end if dur >= 8.0 else base.timeline_start + 15.0
+                        # Append topic if the query is short and doesn't already contain it.
+                        enriched_q = q
+                        if topic_ctx and len(q.split()) <= 4 and topic_ctx.lower() not in q.lower():
+                            enriched_q = f"{q} {topic_ctx}"
                         overridden.append(_CCS(
                             timeline_start=base.timeline_start,
                             timeline_end=end,
-                            search_query=q,
+                            search_query=enriched_q,
                             reason=f"user-specified: {q}",
                             clip_type="reference",
                             num_clips=1,
