@@ -85,11 +85,22 @@ def run(
         uniq.sort(key=lambda x: x[0])
 
         out_wav = assets_dir / "narration_with_pivot_pauses.wav"
+
+        # Build a fingerprint of the insertion parameters so we can detect
+        # when a cached WAV was produced with DIFFERENT insertions (e.g.
+        # a previous run that used a different cue-phrase timestamp).
+        import hashlib as _hl
+        ins_fingerprint = _hl.md5(
+            "|".join(f"{t:.3f},{d:.3f}" for t, d in uniq).encode()
+        ).hexdigest()[:12]
+        fingerprint_file = out_wav.with_suffix(".fingerprint")
+
         try:
             if out_wav.exists() and out_wav.stat().st_size > 4096:
-                # Heuristic cache: if it's newer than input, reuse.
                 if out_wav.stat().st_mtime >= audio_in.stat().st_mtime:
-                    return out_wav
+                    # Also verify that insertions haven't changed.
+                    if fingerprint_file.exists() and fingerprint_file.read_text().strip() == ins_fingerprint:
+                        return out_wav
         except Exception:
             pass
 
@@ -153,6 +164,12 @@ def run(
             subprocess.run(cmd, check=True, capture_output=True)
         except Exception:
             return None
+
+        # Write fingerprint so we can detect stale caches.
+        try:
+            fingerprint_file.write_text(ins_fingerprint)
+        except Exception:
+            pass
 
         return out_wav
 
@@ -1733,7 +1750,8 @@ def run(
         )
 
     # ── Video clip mixing: LLM suggests clips → search → download → trim → assign ──
-    if mix_video_clips and vt in {"review", "review_long"}:
+    # Skip this basic path when --clip-queries or --clip-research is used (handled below).
+    if mix_video_clips and vt in {"review", "review_long"} and not clip_queries and not clip_research:
         try:
             from .clip_suggestions import suggest_video_clips
             from .clip_tools import prepare_clip_for_suggestion
@@ -1862,8 +1880,9 @@ def run(
             import traceback
             traceback.print_exc()
 
-    # ── Commentary clip insertion: always-on for commentary type ──────────────
-    if vt == "commentary":
+    # ── Commentary clip insertion: always-on for commentary type,
+    #    also activated when --clip-queries or --clip-research is explicitly set ──
+    if vt == "commentary" or clip_queries or clip_research:
         # Commentary always uses the commentary-specific LLM to find reference clips
         # and build compilation montages.
         # If the user supplied manual `clip_queries`, those REPLACE the LLM-generated

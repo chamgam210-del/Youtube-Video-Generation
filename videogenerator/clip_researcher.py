@@ -216,61 +216,196 @@ def _fallback_search_queries(clip_query: str, topic: str = "") -> list[str]:
     return queries[:7]
 
 
-# ── Step 2: Web Search (DuckDuckGo primary, SerpAPI fallback) ────────────────
+# ── Step 2: Web Search (Playwright Google primary, SerpAPI fallback) ─────────
 
 
-def _ddg_web_search(
+def _playwright_google_search(
     query: str,
     *,
     max_results: int = 10,
 ) -> list[dict[str, Any]]:
-    """Search via DuckDuckGo (free, unlimited, no API key)."""
+    """Search Google directly via Playwright (free, unlimited, no API key).
+
+    Launches a headless Chromium, navigates to google.com/search, and parses
+    organic results from the DOM.  Much better results than DuckDuckGo.
+    """
     try:
-        from ddgs import DDGS
+        from playwright.sync_api import sync_playwright
+        import asyncio as _asyncio
 
-        d = DDGS()
-        raw = d.text(query, max_results=max_results)
+        if sys.platform == "win32":
+            _asyncio.set_event_loop_policy(_asyncio.WindowsProactorEventLoopPolicy())
 
-        results = []
-        for item in raw:
-            results.append({
-                "title": item.get("title", ""),
-                "link": item.get("href", ""),
-                "snippet": item.get("body", ""),
-                "source": "duckduckgo",
-            })
-        return results
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+            )
+            page = ctx.new_page()
+            page.add_init_script(
+                'Object.defineProperty(navigator, "webdriver", {get: () => false})'
+            )
+            url = f"https://www.google.com/search?q={query}&num={max_results}&hl=en"
+            page.goto(url, timeout=15000, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+
+            # Accept cookie consent if present (common in some locales).
+            try:
+                consent_btn = page.query_selector("button#L2AGLb")
+                if consent_btn:
+                    consent_btn.click()
+                    page.wait_for_timeout(1500)
+            except Exception:
+                pass
+
+            results: list[dict[str, Any]] = []
+            seen_links: set[str] = set()
+
+            # Parse organic results via <h3> → closest <a> ancestor.
+            # Google no longer uses plain div.g in headless; h3-based extraction
+            # is more robust.
+            for h3 in page.query_selector_all("h3"):
+                try:
+                    title = (h3.text_content() or "").strip()
+                    if not title:
+                        continue
+                    parent_a = h3.evaluate_handle('el => el.closest("a")')
+                    href = parent_a.evaluate("el => el ? el.href : null")
+                    if not href or "google.com" in href:
+                        continue
+                    if href in seen_links:
+                        continue
+                    seen_links.add(href)
+                    # Attempt to extract snippet from a nearby container.
+                    snippet = h3.evaluate(
+                        """el => {
+                            let p = el.parentElement;
+                            for (let i = 0; i < 5; i++) {
+                                if (p && p.getAttribute("data-hveid")) break;
+                                p = p ? p.parentElement : null;
+                            }
+                            if (!p) p = el.parentElement;
+                            let spans = p.querySelectorAll("span");
+                            for (let s of spans) {
+                                let t = s.textContent.trim();
+                                if (t.length > 40 && !t.includes("http")) return t;
+                            }
+                            return "";
+                        }"""
+                    )
+                    results.append({
+                        "title": title[:200],
+                        "link": href.strip(),
+                        "snippet": (snippet or "")[:300],
+                        "source": "playwright_google",
+                    })
+                    if len(results) >= max_results:
+                        break
+                except Exception:
+                    continue
+
+            browser.close()
+            return results
+
+    except ImportError:
+        print("[researcher] Playwright not installed — skipping Google search")
+        return []
     except Exception as e:
-        print(f"[researcher] DuckDuckGo web search failed for {query!r}: {e}")
+        print(f"[researcher] Playwright Google search failed for {query!r}: {e}")
         return []
 
 
-def _ddg_video_search(
+def _playwright_google_video_search(
     query: str,
     *,
     max_results: int = 8,
 ) -> list[dict[str, Any]]:
-    """Search DuckDuckGo Videos (free, unlimited, no API key)."""
+    """Search Google Videos tab via Playwright (free, unlimited)."""
     try:
-        from ddgs import DDGS
+        from playwright.sync_api import sync_playwright
+        import asyncio as _asyncio
 
-        d = DDGS()
-        raw = d.videos(query, max_results=max_results)
+        if sys.platform == "win32":
+            _asyncio.set_event_loop_policy(_asyncio.WindowsProactorEventLoopPolicy())
 
-        results = []
-        for item in raw:
-            # DDG video results have content/embed_url for the actual video link.
-            link = item.get("content", "") or item.get("embed_url", "")
-            results.append({
-                "title": item.get("title", ""),
-                "link": link,
-                "snippet": item.get("description", ""),
-                "source": item.get("publisher", "duckduckgo_video"),
-                "duration": item.get("duration", ""),
-            })
-        return results
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+            )
+            page = ctx.new_page()
+            page.add_init_script(
+                'Object.defineProperty(navigator, "webdriver", {get: () => false})'
+            )
+            # tbm=vid triggers Google Videos tab.
+            url = f"https://www.google.com/search?q={query}&tbm=vid&hl=en"
+            page.goto(url, timeout=15000, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+
+            # Accept cookie consent if present.
+            try:
+                consent_btn = page.query_selector("button#L2AGLb")
+                if consent_btn:
+                    consent_btn.click()
+                    page.wait_for_timeout(1500)
+            except Exception:
+                pass
+
+            results: list[dict[str, Any]] = []
+            seen_links: set[str] = set()
+
+            # Parse video results via <h3> → closest <a>.
+            for h3 in page.query_selector_all("h3"):
+                try:
+                    title = (h3.text_content() or "").strip()
+                    if not title:
+                        continue
+                    parent_a = h3.evaluate_handle('el => el.closest("a")')
+                    href = parent_a.evaluate("el => el ? el.href : null")
+                    if not href or href in seen_links:
+                        continue
+                    # Skip Google's own pages.
+                    if "google.com/" in href and "/search" in href:
+                        continue
+                    seen_links.add(href)
+                    results.append({
+                        "title": title[:200],
+                        "link": href.strip(),
+                        "snippet": "",
+                        "source": "playwright_google_video",
+                        "duration": "",
+                    })
+                    if len(results) >= max_results:
+                        break
+                except Exception:
+                    continue
+
+            browser.close()
+            return results
+
+    except ImportError:
+        print("[researcher] Playwright not installed — skipping Google Video search")
+        return []
     except Exception as e:
-        print(f"[researcher] DuckDuckGo video search failed for {query!r}: {e}")
+        print(f"[researcher] Playwright Google Video search failed for {query!r}: {e}")
         return []
 
 
@@ -388,11 +523,12 @@ def _web_search(
     *,
     max_results: int = 10,
 ) -> list[dict[str, Any]]:
-    """Unified web search: tries DuckDuckGo first (free), falls back to SerpAPI."""
-    results = _ddg_web_search(query, max_results=max_results)
+    """Unified web search: Playwright Google → SerpAPI fallback."""
+    # 1) Playwright scrapes Google directly (free, unlimited).
+    results = _playwright_google_search(query, max_results=max_results)
     if results:
         return results
-    # Fallback to SerpAPI if DDG returned nothing and key is available.
+    # 2) SerpAPI fallback (needs API key + has quota).
     return _google_search(query, max_results=max_results)
 
 
@@ -401,8 +537,8 @@ def _video_search(
     *,
     max_results: int = 8,
 ) -> list[dict[str, Any]]:
-    """Unified video search: tries DuckDuckGo first (free), falls back to SerpAPI."""
-    results = _ddg_video_search(query, max_results=max_results)
+    """Unified video search: Playwright Google Videos → SerpAPI fallback."""
+    results = _playwright_google_video_search(query, max_results=max_results)
     if results:
         return results
     return _google_video_search(query, max_results=max_results)
@@ -889,8 +1025,8 @@ def research_clip(
     for i, q in enumerate(queries):
         print(f"  Q{i+1}: {q}")
 
-    # ── Step 2: Execute web searches (DuckDuckGo primary, SerpAPI fallback) ──
-    print("\n[researcher] Step 2: Searching the web...")
+    # ── Step 2: Search the web (Playwright Google primary, SerpAPI fallback) ──
+    print("\n[researcher] Step 2: Searching Google...")
     all_search_results: list[dict[str, Any]] = []
 
     # Use first 3 queries for full web search, rest for video search.
@@ -898,13 +1034,13 @@ def research_clip(
         results = _web_search(q, max_results=8)
         all_search_results.extend(results)
         print(f"  Web search: {len(results)} results for {q!r}")
-        time.sleep(1)  # be polite to DDG
+        time.sleep(2)  # polite delay between searches
 
     for q in queries[:3]:
         results = _video_search(q, max_results=6)
         all_search_results.extend(results)
         print(f"  Video search: {len(results)} results for {q!r}")
-        time.sleep(1)
+        time.sleep(2)
 
     # ── Step 3: Extract video URLs from search results + scrape pages ──
     print("\n[researcher] Step 3: Extracting video URLs and scraping pages...")

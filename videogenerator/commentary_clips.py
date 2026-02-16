@@ -146,8 +146,9 @@ def suggest_commentary_clips(
         '     GOOD: "Ben Shapiro Bad Bunny Super Bowl rant"\n'
         '     GOOD: "Donald Trump Bad Bunny halftime Truth Social"\n'
         '     GOOD: "Fox News Bad Bunny halftime show segment"\n'
-        "   → num_clips: **3–4** (each from a different person/source)\n"
-        "   → Duration: **15–25 seconds total**\n\n"
+        "   → num_clips: **5–6** (each from a different person/source)\n"
+        "   → Duration: **15–25 seconds total** (per clip ~15s; the pipeline\n"
+        "     will extend the timeline automatically)\n\n"
         "## UNDERSTANDING THE TRANSCRIPT\n"
         "Before generating insertions, analyze:\n"
         "- What is the MAIN TOPIC? (e.g., Bad Bunny Super Bowl halftime show)\n"
@@ -174,7 +175,7 @@ def suggest_commentary_clips(
         '    "search_query": "<string — SPECIFIC person/event, not generic>",\n'
         '    "reason": "<string — must quote the cue phrase from the transcript>",\n'
         '    "clip_type": "reference" | "compilation",\n'
-        '    "num_clips": <int — 1 for reference, 5-6 for compilation>,\n'
+        '    "num_clips": <int — 1 for reference, 5 for compilation>,\n'
         '    "extra_queries": ["<SPECIFIC person + topic>", ...] | null,\n'
         '    "mute": <bool>\n'
         "  }\n"
@@ -237,6 +238,11 @@ def suggest_commentary_clips(
             # For compilations, enforce at least 5 clips.
             if clip_type == "compilation":
                 num_clips = max(5, min(8, num_clips))
+                # Ensure compilation duration is enough for all clips (~15s each).
+                min_comp_dur = num_clips * 15.0
+                if dur < min_comp_dur:
+                    dur = min_comp_dur
+                    end = start + dur
             else:
                 num_clips = 1
 
