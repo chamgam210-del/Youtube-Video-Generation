@@ -533,6 +533,19 @@ def get_video_duration(path: str | Path) -> float:
     return 0.0
 
 
+def _has_audio_stream(path: str | Path) -> bool:
+    """Return True if the file at *path* contains an audio stream."""
+    ffmpeg = _ffmpeg_exe()
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-i", str(path), "-hide_banner"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return any("Audio:" in ln for ln in (proc.stderr or "").splitlines())
+    except Exception:
+        return False
+
+
 def trim_clip(
     input_path: str | Path,
     output_path: str | Path,
@@ -553,6 +566,8 @@ def trim_clip(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    source_has_audio = _has_audio_stream(input_path)
+
     vf = (
         f"scale={width}:{height}:force_original_aspect_ratio=increase,"
         f"crop={width}:{height}:(in_w-out_w)/2:(in_h-out_h)/2,"
@@ -563,6 +578,13 @@ def trim_clip(
         ffmpeg, "-y",
         "-ss", f"{start:.3f}",
         "-i", str(input_path),
+    ]
+
+    if not mute and not source_has_audio:
+        # Source has no audio — generate a silent track so the output always has audio.
+        cmd += ["-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=44100"]
+
+    cmd += [
         "-t", f"{duration:.3f}",
         "-vf", vf,
         "-c:v", "libx264",
@@ -574,8 +596,11 @@ def trim_clip(
 
     if mute:
         cmd += ["-an"]
-    else:
+    elif source_has_audio:
         cmd += ["-c:a", "aac", "-b:a", "128k"]
+    else:
+        # Map video from first input, audio from anullsrc.
+        cmd += ["-map", "0:v", "-map", "1:a", "-shortest", "-c:a", "aac", "-b:a", "128k"]
 
     cmd.append(str(output_path))
 

@@ -7,10 +7,24 @@ import wave
 import os
 import re
 from pathlib import Path
+from functools import lru_cache
 
 import imageio_ffmpeg
 
 from .models import Slide
+
+
+def _video_has_audio(path: str | Path) -> bool:
+    """Return True if the video file at *path* contains an audio stream."""
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-i", str(path), "-hide_banner"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return any("Audio:" in ln for ln in (proc.stderr or "").splitlines())
+    except Exception:
+        return False
 
 
 def _is_encoder_error(stderr: str) -> bool:
@@ -1206,6 +1220,10 @@ def render_slideshow(
             for ci, (tl_start, tl_dur, inp_idx, muted) in enumerate(clip_ranges):
                 if muted:
                     continue  # clip was trimmed with -an, no audio stream
+                # Verify the clip file actually contains an audio stream.
+                clip_path = slides[inp_idx].video_clip_path
+                if clip_path and not _video_has_audio(clip_path):
+                    continue  # source had no audio (e.g. TikTok download)
                 cs = float(slides[inp_idx].video_clip_start or 0.0)
                 ce = float(slides[inp_idx].video_clip_end or tl_dur)
                 cd = min(tl_dur, ce)

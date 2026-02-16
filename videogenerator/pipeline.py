@@ -1888,67 +1888,52 @@ def run(
             clip_dir = ensure_dir(out_dir / "clips")
 
             if clip_queries:
-                # ── Manual clip queries: user specifies exactly what to search ──
-                # Still use LLM to find insertion timestamps, but override queries.
+                # ── Manual clip queries: group ALL as a single compilation ──
+                # Use LLM to find the cue-phrase insertion point, then place
+                # all user queries together as one compilation at that point.
                 csug = suggest_commentary_clips(
                     segments=segments,
                     topic=effective_topic or audio_path.stem,
                     title=audio_path.stem,
                     audio_duration=timeline_duration,
-                    max_clips=max(max_video_clips, len(clip_queries)),
+                    max_clips=1,  # we only need ONE insertion point
                     model=llm_model,
                 )
 
-                # If LLM found fewer insertion points than the user has queries,
-                # create evenly-spaced insertion points for the remaining ones.
-                if len(csug) < len(clip_queries):
-                    used_times = {s.timeline_start for s in csug}
-                    spacing = timeline_duration / (len(clip_queries) + 1)
-                    for extra_i in range(len(clip_queries) - len(csug)):
-                        t = spacing * (len(csug) + extra_i + 1)
-                        # Don't overlap with existing suggestions.
-                        while any(abs(t - ut) < 15.0 for ut in used_times) and t + 15 < timeline_duration:
-                            t += 15.0
-                        csug.append(_CCS(
-                            timeline_start=round(t, 1),
-                            timeline_end=round(t + 15.0, 1),
-                            search_query="",  # will be replaced
-                            reason="user-specified clip",
-                            clip_type="reference",
-                            num_clips=1,
-                            extra_queries=None,
-                            mute=False,
-                        ))
-                    csug.sort(key=lambda s: s.timeline_start)
+                # Determine the insertion point: use LLM cue if found,
+                # otherwise default to ~15% into the timeline.
+                if csug:
+                    base = csug[0]
+                    insert_start = base.timeline_start
+                else:
+                    insert_start = round(timeline_duration * 0.15, 1)
 
-                # Override search queries with user's manual queries.
-                # CommentaryClipSuggestion is frozen, so we create new instances.
-                # Enrich short queries with topic context so YouTube finds relevant results.
-                # Clean topic: take first phrase only (before comma), limit to 6 words max.
+                # Enrich short queries with topic context.
                 _raw_topic = (effective_topic or audio_path.stem or "").strip()
                 _first_phrase = _raw_topic.split(",")[0].strip()
                 topic_ctx = " ".join(_first_phrase.split()[:6])
-                overridden: list[_CCS] = []
-                for qi, q in enumerate(clip_queries):
-                    if qi < len(csug):
-                        base = csug[qi]
-                        dur = base.timeline_end - base.timeline_start
-                        end = base.timeline_end if dur >= 8.0 else base.timeline_start + 15.0
-                        # Append topic if the query is short and doesn't already contain it.
-                        enriched_q = q
-                        if topic_ctx and len(q.split()) <= 4 and topic_ctx.lower() not in q.lower():
-                            enriched_q = f"{q} {topic_ctx}"
-                        overridden.append(_CCS(
-                            timeline_start=base.timeline_start,
-                            timeline_end=end,
-                            search_query=enriched_q,
-                            reason=f"user-specified: {q}",
-                            clip_type="reference",
-                            num_clips=1,
-                            extra_queries=None,
-                            mute=False,
-                        ))
-                csug = overridden
+
+                enriched: list[str] = []
+                for q in clip_queries:
+                    eq = q.strip()
+                    if topic_ctx and len(eq.split()) <= 4 and topic_ctx.lower() not in eq.lower():
+                        eq = f"{eq} {topic_ctx}"
+                    enriched.append(eq)
+
+                # Build a single compilation suggestion with all queries.
+                primary_query = enriched[0]
+                extra = enriched[1:] if len(enriched) > 1 else None
+                dur = 15.0 * len(enriched)  # ~15s per clip
+                csug = [_CCS(
+                    timeline_start=insert_start,
+                    timeline_end=round(insert_start + dur, 1),
+                    search_query=primary_query,
+                    reason=f"user-specified compilation: {', '.join(clip_queries)}",
+                    clip_type="compilation",
+                    num_clips=len(enriched),
+                    extra_queries=extra,
+                    mute=False,
+                )]
 
             else:
                 # ── Fully LLM-driven clip detection ──
@@ -2127,7 +2112,13 @@ def run(
                     cursor += cd
 
                 # Part C: remainder of the split slide, shifted forward.
-                remainder = sl.end - insert_at_video
+                # When the insertion point is before this slide (no slide
+                # covers that time), preserve the full original slide duration
+                # instead of the nonsensical sl.end - insert_at_video.
+                if insert_at_video >= sl.start:
+                    remainder = sl.end - insert_at_video
+                else:
+                    remainder = sl.end - sl.start
                 if remainder > 0.2:
                     new_slides.append(Slide(
                         start=cursor, end=cursor + remainder,
@@ -2271,27 +2262,33 @@ def run(
     slides = stitched
 
     if slides[0].start > 0:
+        # Find the first non-clip slide to use its image for the gap-fill.
+        gap_src = slides[0]
+        for _gs in slides:
+            if not _gs.video_clip_path:
+                gap_src = _gs
+                break
         slides = [
             Slide(
                 start=0.0,
                 end=float(slides[0].start),
-                image_path=slides[0].image_path,
-                query=slides[0].query,
-                headline=slides[0].headline,
-                subhead=slides[0].subhead,
-                source_page=slides[0].source_page,
-                image_url=slides[0].image_url,
-                license_name=slides[0].license_name,
-                license_url=slides[0].license_url,
-                attribution=slides[0].attribution,
-                motion=slides[0].motion,
-                window_text=slides[0].window_text,
-                window_keywords=slides[0].window_keywords,
-                queries_tried=slides[0].queries_tried,
-                video_clip_path=slides[0].video_clip_path,
-                video_clip_start=slides[0].video_clip_start,
-                video_clip_end=slides[0].video_clip_end,
-                video_clip_mute=slides[0].video_clip_mute,
+                image_path=gap_src.image_path,
+                query=gap_src.query,
+                headline=gap_src.headline,
+                subhead=gap_src.subhead,
+                source_page=gap_src.source_page,
+                image_url=gap_src.image_url,
+                license_name=gap_src.license_name,
+                license_url=gap_src.license_url,
+                attribution=gap_src.attribution,
+                motion=gap_src.motion,
+                window_text=gap_src.window_text,
+                window_keywords=gap_src.window_keywords,
+                queries_tried=gap_src.queries_tried,
+                video_clip_path=None,
+                video_clip_start=None,
+                video_clip_end=None,
+                video_clip_mute=False,
             )
         ] + slides
 
