@@ -30,21 +30,32 @@ def _openai_chat(
     temperature: float = 0.4,
     max_tokens: int = 3072,
     timeout_s: int = 90,
+    max_retries: int = 5,
 ) -> str:
     import requests
+    import time as _time
 
-    resp = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        },
-        timeout=timeout_s,
-    )
-    resp.raise_for_status()
+    _payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    _headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    for _attempt in range(max_retries + 1):
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=_headers,
+            json=_payload,
+            timeout=timeout_s,
+        )
+        if resp.status_code == 429 and _attempt < max_retries:
+            _wait = min(int(resp.headers.get("Retry-After", 0)) or (30 * (_attempt + 1)), 120)
+            print(f"[LLM] 429 rate-limited, retrying in {_wait}s (attempt {_attempt + 1}/{max_retries})")
+            _time.sleep(_wait)
+            continue
+        resp.raise_for_status()
+        break
     content = resp.json()["choices"][0]["message"]["content"].strip()
     # Strip markdown fences.
     if content.startswith("```"):
@@ -163,7 +174,7 @@ def suggest_commentary_clips(
         '    "search_query": "<string — SPECIFIC person/event, not generic>",\n'
         '    "reason": "<string — must quote the cue phrase from the transcript>",\n'
         '    "clip_type": "reference" | "compilation",\n'
-        '    "num_clips": <int — 1 for reference, 3-4 for compilation>,\n'
+        '    "num_clips": <int — 1 for reference, 5-6 for compilation>,\n'
         '    "extra_queries": ["<SPECIFIC person + topic>", ...] | null,\n'
         '    "mute": <bool>\n'
         "  }\n"
@@ -201,7 +212,7 @@ def suggest_commentary_clips(
             clip_type = str(item.get("clip_type") or "reference").strip().lower()
             if clip_type not in {"reference", "compilation"}:
                 clip_type = "reference"
-            num_clips = int(item.get("num_clips") or (1 if clip_type == "reference" else 3))
+            num_clips = int(item.get("num_clips") or (1 if clip_type == "reference" else 5))
             extra_queries = item.get("extra_queries")
             if extra_queries and isinstance(extra_queries, list):
                 extra_queries = [str(q).strip() for q in extra_queries if str(q).strip()]
@@ -218,9 +229,9 @@ def suggest_commentary_clips(
             if not query:
                 continue
 
-            # For compilations, enforce at least 2 clips.
+            # For compilations, enforce at least 5 clips.
             if clip_type == "compilation":
-                num_clips = max(2, min(6, num_clips))
+                num_clips = max(5, min(8, num_clips))
             else:
                 num_clips = 1
 

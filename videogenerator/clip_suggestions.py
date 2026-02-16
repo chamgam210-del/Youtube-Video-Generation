@@ -15,17 +15,26 @@ def _openai_chat_completions(
     model: str,
     messages: list[dict[str, Any]],
     timeout_s: int = 90,
+    max_retries: int = 5,
 ) -> str:
     """Minimal OpenAI chat completions call (no SDK dependency)."""
     import requests
+    import time as _time
 
-    resp = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={"model": model, "messages": messages, "temperature": 0.4, "max_tokens": 2048},
-        timeout=int(timeout_s),
-    )
-    resp.raise_for_status()
+    for _attempt in range(max_retries + 1):
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model, "messages": messages, "temperature": 0.4, "max_tokens": 2048},
+            timeout=int(timeout_s),
+        )
+        if resp.status_code == 429 and _attempt < max_retries:
+            _wait = min(int(resp.headers.get("Retry-After", 0)) or (30 * (_attempt + 1)), 120)
+            print(f"[LLM] 429 rate-limited, retrying in {_wait}s (attempt {_attempt + 1}/{max_retries})")
+            _time.sleep(_wait)
+            continue
+        resp.raise_for_status()
+        break
     data = resp.json()
     content = data["choices"][0]["message"]["content"]
     # Strip markdown code fences if present.

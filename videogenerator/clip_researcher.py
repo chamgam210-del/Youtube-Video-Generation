@@ -93,24 +93,35 @@ def _openai_chat(
     temperature: float = 0.3,
     max_tokens: int = 2048,
     timeout_s: int = 60,
+    max_retries: int = 5,
 ) -> str:
     import requests
+    import time as _time
 
-    resp = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        },
-        timeout=timeout_s,
-    )
-    resp.raise_for_status()
+    _payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    _headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    for _attempt in range(max_retries + 1):
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=_headers,
+            json=_payload,
+            timeout=timeout_s,
+        )
+        if resp.status_code == 429 and _attempt < max_retries:
+            _wait = min(int(resp.headers.get("Retry-After", 0)) or (30 * (_attempt + 1)), 120)
+            print(f"[LLM] 429 rate-limited, retrying in {_wait}s (attempt {_attempt + 1}/{max_retries})")
+            _time.sleep(_wait)
+            continue
+        resp.raise_for_status()
+        break
     content = resp.json()["choices"][0]["message"]["content"].strip()
     # Strip markdown fences.
     if content.startswith("```"):

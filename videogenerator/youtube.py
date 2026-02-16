@@ -28,7 +28,9 @@ class YouTubePackage:
     thumbnail_crop: dict[str, float] | None = None
 
 
-def _openai_chat_completions(*, api_key: str, model: str, messages: list[dict[str, Any]], timeout_s: int = 60) -> str:
+def _openai_chat_completions(*, api_key: str, model: str, messages: list[dict[str, Any]], timeout_s: int = 60, max_retries: int = 5) -> str:
+    import time as _time
+
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -39,8 +41,15 @@ def _openai_chat_completions(*, api_key: str, model: str, messages: list[dict[st
         "messages": messages,
         "temperature": 0.4,
     }
-    resp = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
-    resp.raise_for_status()
+    for _attempt in range(max_retries + 1):
+        resp = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
+        if resp.status_code == 429 and _attempt < max_retries:
+            _wait = min(int(resp.headers.get("Retry-After", 0)) or (30 * (_attempt + 1)), 120)
+            print(f"[LLM] 429 rate-limited, retrying in {_wait}s (attempt {_attempt + 1}/{max_retries})")
+            _time.sleep(_wait)
+            continue
+        resp.raise_for_status()
+        break
     data = resp.json()
     return data["choices"][0]["message"]["content"]
 

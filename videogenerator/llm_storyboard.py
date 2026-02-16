@@ -732,7 +732,10 @@ def _openai_chat_completions(
     model: str,
     messages: list[dict[str, Any]],
     timeout_s: int = 60,
+    max_retries: int = 5,
 ) -> str:
+    import time as _time
+
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -744,6 +747,19 @@ def _openai_chat_completions(
         "temperature": 0.2,
     }
 
+    for attempt in range(max_retries):
+        resp = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", 0)) or (30 * (attempt + 1))
+            wait = min(retry_after, 120)
+            print(f"[LLM] 429 rate-limited, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
+            _time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+
+    # Final attempt — let it raise on failure
     resp = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
     resp.raise_for_status()
     data = resp.json()
