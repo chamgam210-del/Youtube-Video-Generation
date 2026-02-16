@@ -94,25 +94,33 @@ def suggest_commentary_clips(
         "## YOUR JOB\n"
         "1. **Read and DEEPLY UNDERSTAND the transcript.** Figure out WHO and WHAT the "
         "host is talking about — the people, events, controversies, reactions.\n"
-        "2. **Decide what clips the viewer needs to SEE** at each moment to make the "
-        "video engaging. Think like a TV producer cutting to news footage.\n"
+        "2. **ONLY insert clips where the host EXPLICITLY CUES one.** If the host "
+        "never cues a clip, return an EMPTY list [].\n"
         "3. **Generate highly specific YouTube search queries** that will find the "
         "EXACT clips viewers would want to see.\n\n"
+        "## CRITICAL RULE: EXPLICIT CUE PHRASES ONLY\n"
+        "You MUST ONLY insert a clip at a timestamp where the host says one of these "
+        "CUE PHRASES (or something very similar):\n"
+        '  "let\'s look at", "let\'s take a look", "let\'s watch", "here\'s the clip", '
+        '"watch this", "check this out", "play the clip", "roll the clip", '
+        '"look at this", "this is what he/she said", "let me show you", '
+        '"take a look at this", "let\'s see", "here\'s what happened"\n\n'
+        "**If the host does NOT use a cue phrase, DO NOT insert a clip there.**\n"
+        "Do NOT insert clips just because the host mentions a person or event.\n"
+        "Do NOT insert clips at random points for visual interest.\n"
+        "The host must INVITE the viewer to watch something.\n\n"
         "## TWO TYPES OF CLIP INSERTION\n\n"
-        '### 1. **reference** – The host cues a specific clip\n'
-        '   Trigger phrases: "let\'s take a look", "here\'s the clip", "watch this", '
-        '"let\'s watch", "check this out", "play the clip", "look at this", '
-        '"this is what he/she said", "roll the clip", etc.\n'
+        '### 1. **reference** – The host cues a SPECIFIC clip\n'
+        '   The host says something like "let\'s look at what he said" or '
+        '"here\'s the clip" about ONE specific person/moment.\n'
         "   → Find THE specific clip being referenced.\n"
         "   → search_query must be VERY specific: include the person's full name + "
         "what they said/did + the show/event name.\n"
-        "   → Example: instead of 'Republican reactions halftime show', use "
-        "'Megyn Kelly rant about Bad Bunny Super Bowl halftime show'\n"
-        "   → Duration: **10–20 seconds**\n\n"
-        '### 2. **compilation** – The host describes a GROUP of reactions/events\n'
-        '   Trigger phrases: "they all lost their mind", "people are going crazy", '
-        '"everyone is losing their minds", "they went off one after the other", '
-        '"reactions have been insane", "republicans/democrats are freaking out", etc.\n'
+        "   → num_clips: **1**\n"
+        "   → Duration: **8–15 seconds**\n\n"
+        '### 2. **compilation** – The host cues clips from a GROUP of people\n'
+        '   The host says something like "let\'s look at some of these republican '
+        'reactions" or "let\'s see what people are saying" about MULTIPLE people.\n'
         "   → You must create a MONTAGE of 3–4 clips from DIFFERENT specific people.\n"
         "   → **CRITICAL**: Think about WHO would be reacting to this topic. Use your "
         "knowledge of current events and public figures to name SPECIFIC people.\n"
@@ -120,7 +128,8 @@ def suggest_commentary_clips(
         "news anchors (e.g., Megyn Kelly, Ben Shapiro, Tucker Carlson, Donald Trump, "
         "AOC, Rachel Maddow, etc.)\n"
         "   → For entertainment: think of specific celebrities, YouTubers, critics.\n"
-        "   → Each extra_query MUST name a SPECIFIC person or outlet:\n"
+        "   → **search_query**: the primary search (e.g., 'Megyn Kelly reaction Bad Bunny halftime show')\n"
+        "   → **extra_queries**: one query PER additional person, each naming a SPECIFIC person:\n"
         '     BAD:  "conservative reaction halftime show"\n'
         '     GOOD: "Megyn Kelly reaction Bad Bunny halftime show"\n'
         '     GOOD: "Ben Shapiro Bad Bunny Super Bowl rant"\n'
@@ -136,8 +145,9 @@ def suggest_commentary_clips(
         "- What SPECIFIC moments or clips would viewers want to see?\n"
         "- When the host says people 'lost their mind' or 'went off', WHO specifically?\n\n"
         "## RULES\n"
-        "- **SCAN EVERY LINE** for trigger phrases. Do NOT miss any.\n"
-        "- Clip insertion starts at the EXACT timestamp of the trigger phrase.\n"
+        "- **SCAN EVERY LINE** for cue phrases. Do NOT miss any.\n"
+        "- **ONLY insert where a cue phrase exists.** No cue phrase = no clip.\n"
+        "- Clip insertion starts at the EXACT timestamp of the cue phrase.\n"
         f"- Suggest AT MOST {max_clips} insertions total.\n"
         f"- Each insertion: {min_clip_seconds:.0f}–{max_clip_seconds:.0f} seconds.\n"
         "- Clips must NOT overlap.\n"
@@ -151,7 +161,7 @@ def suggest_commentary_clips(
         '    "start": <float>,\n'
         '    "end": <float>,\n'
         '    "search_query": "<string — SPECIFIC person/event, not generic>",\n'
-        '    "reason": "<string>",\n'
+        '    "reason": "<string — must quote the cue phrase from the transcript>",\n'
         '    "clip_type": "reference" | "compilation",\n'
         '    "num_clips": <int — 1 for reference, 3-4 for compilation>,\n'
         '    "extra_queries": ["<SPECIFIC person + topic>", ...] | null,\n'

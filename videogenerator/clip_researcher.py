@@ -927,37 +927,28 @@ def research_clip(
 # ── High-level: research → download → prepare ───────────────────────────────
 
 
-def research_and_prepare_clip(
-    suggestion: Any,  # VideoClipSuggestion or CommentaryClipSuggestion
+def _research_and_download_one(
+    search_query: str,
     *,
-    dest_dir: str | Path,
-    clip_index: int = 0,
-    width: int = 1920,
-    height: int = 1080,
-    topic: str = "",
-    transcript_context: str = "",
-    llm_model: str = "gpt-4o",
-    seen_urls: set[str] | None = None,
-    max_scrape_pages: int = 5,
-    max_clips: int = 1,
-) -> list[PreparedClip]:
-    """Full pipeline: research → download → trim → return prepared clips.
+    target_duration: float,
+    dest_dir: Path,
+    raw_dir: Path,
+    clip_index: int,
+    width: int,
+    height: int,
+    topic: str,
+    transcript_context: str,
+    llm_model: str,
+    seen_urls: set[str] | None,
+    max_scrape_pages: int,
+    mute: bool,
+    timeline_start: float,
+    timeline_end: float,
+) -> PreparedClip | None:
+    """Research a single query, download the best matching clip, return PreparedClip or None."""
 
-    This replaces ``prepare_clip_for_suggestion`` with an agentic research approach.
-    Returns a list of PreparedClip (possibly empty).  When *max_clips* > 1,
-    multiple top-ranked clips are downloaded and returned sequentially.
-    """
-
-    dest_dir = Path(dest_dir)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
-    target_duration = float(suggestion.timeline_end - suggestion.timeline_start)
-    if target_duration <= 0:
-        return []
-
-    # Run agentic research.
     research = research_clip(
-        suggestion.search_query,
+        search_query,
         topic=topic,
         transcript_context=transcript_context,
         model=llm_model,
@@ -966,22 +957,13 @@ def research_and_prepare_clip(
     )
 
     if not research.best_clip:
-        return []
+        return None
 
-    # Try the best clips in order: get info → pick segment → download only that section.
-    raw_dir = dest_dir / "raw"
-    mute = getattr(suggestion, "mute", False)
-    results: list[PreparedClip] = []
-    clips_downloaded = 0
-
-    for rank, clip in enumerate(research.discovered_clips[:5 + max_clips]):
-        if clips_downloaded >= max_clips:
-            break
+    for rank, clip in enumerate(research.discovered_clips[:5]):
         if clip.relevance_score < 0.3 and rank > 0:
-            break  # don't try low-relevance clips
+            break
         print(f"[researcher] Trying clip #{rank+1}: {clip.title[:60] or clip.url}")
 
-        # Step A: Get video info (duration, title) without downloading.
         info = get_video_info(clip.url)
         video_duration = 0.0
         video_title = clip.title or ""
@@ -993,12 +975,9 @@ def research_and_prepare_clip(
         else:
             print(f"  Could not get video info, trying download anyway")
 
-        # Step B: Use LLM to pick the best segment within the video.
         clip_start = 0.0
         clip_dur = target_duration
         if video_duration > 0:
-            from .clip_tools import find_best_clip_segment as _find_seg
-            # We don't have the file yet — use the LLM with title/duration only.
             import os as _os, json as _json
             api_key = _os.getenv("OPENAI_API_KEY")
             if api_key and video_duration > target_duration * 1.5:
@@ -1022,7 +1001,7 @@ def research_and_prepare_clip(
                     user_msg = {
                         "video_title": video_title,
                         "video_duration_seconds": round(video_duration, 1),
-                        "search_query": suggestion.search_query,
+                        "search_query": search_query,
                         "desired_clip_duration": round(target_duration, 1),
                     }
                     resp = _req.post(
@@ -1054,15 +1033,11 @@ def research_and_prepare_clip(
             clip_start = 0.0
             clip_dur = target_duration
 
-        # Step C: Download only the relevant section.
         section_end = clip_start + clip_dur
-        sub_index = clip_index + clips_downloaded
         raw_path = download_clip_section(
-            clip.url,
-            raw_dir,
-            start=clip_start,
-            end=section_end,
-            prefix=f"clip{sub_index:02d}",
+            clip.url, raw_dir,
+            start=clip_start, end=section_end,
+            prefix=f"clip{clip_index:02d}",
         )
         if raw_path is None:
             print(f"  Download failed, trying next...")
@@ -1071,24 +1046,219 @@ def research_and_prepare_clip(
         if seen_urls is not None:
             seen_urls.add(clip.url)
 
-        # The downloaded section is already roughly the right segment.
-        # Do a final trim + scale to exact dimensions.
         actual_dur = get_video_duration(raw_path)
-        # The section download has ~5s padding on each side, so trim to center.
         trim_start = 5.0 if actual_dur > clip_dur + 3.0 else 0.0
         trim_dur = min(clip_dur, actual_dur - trim_start) if actual_dur > 0 else clip_dur
 
-        trimmed_path = dest_dir / f"prepared_{sub_index:02d}.mp4"
+        trimmed_path = dest_dir / f"prepared_{clip_index:02d}.mp4"
         try:
-            trim_clip(
-                raw_path,
-                trimmed_path,
-                start=trim_start,
-                duration=trim_dur,
-                width=width,
-                height=height,
-                mute=mute,
-            )
+            trim_clip(raw_path, trimmed_path, start=trim_start, duration=trim_dur,
+                      width=width, height=height, mute=mute)
+        except Exception as e:
+            print(f"[researcher] Trim failed: {e}")
+            continue
+
+        return PreparedClip(
+            path=trimmed_path,
+            timeline_start=timeline_start,
+            timeline_end=timeline_end,
+            source_url=clip.url,
+            source_title=clip.title or "",
+            search_query=search_query,
+            muted=mute,
+        )
+
+    return None
+
+
+def research_and_prepare_clip(
+    suggestion: Any,  # VideoClipSuggestion or CommentaryClipSuggestion
+    *,
+    dest_dir: str | Path,
+    clip_index: int = 0,
+    width: int = 1920,
+    height: int = 1080,
+    topic: str = "",
+    transcript_context: str = "",
+    llm_model: str = "gpt-4o",
+    seen_urls: set[str] | None = None,
+    max_scrape_pages: int = 5,
+    max_clips: int = 1,
+) -> list[PreparedClip]:
+    """Full pipeline: research → download → trim → return prepared clips.
+
+    This replaces ``prepare_clip_for_suggestion`` with an agentic research approach.
+    Returns a list of PreparedClip (possibly empty).
+
+    For **compilation** suggestions with *extra_queries*, each query is researched
+    independently so the resulting clips come from different people/sources.
+    For **reference** suggestions (or compilations without extra_queries), the
+    top *max_clips* results from a single research run are downloaded.
+    """
+
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    target_duration = float(suggestion.timeline_end - suggestion.timeline_start)
+    if target_duration <= 0:
+        return []
+
+    raw_dir = dest_dir / "raw"
+    mute = getattr(suggestion, "mute", False)
+    extra_queries: list[str] = getattr(suggestion, "extra_queries", None) or []
+    clip_type = getattr(suggestion, "clip_type", "reference")
+
+    common_kw = dict(
+        target_duration=target_duration / max(1, max_clips),  # per-clip duration
+        dest_dir=dest_dir,
+        raw_dir=raw_dir,
+        width=width,
+        height=height,
+        topic=topic,
+        transcript_context=transcript_context,
+        llm_model=llm_model,
+        seen_urls=seen_urls,
+        max_scrape_pages=max_scrape_pages,
+        mute=mute,
+        timeline_start=suggestion.timeline_start,
+        timeline_end=suggestion.timeline_end,
+    )
+
+    results: list[PreparedClip] = []
+
+    # ── Compilation with extra_queries: research each query independently ──
+    if clip_type == "compilation" and extra_queries:
+        # Build the full query list: primary + extras.
+        all_queries = [suggestion.search_query] + list(extra_queries)
+        # Limit to max_clips.
+        all_queries = all_queries[:max_clips]
+        print(f"[researcher] Compilation: researching {len(all_queries)} separate queries")
+        for qi, q in enumerate(all_queries):
+            idx = clip_index + len(results)
+            print(f"\n[researcher] === Compilation clip {qi+1}/{len(all_queries)}: {q} ===")
+            pc = _research_and_download_one(q, clip_index=idx, **common_kw)
+            if pc is not None:
+                results.append(pc)
+                print(f"  ✓ Clip {len(results)}/{len(all_queries)} prepared")
+            else:
+                print(f"  ✗ No clip found for: {q}")
+        return results
+
+    # ── Single query (reference) or compilation without extra_queries ──
+    # Run one research, download up to max_clips from the results.
+    research = research_clip(
+        suggestion.search_query,
+        topic=topic,
+        transcript_context=transcript_context,
+        model=llm_model,
+        max_scrape_pages=max_scrape_pages,
+        seen_urls=seen_urls,
+    )
+
+    if not research.best_clip:
+        return []
+
+    clips_downloaded = 0
+    for rank, clip in enumerate(research.discovered_clips[:5 + max_clips]):
+        if clips_downloaded >= max_clips:
+            break
+        if clip.relevance_score < 0.3 and rank > 0:
+            break
+        idx = clip_index + clips_downloaded
+        print(f"[researcher] Trying clip #{rank+1}: {clip.title[:60] or clip.url}")
+
+        info = get_video_info(clip.url)
+        video_duration = 0.0
+        video_title = clip.title or ""
+        if info:
+            video_duration = info.get("duration", 0.0)
+            if not video_title:
+                video_title = info.get("title", "")
+            print(f"  Duration: {video_duration:.0f}s, Title: {video_title[:60]}")
+        else:
+            print(f"  Could not get video info, trying download anyway")
+
+        per_clip_dur = target_duration / max(1, max_clips)
+
+        clip_start = 0.0
+        clip_dur = per_clip_dur
+        if video_duration > 0:
+            import os as _os, json as _json
+            api_key = _os.getenv("OPENAI_API_KEY")
+            if api_key and video_duration > per_clip_dur * 1.5:
+                try:
+                    import requests as _req
+                    system = (
+                        "You are helping select the best segment from a video to use as a clip.\n"
+                        "Given the video title, total duration, what we searched for, and how long the clip should be,\n"
+                        "pick the best START time (in seconds) so the clip shows the most relevant/interesting part.\n\n"
+                        "Guidelines:\n"
+                        "- Skip intros, outros, channel branding (usually first 5-15s and last 10s).\n"
+                        "- For news clips: jump to where the person of interest is actually speaking.\n"
+                        "- For reaction videos: jump to the peak reaction moment.\n"
+                        "- For interviews: jump to the key quote or heated exchange.\n"
+                        "- For podcast episodes / long shows: estimate where in the episode the topic\n"
+                        "  would be discussed (often 10-30% in, after intro/ads).\n"
+                        "- For social media clips (Twitter, TikTok): they're usually short — start near 0.\n"
+                        "- Make sure start + duration doesn't exceed the total video duration.\n\n"
+                        'Return ONLY valid JSON: {"start": <float>}'
+                    )
+                    user_msg = {
+                        "video_title": video_title,
+                        "video_duration_seconds": round(video_duration, 1),
+                        "search_query": suggestion.search_query,
+                        "desired_clip_duration": round(per_clip_dur, 1),
+                    }
+                    resp = _req.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        json={"model": llm_model, "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": _json.dumps(user_msg, ensure_ascii=False)},
+                        ], "temperature": 0.2, "max_tokens": 60},
+                        timeout=20,
+                    )
+                    resp.raise_for_status()
+                    content = resp.json()["choices"][0]["message"]["content"].strip()
+                    if content.startswith("```"):
+                        content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                    parsed = _json.loads(content)
+                    clip_start = float(parsed.get("start", 0))
+                    clip_start = max(0.0, min(clip_start, video_duration - per_clip_dur))
+                    clip_dur = min(per_clip_dur, video_duration - clip_start)
+                    print(f"  LLM picked segment: {clip_start:.1f}s - {clip_start + clip_dur:.1f}s")
+                except Exception as e:
+                    print(f"  LLM segment selection failed: {e}")
+                    clip_start = max(0.0, video_duration * 0.15)
+                    clip_dur = min(per_clip_dur, video_duration - clip_start)
+            else:
+                clip_start = 0.0
+                clip_dur = min(per_clip_dur, video_duration)
+        else:
+            clip_start = 0.0
+            clip_dur = per_clip_dur
+
+        section_end = clip_start + clip_dur
+        raw_path = download_clip_section(
+            clip.url, raw_dir,
+            start=clip_start, end=section_end,
+            prefix=f"clip{idx:02d}",
+        )
+        if raw_path is None:
+            print(f"  Download failed, trying next...")
+            continue
+
+        if seen_urls is not None:
+            seen_urls.add(clip.url)
+
+        actual_dur = get_video_duration(raw_path)
+        trim_start = 5.0 if actual_dur > clip_dur + 3.0 else 0.0
+        trim_dur = min(clip_dur, actual_dur - trim_start) if actual_dur > 0 else clip_dur
+
+        trimmed_path = dest_dir / f"prepared_{idx:02d}.mp4"
+        try:
+            trim_clip(raw_path, trimmed_path, start=trim_start, duration=trim_dur,
+                      width=width, height=height, mute=mute)
         except Exception as e:
             print(f"[researcher] Trim failed: {e}")
             continue
