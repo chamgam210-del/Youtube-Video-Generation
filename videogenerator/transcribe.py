@@ -12,6 +12,26 @@ from .models import TranscriptSegment
 from .utils import ensure_dir, read_json, sanitize_filename, write_json
 
 
+def _audio_content_hash(audio_path: Path) -> str:
+    """Fast content-based hash using file size + first/last 64 KB.
+
+    This avoids re-transcribing when only the file's mtime changes
+    (e.g. after a copy or re-save without content changes).
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    size = audio_path.stat().st_size
+    h.update(size.to_bytes(8, "little"))
+    chunk = 65536
+    with open(audio_path, "rb") as f:
+        h.update(f.read(chunk))
+        if size > chunk * 2:
+            f.seek(-chunk, 2)
+        h.update(f.read(chunk))
+    return h.hexdigest()[:24]
+
+
 def _decode_audio_to_float32_mono_16k(audio_path: str | Path) -> np.ndarray:
     """Decode audio file to a 16kHz mono float32 waveform in [-1, 1].
 
@@ -94,6 +114,7 @@ def transcribe_cached(
     cache_dir = ensure_dir(cache_dir)
 
     st = audio_path.stat()
+    content_hash = _audio_content_hash(audio_path)
     cache_key = sanitize_filename(f"{audio_path.stem}.{model_name}")
     cache_path = cache_dir / f"{cache_key}.json"
 
@@ -101,10 +122,17 @@ def transcribe_cached(
         try:
             data = read_json(cache_path)
             meta = data.get("meta", {}) if isinstance(data, dict) else {}
-            if (
-                meta.get("audio_name") == audio_path.name
+            # Match by content hash (preferred) or legacy mtime+size.
+            cached_hash = meta.get("content_hash", "")
+            hash_match = cached_hash and cached_hash == content_hash
+            legacy_match = (
+                not cached_hash
+                and meta.get("audio_name") == audio_path.name
                 and int(meta.get("audio_size", -1)) == int(st.st_size)
                 and float(meta.get("audio_mtime", -1)) == float(st.st_mtime)
+            )
+            if (
+                (hash_match or legacy_match)
                 and meta.get("model") == model_name
             ):
                 segs = data.get("segments") or []
@@ -118,6 +146,13 @@ def transcribe_cached(
                         )
                     )
                 if out:
+                    # Back-fill content_hash into legacy cache entries.
+                    if not cached_hash:
+                        meta["content_hash"] = content_hash
+                        try:
+                            write_json(cache_path, data)
+                        except Exception:
+                            pass
                     return out
         except Exception:
             # Cache read/parse errors fall back to fresh transcription.
@@ -131,6 +166,7 @@ def transcribe_cached(
                 "audio_name": audio_path.name,
                 "audio_size": int(st.st_size),
                 "audio_mtime": float(st.st_mtime),
+                "content_hash": content_hash,
                 "model": model_name,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             },
