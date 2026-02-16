@@ -372,7 +372,7 @@ def main() -> None:
     run(
         audio_path=args.audio,
         out_dir=out_dir,
-        topic=(str(args.visual_subject).strip() or args.topic),
+        topic=str((args.visual_subject or args.topic) or "").strip() or None,
         video_type=str(args.video_type),
         image_provider=args.image_provider,
         serpapi_api_key=args.serpapi_key or os.getenv("SERPAPI_API_KEY"),

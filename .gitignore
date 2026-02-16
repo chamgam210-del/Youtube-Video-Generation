@@ -9,4 +9,5 @@ output_*/
 *.wav
 *.mp4
 *.json
-*.log
+*.log*.stackdump
+nul

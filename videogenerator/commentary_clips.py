@@ -215,7 +215,12 @@ def suggest_commentary_clips(
             num_clips = int(item.get("num_clips") or (1 if clip_type == "reference" else 5))
             extra_queries = item.get("extra_queries")
             if extra_queries and isinstance(extra_queries, list):
-                extra_queries = [str(q).strip() for q in extra_queries if str(q).strip()]
+                import re as _re
+                extra_queries = [
+                    _re.sub(r'\bNone\b', '', str(q)).strip()
+                    for q in extra_queries
+                    if q is not None and str(q).strip() and str(q).strip().lower() != "none"
+                ]
             else:
                 extra_queries = None
             mute = bool(item.get("mute", False))  # commentary clips default unmuted

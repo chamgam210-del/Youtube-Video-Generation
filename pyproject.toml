@@ -20,6 +20,7 @@ dependencies = [
   "openai-whisper>=20231117",
   "yt-dlp>=2024.1",
   "playwright>=1.40",
+  "ddgs>=9.10.0",
 ]
 
 [project.optional-dependencies]

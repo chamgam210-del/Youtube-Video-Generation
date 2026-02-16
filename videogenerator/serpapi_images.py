@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -58,6 +59,14 @@ def serpapi_google_images(
         params["image_type"] = image_type
 
     resp = requests.get(_SERPAPI_ENDPOINT, params=params, timeout=timeout_s)
+    # Retry with backoff on 429 rate-limit errors.
+    for attempt in range(4):
+        if resp.status_code != 429:
+            break
+        wait = 5 * (2 ** attempt)  # 5, 10, 20, 40s
+        print(f"[serpapi_images] 429 — retrying in {wait}s (attempt {attempt+1}/4)")
+        time.sleep(wait)
+        resp = requests.get(_SERPAPI_ENDPOINT, params=params, timeout=timeout_s)
     resp.raise_for_status()
     data: dict[str, Any] = resp.json()
 

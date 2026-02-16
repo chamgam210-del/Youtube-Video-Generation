@@ -1889,24 +1889,40 @@ def run(
 
             if clip_queries:
                 # ── Manual clip queries: group ALL as a single compilation ──
-                # Use LLM to find the cue-phrase insertion point, then place
-                # all user queries together as one compilation at that point.
-                csug = suggest_commentary_clips(
-                    segments=segments,
-                    topic=effective_topic or audio_path.stem,
-                    title=audio_path.stem,
-                    audio_duration=timeline_duration,
-                    max_clips=1,  # we only need ONE insertion point
-                    model=llm_model,
+                # Scan transcript for explicit cue phrases first — much more
+                # reliable than asking the LLM for just 1 insertion point.
+                import re as _re
+                _CUE_RE = _re.compile(
+                    r"(?:let'?s\s+(?:take\s+a\s+)?look|let'?s\s+(?:watch|see)|"
+                    r"here'?s\s+the\s+clip|watch\s+this|check\s+(?:this|it)\s+out|"
+                    r"play\s+the\s+clip|roll\s+the\s+clip|look\s+at\s+(?:this|the)|"
+                    r"let\s+me\s+show\s+you|take\s+a\s+look)",
+                    _re.IGNORECASE,
                 )
+                cue_start: float | None = None
+                for seg in segments:
+                    if _CUE_RE.search(seg.text):
+                        cue_start = seg.start
+                        print(f"[pipeline] Found cue phrase at {cue_start:.1f}s: {seg.text.strip()[:80]}")
+                        break  # use first cue phrase
 
-                # Determine the insertion point: use LLM cue if found,
-                # otherwise default to ~15% into the timeline.
-                if csug:
-                    base = csug[0]
-                    insert_start = base.timeline_start
+                if cue_start is not None:
+                    insert_start = cue_start
                 else:
-                    insert_start = round(timeline_duration * 0.15, 1)
+                    # Fallback: ask LLM to find the insertion point.
+                    csug = suggest_commentary_clips(
+                        segments=segments,
+                        topic=effective_topic or audio_path.stem,
+                        title=audio_path.stem,
+                        audio_duration=timeline_duration,
+                        max_clips=1,
+                        model=llm_model,
+                    )
+                    if csug:
+                        insert_start = csug[0].timeline_start
+                    else:
+                        insert_start = round(timeline_duration * 0.15, 1)
+                    print(f"[pipeline] No cue phrase found, using LLM/default insertion at {insert_start:.1f}s")
 
                 # Enrich short queries with topic context.
                 _raw_topic = (effective_topic or audio_path.stem or "").strip()

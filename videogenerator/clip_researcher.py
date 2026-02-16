@@ -216,7 +216,62 @@ def _fallback_search_queries(clip_query: str, topic: str = "") -> list[str]:
     return queries[:7]
 
 
-# ── Step 2: Google Web Search via SerpAPI ────────────────────────────────────
+# ── Step 2: Web Search (DuckDuckGo primary, SerpAPI fallback) ────────────────
+
+
+def _ddg_web_search(
+    query: str,
+    *,
+    max_results: int = 10,
+) -> list[dict[str, Any]]:
+    """Search via DuckDuckGo (free, unlimited, no API key)."""
+    try:
+        from ddgs import DDGS
+
+        d = DDGS()
+        raw = d.text(query, max_results=max_results)
+
+        results = []
+        for item in raw:
+            results.append({
+                "title": item.get("title", ""),
+                "link": item.get("href", ""),
+                "snippet": item.get("body", ""),
+                "source": "duckduckgo",
+            })
+        return results
+    except Exception as e:
+        print(f"[researcher] DuckDuckGo web search failed for {query!r}: {e}")
+        return []
+
+
+def _ddg_video_search(
+    query: str,
+    *,
+    max_results: int = 8,
+) -> list[dict[str, Any]]:
+    """Search DuckDuckGo Videos (free, unlimited, no API key)."""
+    try:
+        from ddgs import DDGS
+
+        d = DDGS()
+        raw = d.videos(query, max_results=max_results)
+
+        results = []
+        for item in raw:
+            # DDG video results have content/embed_url for the actual video link.
+            link = item.get("content", "") or item.get("embed_url", "")
+            results.append({
+                "title": item.get("title", ""),
+                "link": link,
+                "snippet": item.get("description", ""),
+                "source": item.get("publisher", "duckduckgo_video"),
+                "duration": item.get("duration", ""),
+            })
+        return results
+    except Exception as e:
+        print(f"[researcher] DuckDuckGo video search failed for {query!r}: {e}")
+        return []
 
 
 def _google_search(
@@ -239,9 +294,20 @@ def _google_search(
             "api_key": api_key,
             "num": max_results,
         }
-        resp = requests.get("https://serpapi.com/search.json", params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+        # Retry with backoff on 429 rate-limit errors.
+        data = None
+        for attempt in range(4):
+            resp = requests.get("https://serpapi.com/search.json", params=params, timeout=30)
+            if resp.status_code == 429:
+                wait = 5 * (2 ** attempt)  # 5, 10, 20, 40s
+                print(f"[researcher] SerpAPI 429 — retrying in {wait}s (attempt {attempt+1}/4)")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        if data is None:
+            return []
 
         results = []
         for item in data.get("organic_results", [])[:max_results]:
@@ -287,9 +353,20 @@ def _google_video_search(
             "q": query,
             "api_key": api_key,
         }
-        resp = requests.get("https://serpapi.com/search.json", params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+        # Retry with backoff on 429 rate-limit errors.
+        data = None
+        for attempt in range(4):
+            resp = requests.get("https://serpapi.com/search.json", params=params, timeout=30)
+            if resp.status_code == 429:
+                wait = 5 * (2 ** attempt)  # 5, 10, 20, 40s
+                print(f"[researcher] SerpAPI 429 — retrying in {wait}s (attempt {attempt+1}/4)")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        if data is None:
+            return []
 
         results = []
         for item in data.get("video_results", [])[:max_results]:
@@ -304,6 +381,31 @@ def _google_video_search(
     except Exception as e:
         print(f"[researcher] Google Video search failed for {query!r}: {e}")
         return []
+
+
+def _web_search(
+    query: str,
+    *,
+    max_results: int = 10,
+) -> list[dict[str, Any]]:
+    """Unified web search: tries DuckDuckGo first (free), falls back to SerpAPI."""
+    results = _ddg_web_search(query, max_results=max_results)
+    if results:
+        return results
+    # Fallback to SerpAPI if DDG returned nothing and key is available.
+    return _google_search(query, max_results=max_results)
+
+
+def _video_search(
+    query: str,
+    *,
+    max_results: int = 8,
+) -> list[dict[str, Any]]:
+    """Unified video search: tries DuckDuckGo first (free), falls back to SerpAPI."""
+    results = _ddg_video_search(query, max_results=max_results)
+    if results:
+        return results
+    return _google_video_search(query, max_results=max_results)
 
 
 # ── Step 3: Extract video URLs from web pages (any platform) ─────────────────
@@ -787,22 +889,22 @@ def research_clip(
     for i, q in enumerate(queries):
         print(f"  Q{i+1}: {q}")
 
-    # ── Step 2: Execute Google searches ──
-    print("\n[researcher] Step 2: Searching Google...")
+    # ── Step 2: Execute web searches (DuckDuckGo primary, SerpAPI fallback) ──
+    print("\n[researcher] Step 2: Searching the web...")
     all_search_results: list[dict[str, Any]] = []
 
-    # Use first 3 queries for full Google search, rest for video search.
+    # Use first 3 queries for full web search, rest for video search.
     for q in queries[:3]:
-        results = _google_search(q, max_results=8)
+        results = _web_search(q, max_results=8)
         all_search_results.extend(results)
-        print(f"  Google web: {len(results)} results for {q!r}")
-        time.sleep(0.5)  # rate limiting
+        print(f"  Web search: {len(results)} results for {q!r}")
+        time.sleep(1)  # be polite to DDG
 
     for q in queries[:3]:
-        results = _google_video_search(q, max_results=6)
+        results = _video_search(q, max_results=6)
         all_search_results.extend(results)
-        print(f"  Google video: {len(results)} results for {q!r}")
-        time.sleep(0.5)
+        print(f"  Video search: {len(results)} results for {q!r}")
+        time.sleep(1)
 
     # ── Step 3: Extract video URLs from search results + scrape pages ──
     print("\n[researcher] Step 3: Extracting video URLs and scraping pages...")
@@ -878,7 +980,12 @@ def research_clip(
 
     # ── Step 3b: Also do a direct YouTube search as fallback ──
     print("\n[researcher] Step 3b: YouTube search fallback...")
-    yt_results = search_video_clips(clip_query, max_results=8, sort_by_views=False)
+    # Enrich short queries with topic for better YouTube search results.
+    import re as _re
+    _yt_query = _re.sub(r'\bNone\b', '', clip_query).strip()
+    if topic and len(_yt_query.split()) <= 4 and topic.lower() not in _yt_query.lower():
+        _yt_query = f"{_yt_query} {topic}"
+    yt_results = search_video_clips(_yt_query, max_results=8, sort_by_views=False)
     for r in yt_results:
         result.discovered_clips.append(DiscoveredClip(
             url=r.url,
@@ -1143,6 +1250,20 @@ def research_and_prepare_clip(
         all_queries = [suggestion.search_query] + list(extra_queries)
         # Limit to max_clips.
         all_queries = all_queries[:max_clips]
+
+        # Sanitize: strip literal "None" that can leak from LLM JSON,
+        # and enrich short queries (just a name) with topic context.
+        import re as _re
+        _clean_queries: list[str] = []
+        for _rq in all_queries:
+            _rq = _re.sub(r'\bNone\b', '', str(_rq)).strip()
+            # If query is very short (just a name), append topic for better results.
+            if topic and len(_rq.split()) <= 4 and topic.lower() not in _rq.lower():
+                _rq = f"{_rq} {topic}"
+            if _rq:
+                _clean_queries.append(_rq)
+        all_queries = _clean_queries
+
         print(f"[researcher] Compilation: researching {len(all_queries)} separate queries")
         for qi, q in enumerate(all_queries):
             idx = clip_index + len(results)

@@ -14,6 +14,53 @@ _ALLOW_HOSTS = {
 }
 
 
+def _ddg_image_search(
+    query: str,
+    *,
+    max_results: int = 12,
+    min_width: int = 800,
+) -> list[dict[str, Any]]:
+    """Free image search via DuckDuckGo — no API key required."""
+    try:
+        from ddgs import DDGS
+
+        d = DDGS()
+        raw = d.images(query, max_results=max_results)
+
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for item in raw:
+            img_url = item.get("image", "")
+            if not img_url or not img_url.startswith("http"):
+                continue
+            w = item.get("width", 0)
+            if w and int(w) < min_width:
+                continue
+            if img_url in seen:
+                continue
+            seen.add(img_url)
+
+            out.append({
+                "title": item.get("title", ""),
+                "page_url": item.get("url", ""),
+                "image_url": img_url,
+                "original_url": img_url,
+                "width": item.get("width"),
+                "height": item.get("height"),
+                "license_name": None,
+                "license_url": None,
+                "attribution": item.get("source", item.get("title", "")),
+            })
+            if len(out) >= max_results:
+                break
+
+        return out
+    except Exception as e:
+        print(f"[serpapi_provider] DuckDuckGo image search failed for {query!r}: {e}")
+        return []
+
+
 def _filename_from_upload_url(url: str) -> str | None:
     # Typical: https://upload.wikimedia.org/wikipedia/commons/.../Some_File_Name.jpg
     try:
@@ -145,18 +192,28 @@ def search_google_images_candidates_via_serpapi(
 
     This mode is not restricted to Wikimedia Commons, so we apply a strict
     usage-rights filter at the API level.
+    Falls back to DuckDuckGo image search when SerpAPI is unavailable.
 
     Notes:
     - We also drop shopping/product results.
     """
 
-    imgs = serpapi_google_images(
-        query,
-        api_key=api_key,
-        num=max_results,
-        safe=safe,
-        image_type="photo",
-    )
+    # Try SerpAPI first.
+    try:
+        imgs = serpapi_google_images(
+            query,
+            api_key=api_key,
+            num=max_results,
+            safe=safe,
+            image_type="photo",
+        )
+    except Exception as e:
+        print(f"[serpapi_provider] SerpAPI images failed ({e}), falling back to DuckDuckGo")
+        return _ddg_image_search(query, max_results=max_results, min_width=min_width)
+
+    if not imgs:
+        print("[serpapi_provider] SerpAPI returned no images, falling back to DuckDuckGo")
+        return _ddg_image_search(query, max_results=max_results, min_width=min_width)
 
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
