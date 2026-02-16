@@ -945,10 +945,7 @@ with col_right:
             if video_path.exists():
                 with left:
                     st.subheader("Full review")
-                    try:
-                        st.video(str(video_path))
-                    except Exception:
-                        st.video(video_path.read_bytes(), format="video/mp4")
+                    st.video(video_path.read_bytes(), format="video/mp4")
 
         cols = st.columns([1, 1, 2])
         with cols[0]:
