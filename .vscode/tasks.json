@@ -1,0 +1,21 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run Streamlit UI (uv)",
+			"type": "shell",
+			"command": "uv",
+			"args": [
+				"run",
+				"streamlit",
+				"run",
+				"videogenerator/ui_app.py",
+				"--server.port",
+				"8502"
+			],
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}
