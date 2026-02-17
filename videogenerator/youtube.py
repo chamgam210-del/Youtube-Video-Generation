@@ -410,6 +410,7 @@ def create_thumbnail(
     theme: str = "default",
     show_title: bool = True,
     crop: dict[str, float] | None = None,
+    title_scale: float = 1.0,
 ) -> Path:
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -679,6 +680,7 @@ def create_thumbnail(
             top_margin = max(18, title_stroke_w * 2)
             title_cy = int(top_margin)
 
+            _title_max = int(min(150, int(width * 0.095)) * max(0.5, float(title_scale)))
             fitted_text, title_font = _fit_title_text(
                 draw,
                 text,
@@ -686,6 +688,7 @@ def create_thumbnail(
                 height=height,
                 stroke_width=title_stroke_w,
                 max_lines=3,
+                max_size=_title_max,
             )
 
             spacing = max(6, int(getattr(title_font, "size", 64) * 0.12))

@@ -959,3 +959,61 @@ with col_right:
             thumb = out_dir / "thumbnail.png"
             if thumb.exists():
                 st.image(str(thumb), caption="thumbnail.png", width="stretch")
+
+        # -------------------------------------------------------------------
+        # YouTube Short creation
+        # -------------------------------------------------------------------
+        if video_path.exists():
+            st.divider()
+            st.subheader("Create YouTube Short")
+            st.caption(
+                "Takes a continuous chunk from the start of the video "
+                "(after skipping any intro), crops to 9:16, and speeds it up."
+            )
+
+            s_col1, s_col2, s_col3 = st.columns(3)
+            with s_col1:
+                short_duration = st.number_input(
+                    "Output duration (seconds)",
+                    min_value=10.0,
+                    max_value=60.0,
+                    value=55.0,
+                    step=1.0,
+                    help="Desired length of the final Short.",
+                )
+            with s_col2:
+                short_speed = st.number_input(
+                    "Speed multiplier",
+                    min_value=1.0,
+                    max_value=3.0,
+                    value=1.35,
+                    step=0.05,
+                    format="%.2f",
+                    help="Playback speed (e.g. 1.35 = 35% faster).",
+                )
+            with s_col3:
+                short_skip = st.number_input(
+                    "Skip intro (seconds)",
+                    min_value=0.0,
+                    max_value=30.0,
+                    value=2.5,
+                    step=0.5,
+                    help="Seconds to skip at the beginning (channel branding).",
+                )
+
+            short_out = out_dir / "short.mp4"
+            if st.button("Generate Short", type="primary"):
+                from videogenerator.create_short import create_youtube_short
+
+                with st.spinner(f"Creating {short_duration:.0f}s Short @ {short_speed}x ..."):
+                    create_youtube_short(
+                        video_path=str(video_path),
+                        out_path=str(short_out),
+                        output_duration=float(short_duration),
+                        speed=float(short_speed),
+                        skip_intro=float(short_skip),
+                    )
+                st.success(f"Short created: {short_out.name}")
+
+            if short_out.exists():
+                st.video(short_out.read_bytes(), format="video/mp4")
