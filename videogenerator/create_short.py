@@ -80,7 +80,7 @@ def create_short_thumbnail(
     except OSError:
         pass
 
-    print(f"  ✓ Short thumbnail: {out}", flush=True)
+    print(f"  Short thumbnail: {out}", flush=True)
     return out
 
 
@@ -176,12 +176,12 @@ def create_youtube_short(
     start_time = skip_intro
     available = vid_duration - start_time
     if source_duration > available:
-        print(f"  ⚠ Requested {source_duration:.1f}s of source but only "
+        print(f"  WARNING: Requested {source_duration:.1f}s of source but only "
               f"{available:.1f}s available after intro skip; using all.", flush=True)
         source_duration = available
 
-    print(f"  Source chunk: {start_time:.1f}s → {start_time + source_duration:.1f}s "
-          f"({source_duration:.1f}s @ {speed}x → ~{source_duration / speed:.1f}s output)",
+    print(f"  Source chunk: {start_time:.1f}s -> {start_time + source_duration:.1f}s "
+          f"({source_duration:.1f}s @ {speed}x -> ~{source_duration / speed:.1f}s output)",
           flush=True)
 
     # Build ffmpeg filters
@@ -226,7 +226,7 @@ def create_youtube_short(
     final_dur = _video_duration(str(out))
     size_mb = out.stat().st_size / (1024 * 1024)
     print(f"\n{'='*60}")
-    print(f"✓ YouTube Short created: {out_path}")
+    print(f"Short created: {out_path}")
     print(f"  Duration: {final_dur:.1f}s | Size: {size_mb:.1f}MB | Resolution: 1080x1920")
     print(f"{'='*60}\n")
 

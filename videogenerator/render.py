@@ -936,6 +936,32 @@ def render_slideshow(
     if trans is not None and trans not in {"fade"}:
         raise ValueError(f"Unknown transition: {transition!r}")
 
+    # Instead of relying on ffmpeg's adelay filter (which can clip the leading
+    # edge of audio on some builds/platforms), pre-pad the audio file with
+    # exact silence so the narration starts precisely after the intro slate.
+    if intro_s > 0.0:
+        _padded = out_mp4.parent / "_narration_padded.wav"
+        try:
+            _pad_cmd = [
+                ffmpeg, "-y",
+                "-f", "lavfi", "-t", f"{intro_s:.3f}",
+                "-i", "anullsrc=r=44100:cl=stereo",
+                "-i", str(Path(audio_path).resolve()),
+                "-filter_complex",
+                "[0:a]aformat=sample_fmts=fltp:sample_rates=44100[sil];"
+                "[1:a]aformat=sample_fmts=fltp:sample_rates=44100[voc];"
+                "[sil][voc]concat=n=2:v=0:a=1[out]",
+                "-map", "[out]",
+                "-c:a", "pcm_s16le",
+                str(_padded),
+            ]
+            _p = subprocess.run(_pad_cmd, capture_output=True, text=True)
+            if _p.returncode == 0 and _padded.exists() and _padded.stat().st_size > 1024:
+                audio_path = str(_padded)
+                intro_s = 0.0  # silence already baked into the file
+        except Exception:
+            pass  # fall back to adelay below
+
     intro_ms = int(round(intro_s * 1000.0))
     # adelay expects per-channel delays; provide 2 channels to be safe.
     adelay = f"adelay={intro_ms}|{intro_ms}," if intro_ms > 0 else ""
