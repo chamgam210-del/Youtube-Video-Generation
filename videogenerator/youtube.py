@@ -570,7 +570,9 @@ def create_thumbnail(
 
             draw = ImageDraw.Draw(im)
 
-            # Title (top): smaller than the default theme.
+            # Title: when no verdict stamp, centre vertically and render BIG;
+            # otherwise keep the original top-positioned smaller title.
+            has_verdict = bool(verdict_text and str(verdict_text).strip() and str(verdict_text).strip().lower() != "decent")
             if show_title:
                 title_text = " ".join((text or "").split()).strip()
                 if title_text:
@@ -578,15 +580,27 @@ def create_thumbnail(
                     title_fill = (0, 0, 0)  # black
                     title_stroke = (255, 140, 0)  # orange outline
 
+                    if has_verdict:
+                        # Original sizing: smaller title at top.
+                        _max_lines = 3
+                        _max_h_ratio = 0.18
+                        _max_size = min(108, int(width * 0.075))
+                    else:
+                        # No stamp → big centred title.
+                        _max_lines = 2
+                        _max_h_ratio = 0.40
+                        _max_size = min(260, int(width * 0.18))
+                        title_stroke_w = max(8, width // 100)
+
                     fitted_text, title_font = _fit_title_text(
                         draw,
                         title_text,
                         width=width,
                         height=height,
                         stroke_width=title_stroke_w,
-                        max_lines=3,
-                        max_text_h_ratio=0.18,
-                        max_size=min(108, int(width * 0.075)),
+                        max_lines=_max_lines,
+                        max_text_h_ratio=_max_h_ratio,
+                        max_size=_max_size,
                     )
                     spacing = max(6, int(getattr(title_font, "size", 64) * 0.12))
                     title_bbox = draw.multiline_textbbox(
@@ -598,9 +612,14 @@ def create_thumbnail(
                         spacing=spacing,
                     )
                     title_w = title_bbox[2] - title_bbox[0]
+                    title_h = title_bbox[3] - title_bbox[1]
                     title_x = int((width - title_w) / 2)
-                    top_margin = max(14, title_stroke_w * 2)
-                    title_y = int(top_margin)
+                    if has_verdict:
+                        top_margin = max(14, title_stroke_w * 2)
+                        title_y = int(top_margin)
+                    else:
+                        # Vertically centre.
+                        title_y = int((height - title_h) / 2)
                     draw.multiline_text(
                         (title_x, title_y),
                         fitted_text,
