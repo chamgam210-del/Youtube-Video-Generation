@@ -9,7 +9,7 @@ Usage
     uv run python -m videogenerator.create_short \\
         --video output/video.mp4 \\
         --out output/short.mp4 \\
-        [--output-duration 55] [--speed 1.35] [--skip-intro 2.5]
+        [--output-duration 45] [--speed 1.35] [--skip-intro 2.5]
 """
 
 from __future__ import annotations
@@ -22,6 +22,66 @@ import sys
 from pathlib import Path
 
 import imageio_ffmpeg
+
+
+# ---------------------------------------------------------------------------
+# thumbnail helper
+# ---------------------------------------------------------------------------
+
+def create_short_thumbnail(
+    *,
+    video_path: str,
+    out_path: str = "output/short_thumbnail.png",
+    channel_name: str = "Brutally Honest Review",
+    stamp_text: str | None = None,
+    title_text: str | None = None,
+    grab_time: float = 5.0,
+) -> Path:
+    """Extract a frame from the video and overlay channel name + stamp.
+
+    Uses the existing ``create_thumbnail`` from *youtube.py* with the
+    ``review_long`` theme so the result matches the channel's brand.
+    """
+    import tempfile
+    from videogenerator.youtube import create_thumbnail
+
+    ffmpeg = _ffmpeg()
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    tmp.close()
+    # Extract a single frame from the video
+    cmd = [
+        ffmpeg, "-y",
+        "-ss", f"{grab_time:.3f}",
+        "-i", video_path,
+        "-frames:v", "1",
+        "-q:v", "2",
+        tmp.name,
+    ]
+    _run(cmd, f"grab frame @{grab_time:.1f}s")
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    display_title = title_text or channel_name
+    create_thumbnail(
+        out_path=out,
+        background_image=tmp.name,
+        text=display_title,
+        verdict_text=stamp_text,
+        stamp_text=None,
+        width=1080,
+        height=1920,
+        theme="review_long",
+        show_title=True,
+    )
+
+    try:
+        os.remove(tmp.name)
+    except OSError:
+        pass
+
+    print(f"  ✓ Short thumbnail: {out}", flush=True)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -63,9 +123,13 @@ def create_youtube_short(
     *,
     video_path: str,
     out_path: str = "output/short.mp4",
-    output_duration: float = 55,
+    output_duration: float = 45,
     speed: float = 1.35,
     skip_intro: float = 2.5,
+    channel_name: str | None = None,
+    stamp_text: str | None = None,
+    title_text: str | None = None,
+    generate_thumbnail: bool = False,
 ) -> Path:
     """Create a YouTube Short from a full-length video.
 
@@ -85,6 +149,14 @@ def create_youtube_short(
         Playback speed multiplier (default 1.35).
     skip_intro : float
         Seconds to skip at the very start (e.g. channel intro, default 2.5).
+    channel_name : str | None
+        Channel name for the thumbnail (default: Brutally Honest Review).
+    stamp_text : str | None
+        Verdict / stamp text drawn on the thumbnail (e.g. "MUST WATCH").
+    title_text : str | None
+        Title text drawn on the thumbnail. Falls back to *channel_name*.
+    generate_thumbnail : bool
+        If True, create a 9:16 thumbnail from a grabbed video frame.
     """
 
     print(f"\n{'='*60}")
@@ -158,6 +230,19 @@ def create_youtube_short(
     print(f"  Duration: {final_dur:.1f}s | Size: {size_mb:.1f}MB | Resolution: 1080x1920")
     print(f"{'='*60}\n")
 
+    # Optional thumbnail
+    if generate_thumbnail:
+        thumb_out = str(Path(out_path).with_name("short_thumbnail.png"))
+        effective_channel = channel_name or "Brutally Honest Review"
+        create_short_thumbnail(
+            video_path=video_path,
+            out_path=thumb_out,
+            channel_name=effective_channel,
+            stamp_text=stamp_text,
+            title_text=title_text,
+            grab_time=skip_intro + 5.0,
+        )
+
     return out
 
 
@@ -172,12 +257,20 @@ def main() -> None:
     parser.add_argument("--video", required=True, help="Path to source video")
     parser.add_argument("--out", default="output/short.mp4",
                         help="Output path (default: output/short.mp4)")
-    parser.add_argument("--output-duration", type=float, default=55,
-                        help="Desired Short length in seconds (default: 55)")
+    parser.add_argument("--output-duration", type=float, default=45,
+                        help="Desired Short length in seconds (default: 45)")
     parser.add_argument("--speed", type=float, default=1.35,
                         help="Playback speed multiplier (default: 1.35)")
     parser.add_argument("--skip-intro", type=float, default=2.5,
                         help="Seconds to skip at start (default: 2.5)")
+    parser.add_argument("--channel-name", default="Brutally Honest Review",
+                        help="Channel name for the thumbnail")
+    parser.add_argument("--stamp", default=None,
+                        help="Stamp/verdict text for thumbnail (e.g. MUST WATCH)")
+    parser.add_argument("--title", default=None,
+                        help="Title text for thumbnail")
+    parser.add_argument("--thumbnail", action="store_true", default=False,
+                        help="Generate a 9:16 thumbnail alongside the Short")
     args = parser.parse_args()
 
     create_youtube_short(
@@ -186,6 +279,10 @@ def main() -> None:
         output_duration=args.output_duration,
         speed=args.speed,
         skip_intro=args.skip_intro,
+        channel_name=args.channel_name,
+        stamp_text=args.stamp,
+        title_text=args.title,
+        generate_thumbnail=args.thumbnail,
     )
 
 

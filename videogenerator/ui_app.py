@@ -977,7 +977,7 @@ with col_right:
                     "Output duration (seconds)",
                     min_value=10.0,
                     max_value=60.0,
-                    value=55.0,
+                    value=45.0,
                     step=1.0,
                     help="Desired length of the final Short.",
                 )
@@ -1001,6 +1001,21 @@ with col_right:
                     help="Seconds to skip at the beginning (channel branding).",
                 )
 
+            # Thumbnail options
+            short_gen_thumb = st.checkbox("Generate Short thumbnail (channel + stamp)", value=True)
+            st_col1, st_col2 = st.columns(2)
+            with st_col1:
+                short_channel = st.text_input(
+                    "Channel name (Short thumb)",
+                    value="Brutally Honest Review",
+                )
+            with st_col2:
+                short_stamp = st.text_input(
+                    "Stamp text (Short thumb)",
+                    value="",
+                    help="e.g. MUST WATCH, GARBAGE!, WORTH IT?  Leave blank to omit.",
+                )
+
             short_out = out_dir / "short.mp4"
             if st.button("Generate Short", type="primary"):
                 from videogenerator.create_short import create_youtube_short
@@ -1012,8 +1027,16 @@ with col_right:
                         output_duration=float(short_duration),
                         speed=float(short_speed),
                         skip_intro=float(short_skip),
+                        channel_name=short_channel.strip() or "Brutally Honest Review",
+                        stamp_text=short_stamp.strip() or None,
+                        title_text=None,
+                        generate_thumbnail=bool(short_gen_thumb),
                     )
                 st.success(f"Short created: {short_out.name}")
 
             if short_out.exists():
                 st.video(short_out.read_bytes(), format="video/mp4")
+
+            short_thumb = out_dir / "short_thumbnail.png"
+            if short_thumb.exists():
+                st.image(str(short_thumb), caption="short_thumbnail.png", width=360)
