@@ -535,6 +535,21 @@ def run(
                         q, h, sh = planned[i][2], planned[i][3], planned[i][4]
                         respaced.append((float(b.start), float(b.end), q, h, sh))
                     planned = respaced
+
+            # Guardrail: if the LLM produced FAR fewer slides than requested
+            # (e.g. 3 for a 5-minute audio when max_images=12), expand by evenly
+            # distributing heuristic buckets and cycling the LLM queries.
+            if planned and audio_duration > 0 and vt not in {"shorts_review"}:
+                min_slides = max(4, int(audio_duration / 60))  # at least 1 per minute
+                target = max(min_slides, min(max_images, int(audio_duration / 30)))
+                if len(planned) < min_slides:
+                    print(f"[pipeline] LLM produced only {len(planned)} slides for {audio_duration:.0f}s — expanding to {target}")
+                    buckets = select_evenly_spaced(merged, max_items=target, audio_duration=audio_duration)
+                    expanded: list[tuple[float, float, str, str, str | None]] = []
+                    for i, b in enumerate(buckets):
+                        src = planned[i % len(planned)]
+                        expanded.append((float(b.start), float(b.end), src[2], src[3], src[4]))
+                    planned = expanded
         except Exception:
             if storyboard == "llm":
                 raise
