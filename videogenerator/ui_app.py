@@ -407,7 +407,14 @@ with col_right:
             pass
 
     if not out_name.strip():
-        out_name = _default_output_dir(saved_audio)
+        # Re-use the folder from the last successful pipeline run (same audio)
+        # so that post-run actions (Generate Short, thumbnail regen) still
+        # point at the correct output even after page reruns.
+        _ss_key = f"last_out_dir_{uploaded_sha}"
+        if _ss_key in st.session_state:
+            out_name = st.session_state[_ss_key]
+        else:
+            out_name = _default_output_dir(saved_audio)
 
     out_dir = workspace / out_name
     st.code(str(out_dir), language="text")
@@ -930,6 +937,11 @@ with col_right:
             status.update(label="Done", state="complete", expanded=False)
 
         st.success("Finished")
+
+        # Persist the output folder name so that post-run actions (Generate Short,
+        # thumbnail regen) survive page reruns even when the text input is blank.
+        _ss_key = f"last_out_dir_{uploaded_sha}"
+        st.session_state[_ss_key] = out_dir.name
 
     # Convenience links/actions
     if out_dir.exists():
