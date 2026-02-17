@@ -581,10 +581,11 @@ def create_thumbnail(
                     title_stroke = (255, 140, 0)  # orange outline
 
                     if has_verdict:
-                        # Original sizing: smaller title at top.
+                        # Title at top — larger than before.
                         _max_lines = 3
-                        _max_h_ratio = 0.18
-                        _max_size = min(108, int(width * 0.075))
+                        _max_h_ratio = 0.28
+                        _max_size = min(180, int(width * 0.12))
+                        title_stroke_w = max(6, width // 130)
                     else:
                         # No stamp → big centred title.
                         _max_lines = 2
@@ -668,6 +669,12 @@ def create_thumbnail(
                     stroke_width=verdict_stroke_w,
                     stroke_fill=verdict_stroke,
                     spacing=stamp_spacing,
+                )
+
+                # Tilt the stamp layer slightly for a casual / punchy look.
+                stamp_layer = stamp_layer.rotate(
+                    -6, resample=Image.BICUBIC, expand=False,
+                    center=(verdict_cx, verdict_cy),
                 )
 
                 base = im.convert("RGBA")

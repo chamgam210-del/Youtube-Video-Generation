@@ -743,8 +743,8 @@ with col_right:
                     create_thumbnail(
                         out_path=out_dir / "thumbnail.png",
                         background_image=bg,
-                        text=("REVIEW" if vt == "review" else title_txt),
-                        verdict_text=(None if vt == "review" else (pkg.verdict_label if pkg else None)),
+                        text=("Brutally Honest Review" if vt == "review" else title_txt),
+                        verdict_text=(thumb_stamp if vt == "review" else (pkg.verdict_label if pkg else None)),
                         stamp_text=(None if vt == "review" else (pkg.thumbnail_stamp_text if pkg else None)),
                         match_video_frame=False,
                         width=int(vid_w),
@@ -912,8 +912,8 @@ with col_right:
                     create_thumbnail(
                         out_path=out_dir / "thumbnail.png",
                         background_image=bg,
-                        text=("REVIEW" if vt == "review" else title_txt),
-                        verdict_text=(None if vt == "review" else pkg.verdict_label),
+                        text=("Brutally Honest Review" if vt == "review" else title_txt),
+                        verdict_text=(thumb_stamp if vt == "review" else pkg.verdict_label),
                         stamp_text=(None if vt == "review" else pkg.thumbnail_stamp_text),
                         match_video_frame=False,
                         theme=("review_long" if vt == "review" else "default"),
