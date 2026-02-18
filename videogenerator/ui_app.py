@@ -442,13 +442,86 @@ with col_right:
         else:
             st.caption("No prior output folders detected for this MP3 stem (yet).")
 
-    b1, b2 = st.columns([1, 1])
+    b1, b2, b3 = st.columns([1, 1, 1])
     with b1:
         run_clicked = st.button("Run", type="primary")
     with b2:
         thumb_only_clicked = st.button("Thumbnail only", type="secondary", help="Generate thumbnail.png from the audio (transcribe → pick image + crop + text). Skips MP4 rendering.")
+    with b3:
+        short_only_clicked = st.button("Short only", type="secondary", help="Create a YouTube Short from an existing video.mp4 in the output folder. Skips pipeline + rendering.")
 
-    action = "run" if run_clicked else ("thumbnail_only" if thumb_only_clicked else None)
+    action = "run" if run_clicked else ("thumbnail_only" if thumb_only_clicked else ("short_only" if short_only_clicked else None))
+
+    # ------------------------------------------------------------------
+    # Short-only mode: skip pipeline, jump straight to short creation
+    # ------------------------------------------------------------------
+    if action == "short_only":
+        video_path = out_dir / "video.mp4"
+        if not video_path.exists():
+            st.error(f"No video.mp4 found in {out_dir}. Run the full pipeline first.")
+            st.stop()
+
+        st.divider()
+        st.subheader("Create YouTube Short")
+        st.caption(
+            "Takes a continuous chunk from the start of the video "
+            "(after skipping any intro), crops to 9:16, and speeds it up."
+        )
+
+        s_col1, s_col2, s_col3 = st.columns(3)
+        with s_col1:
+            short_duration = st.number_input(
+                "Output duration (seconds)",
+                min_value=10.0, max_value=60.0, value=45.0, step=1.0,
+                key="so_dur",
+            )
+        with s_col2:
+            short_speed = st.number_input(
+                "Speed multiplier",
+                min_value=1.0, max_value=3.0, value=1.35, step=0.05, format="%.2f",
+                key="so_spd",
+            )
+        with s_col3:
+            short_skip = st.number_input(
+                "Skip intro (seconds)",
+                min_value=0.0, max_value=30.0, value=2.5, step=0.5,
+                key="so_skip",
+            )
+
+        short_gen_thumb = st.checkbox("Generate Short thumbnail (channel + stamp)", value=True, key="so_thumb")
+        st_col1, st_col2 = st.columns(2)
+        with st_col1:
+            short_channel = st.text_input("Channel name (Short thumb)", value="Brutally Honest Review", key="so_ch")
+        with st_col2:
+            short_stamp = st.text_input("Stamp text (Short thumb)", value="", key="so_st",
+                                        help="e.g. MUST WATCH, GARBAGE!, WORTH IT?  Leave blank to omit.")
+
+        short_out = out_dir / "short.mp4"
+        if st.button("Generate Short", type="primary", key="so_gen"):
+            from videogenerator.create_short import create_youtube_short
+
+            with st.spinner(f"Creating {short_duration:.0f}s Short @ {short_speed}x ..."):
+                create_youtube_short(
+                    video_path=str(video_path),
+                    out_path=str(short_out),
+                    output_duration=float(short_duration),
+                    speed=float(short_speed),
+                    skip_intro=float(short_skip),
+                    channel_name=short_channel.strip() or "Brutally Honest Review",
+                    stamp_text=short_stamp.strip() or None,
+                    title_text=None,
+                    generate_thumbnail=bool(short_gen_thumb),
+                )
+            st.success(f"Short created: {short_out.name}")
+
+        if short_out.exists():
+            st.video(short_out.read_bytes(), format="video/mp4")
+
+        short_thumb = out_dir / "short_thumbnail.png"
+        if short_thumb.exists():
+            st.image(str(short_thumb), caption="short_thumbnail.png", width=360)
+
+        st.stop()
 
     if action is not None:
         thumbnail_only = action == "thumbnail_only"
