@@ -185,12 +185,35 @@ def create_youtube_short(
           flush=True)
 
     # Build ffmpeg filters
-    # Video: crop 9:16 centre → scale to 1080x1920 → speed up
-    vf = (
-        f"crop=ih*9/16:ih:(iw-ih*9/16)/2:0,"
-        f"scale=1080:1920:flags=lanczos,"
-        f"setpts=PTS/{speed:.4f}"
-    )
+    # Video: crop 9:16 centre -> scale to 1080x1920 -> speed up
+    vf_parts = [
+        f"crop=ih*9/16:ih:(iw-ih*9/16)/2:0",
+        f"scale=1080:1920:flags=lanczos",
+        f"setpts=PTS/{speed:.4f}",
+    ]
+
+    # Burn stamp text onto the video (bottom-centre, green with black outline).
+    _stamp = (stamp_text or "").strip()
+    if _stamp:
+        # Escape characters that are special in ffmpeg drawtext.
+        _st_esc = _stamp.replace("'", "\u2019").replace(":", "\\:")
+        # Font path — ffmpeg on Windows needs forward slashes and colon escaped.
+        _font = "C\\\\:/Windows/Fonts/impact.ttf"
+        _font_size = 100
+        # Position: centred horizontally, 86% down the frame.
+        _dt = (
+            f"drawtext=fontfile={_font}"
+            f":text='{_st_esc}'"
+            f":fontsize={_font_size}"
+            f":fontcolor=0x00C853"
+            f":borderw=8"
+            f":bordercolor=black"
+            f":x=(w-text_w)/2"
+            f":y=h*0.86-text_h/2"
+        )
+        vf_parts.append(_dt)
+
+    vf = ",".join(vf_parts)
 
     # Audio: atempo (chain if speed > 2.0)
     atempo_chain: list[str] = []
