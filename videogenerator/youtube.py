@@ -902,6 +902,8 @@ def _vision_verify_centered_person(
             "ok must be true ONLY if ALL are satisfied:\n"
             "- There is a clearly visible PERSON/CHARACTER as the dominant subject (not a landscape/object).\n"
             "- The person is near the center of the frame (roughly centered).\n"
+            "- The face is a CLOSE-UP (head/face fills a significant portion of the frame).\n"
+            "- The face shows an INTENSE or dramatic expression (anger, shock, determination, emotion) — NOT neutral/blank.\n"
             "- The face is visible (eyes visible) OR it is an obvious close-up of the person.\n"
             "- The face/head is NOT cut off by the frame edges (no missing forehead/chin/cheeks due to cropping).\n"
             "- Composition leaves headroom: the face/head should not be too high in frame (reserve space for a title at the top).\n"
@@ -997,7 +999,7 @@ def _crop_center_face(
     *,
     face_bbox: dict[str, float],
     target_ratio: float,
-    face_fill: float = 0.52,
+    face_fill: float = 0.62,
     headroom_frac: float = 0.18,
 ) -> dict[str, float]:
     """Compute a crop window that centers the face and leaves top headroom for title.
@@ -1073,8 +1075,10 @@ def pick_long_review_thumbnail_with_vision(
             score -= 2.0
         if any(k in q for k in ("still", "scene", "screencap", "frame", "cast")):
             score += 1.0
-        if any(k in q for k in ("close", "portrait", "face")):
-            score += 0.8
+        if any(k in q for k in ("close", "portrait", "face", "headshot")):
+            score += 1.2
+        if any(k in q for k in ("intense", "angry", "emotional", "dramatic", "expression", "stare", "scream", "crying")):
+            score += 1.0
         scored.append((i, score))
 
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -1105,14 +1109,17 @@ def pick_long_review_thumbnail_with_vision(
         "Follow these rules strictly:\n"
         "- The image MUST feature a clearly visible PERSON/CHARACTER as the dominant subject.\n"
         "- That person MUST be near the center of the frame (centered composition).\n"
-        "- Close-up is good; face/eyes should be visible; avoid tiny full-body shots.\n"
+        "- STRONGLY PREFER close-up shots showing the face/head filling most of the frame.\n"
+        "- The character should have an INTENSE, dramatic, or emotional facial expression "
+        "(e.g. anger, shock, determination, fear, pain). Avoid neutral/blank expressions.\n"
+        "- Face/eyes MUST be visible; avoid tiny full-body or wide shots.\n"
         "- Do NOT crop so tight that any part of the face/head is cut off. Leave a little breathing room.\n"
         "- Use ONLY one focal point (one person). Avoid crowds.\n"
         "- Avoid posters, collages, text-heavy images, logos.\n"
         "- Provide ONE strong text phrase (2-4 words max). Examples: 'WORTH IT?', 'SURPRISING', 'I WAS WRONG', 'BRUTAL'.\n"
         "Return ONLY valid JSON (no markdown).\n"
         "Schema: {\"index\": <int>, \"text\": <string>, \"crop\": {\"x\":<float>,\"y\":<float>,\"w\":<float>,\"h\":<float>}}\n"
-        "crop must be normalized [0,1] (top-left x,y + w,h) and should center the person/face in-frame."
+        "crop must be normalized [0,1] (top-left x,y + w,h) and should tightly frame the face/head with some breathing room."
     )
 
     def _pad_crop(c: dict[str, float] | None, *, pad_frac: float = 0.12) -> dict[str, float] | None:
