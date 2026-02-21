@@ -213,7 +213,7 @@ with col_left:
     st.subheader("3) Audio mix")
     bgm_preset = st.selectbox(
         "BGM preset",
-        options=["elevator", "ambient", "creepy", "hiphop", "rnb", "clown", "cylinder_five", "dark_walk", "(none)"],
+        options=["(none)", "elevator", "ambient", "creepy", "hiphop", "rnb", "clown", "cylinder_five", "dark_walk"],
         index=0,
     )
 
@@ -880,19 +880,6 @@ with col_right:
                 pass
 
             effective_bgm_preset = None if bgm_preset == "(none)" else bgm_preset
-            if vt == "review" and effective_bgm_preset is None:
-                try:
-                    from videogenerator.youtube import _fallback_verdict_label
-
-                    v = ""
-                    if pkg is not None:
-                        v = str(pkg.verdict_label or "").strip()
-                    if not v:
-                        v = _fallback_verdict_label(segments=segments)
-                    if v == "Garbage!":
-                        effective_bgm_preset = "clown"
-                except Exception:
-                    pass
 
             render_slideshow(
                 slides_to_render,

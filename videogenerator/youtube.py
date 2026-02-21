@@ -531,9 +531,11 @@ def create_thumbnail(
             im = im.resize((width, height), Image.Resampling.LANCZOS)
 
             # Slight contrast + darken for text legibility.
-            im = ImageEnhance.Contrast(im).enhance(1.05)
-            overlay = Image.new("RGB", (width, height), (0, 0, 0))
-            im = Image.blend(im, overlay, alpha=0.18)
+            # Skip for review_long — it applies its own darken pass.
+            if theme_norm != "review_long":
+                im = ImageEnhance.Contrast(im).enhance(1.05)
+                overlay = Image.new("RGB", (width, height), (0, 0, 0))
+                im = Image.blend(im, overlay, alpha=0.18)
 
         # If we already pre-cropped to (approximately) the target aspect, avoid an additional
         # cover-crop effect by just resizing to the output size.
@@ -546,22 +548,22 @@ def create_thumbnail(
         # Long review thumbnail: title + verdict stamp (reference-style), but with the
         # title slightly smaller to avoid dominating the frame.
         if theme_norm == "review_long":
-            # Darken aggressively for contrast.
-            im = ImageEnhance.Contrast(im).enhance(1.08)
+            # Darken for contrast — lighter than before since title is hidden by default.
+            im = ImageEnhance.Contrast(im).enhance(1.10)
             overlay = Image.new("RGB", (width, height), (0, 0, 0))
-            im = Image.blend(im, overlay, alpha=0.30)
+            im = Image.blend(im, overlay, alpha=0.15)
 
-            # Slight vignette for extra focus/contrast.
+            # Subtle vignette: draws attention to centre without over-darkening edges.
             try:
                 vignette = Image.new("L", (width, height), 0)
                 vd = ImageDraw.Draw(vignette)
-                pad_x = int(width * 0.08)
-                pad_y = int(height * 0.10)
+                pad_x = int(width * 0.10)
+                pad_y = int(height * 0.12)
                 vd.ellipse((pad_x, pad_y, width - pad_x, height - pad_y), fill=255)
                 vignette = vignette.filter(ImageFilter.GaussianBlur(radius=int(min(width, height) * 0.06)))
                 vignette = Image.eval(vignette, lambda a: 255 - a)
                 shade = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-                shade.putalpha(vignette.point(lambda a: int(a * 0.35)))
+                shade.putalpha(vignette.point(lambda a: int(a * 0.22)))
                 base = im.convert("RGBA")
                 base.alpha_composite(shade)
                 im = base.convert("RGB")
