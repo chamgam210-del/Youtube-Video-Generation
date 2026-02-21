@@ -274,6 +274,11 @@ with col_left:
         value="",
         help="If set, this exact phrase is used for the review thumbnail text (e.g. WORTH IT?, SURPRISINGLY GOOD).",
     )
+    show_channel_on_thumb = st.checkbox(
+        "Show channel name on thumbnail",
+        value=False,
+        help="When checked, draws the channel name (e.g. 'Brutally Honest Review') on the thumbnail.",
+    )
     thumbnail_title_override = st.text_input(
         "Thumbnail title (review override)",
         value="",
@@ -830,7 +835,7 @@ with col_right:
                         width=int(vid_w),
                         height=int(vid_h),
                         theme=("highlight" if vt in {"shorts"} else ("review_long" if vt == "review" else "default")),
-                        show_title=(True if vt == "review" else (vt not in {"shorts"})),
+                        show_title=(show_channel_on_thumb if vt == "review" else (vt not in {"shorts"})),
                         crop=(pkg.thumbnail_crop if (vt == "review" and pkg is not None) else None),
                     )
                 except Exception:
@@ -997,7 +1002,7 @@ with col_right:
                         stamp_text=(None if vt == "review" else pkg.thumbnail_stamp_text),
                         match_video_frame=False,
                         theme=("review_long" if vt == "review" else "default"),
-                        show_title=(True if vt == "review" else True),
+                        show_title=(show_channel_on_thumb if vt == "review" else True),
                         crop=(pkg.thumbnail_crop if vt == "review" else None),
                     )
 
