@@ -1067,23 +1067,39 @@ with col_right:
             if _vid_dur < 1.0:
                 _vid_dur = 600.0
 
-            fc1, fc2 = st.columns([3, 1])
+            _total_mins = int(_vid_dur) // 60
+            _total_secs = int(_vid_dur) % 60
+
+            fc1, fc2, fc3 = st.columns([2, 2, 1])
             with fc1:
-                frame_ts = st.slider(
-                    "Timestamp (seconds)",
-                    min_value=0.0,
-                    max_value=float(_vid_dur),
-                    value=min(5.0, float(_vid_dur)),
-                    step=0.1,
-                    key="frame_pick_ts",
+                frame_min = st.number_input(
+                    "Minutes",
+                    min_value=0,
+                    max_value=max(0, _total_mins),
+                    value=0,
+                    step=1,
+                    key="frame_pick_min",
                 )
             with fc2:
+                frame_sec = st.number_input(
+                    "Seconds",
+                    min_value=0.0,
+                    max_value=59.9,
+                    value=5.0,
+                    step=0.5,
+                    format="%.1f",
+                    key="frame_pick_sec",
+                )
+            with fc3:
                 frame_stamp_text = st.text_input(
                     "Stamp text",
                     value="",
                     key="frame_stamp_txt",
                     help="Verdict stamp to overlay (e.g. GARBAGE!). Leave blank for no stamp.",
                 )
+
+            frame_ts = float(frame_min) * 60.0 + float(frame_sec)
+            frame_ts = max(0.0, min(frame_ts, _vid_dur))
 
             if st.button("Extract frame & generate thumbnail", key="btn_frame_thumb"):
                 with st.spinner("Extracting frame..."):
