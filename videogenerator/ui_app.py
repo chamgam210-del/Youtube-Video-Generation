@@ -1038,6 +1038,96 @@ with col_right:
                 st.image(str(thumb), caption="thumbnail.png", width="stretch")
 
         # -------------------------------------------------------------------
+        # Thumbnail from video frame
+        # -------------------------------------------------------------------
+        if video_path.exists():
+            st.divider()
+            st.subheader("Thumbnail from video frame")
+            st.caption("Pick a timestamp from the video, extract that frame, and generate a thumbnail with the stamp overlaid.")
+
+            # Get video duration for slider range.
+            _vid_dur = 0.0
+            try:
+                import subprocess, re as _re
+                import imageio_ffmpeg
+                _ff = imageio_ffmpeg.get_ffmpeg_exe()
+                _probe = subprocess.run(
+                    [_ff, "-i", str(video_path), "-hide_banner"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                for _ln in (_probe.stderr or "").splitlines():
+                    if "Duration:" in _ln:
+                        _m = _re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", _ln)
+                        if _m:
+                            _vid_dur = int(_m.group(1)) * 3600 + int(_m.group(2)) * 60 + float(_m.group(3))
+                        break
+            except Exception:
+                _vid_dur = 600.0
+
+            if _vid_dur < 1.0:
+                _vid_dur = 600.0
+
+            fc1, fc2 = st.columns([3, 1])
+            with fc1:
+                frame_ts = st.slider(
+                    "Timestamp (seconds)",
+                    min_value=0.0,
+                    max_value=float(_vid_dur),
+                    value=min(5.0, float(_vid_dur)),
+                    step=0.1,
+                    key="frame_pick_ts",
+                )
+            with fc2:
+                frame_stamp_text = st.text_input(
+                    "Stamp text",
+                    value="",
+                    key="frame_stamp_txt",
+                    help="Verdict stamp to overlay (e.g. GARBAGE!). Leave blank for no stamp.",
+                )
+
+            if st.button("Extract frame & generate thumbnail", key="btn_frame_thumb"):
+                with st.spinner("Extracting frame..."):
+                    try:
+                        import subprocess
+                        import imageio_ffmpeg
+                        _ff = imageio_ffmpeg.get_ffmpeg_exe()
+
+                        frame_img = out_dir / "_thumb_frame.png"
+                        subprocess.run(
+                            [
+                                _ff, "-y",
+                                "-ss", f"{float(frame_ts):.3f}",
+                                "-i", str(video_path),
+                                "-frames:v", "1",
+                                "-q:v", "2",
+                                str(frame_img),
+                            ],
+                            capture_output=True, timeout=30,
+                            check=True,
+                        )
+
+                        if not frame_img.exists():
+                            st.error("Failed to extract frame.")
+                        else:
+                            stamp = (frame_stamp_text or "").strip() or None
+                            thumb_out = out_dir / "thumbnail.png"
+                            create_thumbnail(
+                                out_path=thumb_out,
+                                background_image=frame_img,
+                                text="Brutally Honest Review",
+                                verdict_text=stamp,
+                                stamp_text=None,
+                                match_video_frame=False,
+                                theme="review_long",
+                                show_title=False,
+                                crop=None,
+                            )
+                            st.success(f"Thumbnail saved: {thumb_out.name}")
+                            st.image(str(thumb_out), caption="thumbnail.png (from frame)", use_container_width=True)
+                    except Exception as exc:
+                        st.error(f"Frame extraction failed: {exc}")
+
+        # -------------------------------------------------------------------
         # YouTube Short creation
         # -------------------------------------------------------------------
         if video_path.exists():
