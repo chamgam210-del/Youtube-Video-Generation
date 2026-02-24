@@ -566,6 +566,21 @@ def run(
         )
         planned = [(s.start, s.end, "", "", None) for s in picked]
 
+    # ── Guardrail: enforce min_seg_seconds as a hard floor on slide durations ──
+    # Merge any planned slide shorter than the user's minimum into its neighbor.
+    if planned and vt not in {"shorts_review"} and min_seg_seconds > 0:
+        enforced: list[tuple[float, float, str, str, str | None]] = []
+        for st, en, q, h, sh in planned:
+            dur = float(en) - float(st)
+            if dur < float(min_seg_seconds) and enforced:
+                # Absorb into the previous slide (extend its end time).
+                prev = enforced[-1]
+                enforced[-1] = (prev[0], float(en), prev[2], prev[3], prev[4])
+            else:
+                enforced.append((float(st), float(en), q, h, sh))
+        if enforced:
+            planned = enforced
+
     # Shorts Review heuristic fallback: strictly keep a fast cadence by respacing the plan.
     # (LLM shorts_review schema path above bypasses this.)
     if vt == "shorts_review" and merged and audio_duration > 0 and not planned_motion:
