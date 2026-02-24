@@ -168,3 +168,148 @@ def suggest_video_clips(
         cleaned.append(s)
 
     return cleaned[:max_clips]
+
+
+def suggest_full_coverage_clips(
+    segments: list[TranscriptSegment],
+    *,
+    topic: str | None = None,
+    title: str | None = None,
+    audio_duration: float = 0.0,
+    target_clip_seconds: float = 8.0,
+    model: str = "gpt-4o-mini",
+) -> list[VideoClipSuggestion]:
+    """Generate clip suggestions that cover the ENTIRE timeline for clip_review format.
+
+    Unlike ``suggest_video_clips`` (which picks a few highlight spots), this function
+    asks the LLM to segment the whole review into consecutive clips — one per idea —
+    so every second of the video is covered by a relevant, muted movie clip.
+
+    Returns a list of non-overlapping ``VideoClipSuggestion`` sorted by timeline_start,
+    spanning [0, audio_duration].
+    """
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return []
+
+    if not segments:
+        return []
+
+    # Build a compact transcript representation.
+    transcript_lines: list[str] = []
+    for s in segments:
+        transcript_lines.append(f"[{s.start:.1f}-{s.end:.1f}] {s.text}")
+    transcript_text = "\n".join(transcript_lines)
+
+    if len(transcript_text) > 14000:
+        transcript_text = transcript_text[:14000] + "\n... (truncated)"
+
+    dur = max(1.0, float(audio_duration))
+    approx_clips = max(3, int(round(dur / target_clip_seconds)))
+
+    system = (
+        "You are a professional video editor creating a SHORT-FORMAT movie review video.\n"
+        "The host's review audio plays continuously over MUTED video clips from the movie.\n"
+        "Your job is to divide the ENTIRE review into consecutive clip segments so that\n"
+        "every second of the video shows a relevant clip from the movie/show being reviewed.\n\n"
+        "RULES:\n"
+        f"- Divide the full duration (0 to {dur:.1f}s) into approximately {approx_clips} consecutive segments.\n"
+        "- Each segment should be 4-15 seconds long.\n"
+        "- Segments must be CONSECUTIVE: segment N's end == segment N+1's start. No gaps.\n"
+        "- The first segment starts at 0.0 and the last ends at the audio duration.\n"
+        "- For each segment, provide a specific YouTube search query to find a relevant movie clip.\n"
+        "  Include the movie/show name + what scene/moment to show (e.g. 'Predator Badlands fight scene').\n"
+        "- Match the clip to what the host is DISCUSSING in that segment of the review.\n"
+        "- All clips will be MUTED (the host's voice plays over them).\n"
+        "- Vary the clips: use trailer moments, key scenes, action sequences, emotional beats,\n"
+        "  behind-the-scenes footage, cast interviews — whatever matches the discussion.\n\n"
+        "Return ONLY valid JSON (no markdown). Schema:\n"
+        '[\n  {"start": <float>, "end": <float>, "search_query": "<string>", '
+        '"reason": "<string>"}\n]\n'
+        "where start/end are seconds into the commentary audio."
+    )
+
+    user_content = {
+        "topic": (topic or "").strip(),
+        "title": (title or "").strip(),
+        "audio_duration": round(dur, 1),
+        "transcript": transcript_text,
+    }
+
+    content = _openai_chat_completions(
+        api_key=api_key,
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user_content, ensure_ascii=False)},
+        ],
+        timeout_s=120,
+    )
+
+    parsed = json.loads(content)
+    if not isinstance(parsed, list):
+        return []
+
+    suggestions: list[VideoClipSuggestion] = []
+    for item in parsed:
+        try:
+            start = float(item["start"])
+            end = float(item["end"])
+            query = str(item.get("search_query") or "").strip()
+            reason = str(item.get("reason") or "").strip()
+
+            if end <= start + 1.0:
+                continue
+            if not query:
+                continue
+
+            suggestions.append(
+                VideoClipSuggestion(
+                    timeline_start=start,
+                    timeline_end=end,
+                    search_query=query,
+                    reason=reason,
+                    mute=True,  # always muted for clip_review
+                )
+            )
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    suggestions.sort(key=lambda s: s.timeline_start)
+
+    # Fix gaps: make each segment's end == next segment's start.
+    for i in range(len(suggestions) - 1):
+        s = suggestions[i]
+        nxt = suggestions[i + 1]
+        if abs(s.timeline_end - nxt.timeline_start) > 0.5:
+            suggestions[i] = VideoClipSuggestion(
+                timeline_start=s.timeline_start,
+                timeline_end=nxt.timeline_start,
+                search_query=s.search_query,
+                reason=s.reason,
+                mute=True,
+            )
+
+    # Ensure first starts at 0 and last ends at duration.
+    if suggestions:
+        s0 = suggestions[0]
+        if s0.timeline_start > 0.5:
+            suggestions[0] = VideoClipSuggestion(
+                timeline_start=0.0,
+                timeline_end=s0.timeline_end,
+                search_query=s0.search_query,
+                reason=s0.reason,
+                mute=True,
+            )
+        sn = suggestions[-1]
+        if sn.timeline_end < dur - 0.5:
+            suggestions[-1] = VideoClipSuggestion(
+                timeline_start=sn.timeline_start,
+                timeline_end=dur,
+                search_query=sn.search_query,
+                reason=sn.reason,
+                mute=True,
+            )
+
+    return suggestions

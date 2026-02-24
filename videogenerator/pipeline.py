@@ -193,7 +193,7 @@ def run(
         segments = [segments[0].__class__(start=0.0, end=audio_duration, text=segments[0].text)]
 
     vt = (video_type or "review").strip().lower()
-    if vt not in {"review", "explainer", "shorts", "shorts_review", "commentary", "auto"}:
+    if vt not in {"review", "explainer", "shorts", "shorts_review", "commentary", "clip_review", "auto"}:
         vt = "review"
 
     # Shorts Review determines its own beat count from audio duration.
@@ -250,7 +250,7 @@ def run(
     # For non-review videos, we want a stable topic hint to keep image searches on the right subject.
     effective_topic: str | None = (topic or "").strip() or None
     topic_type: str | None = None
-    if vt in {"explainer", "shorts", "shorts_review", "commentary", "auto"} and not effective_topic:
+    if vt in {"explainer", "shorts", "shorts_review", "commentary", "clip_review", "auto"} and not effective_topic:
         if use_llm:
             try:
                 from .llm_storyboard import infer_topic_with_llm
@@ -268,7 +268,7 @@ def run(
             topic_type = inferred.topic_type
 
     # Heuristic: if transcript strongly suggests TV content, treat as tv_show.
-    if vt in {"explainer", "shorts", "shorts_review", "commentary"} and (topic_type is None or topic_type == "other"):
+    if vt in {"explainer", "shorts", "shorts_review", "commentary", "clip_review"} and (topic_type is None or topic_type == "other"):
         try:
             tail = " ".join(s.text for s in merged[-25:]).lower()
         except Exception:
@@ -1892,6 +1892,190 @@ def run(
             ])
         except Exception as exc:
             # Video clip mixing is best-effort; don't fail the whole pipeline.
+            import traceback
+            traceback.print_exc()
+
+    # ── Clip-review: fill EVERY slide with muted movie clips (OVERLAY, no pauses) ──
+    if vt == "clip_review":
+        try:
+            from .clip_suggestions import suggest_full_coverage_clips
+            from .clip_tools import (
+                prepare_clip_for_suggestion as _prep_cr,
+                get_video_duration as _clip_dur_cr,
+                PreparedClip as _PC_cr,
+            )
+
+            _use_research_cr = clip_research
+            if _use_research_cr:
+                from .clip_researcher import research_and_prepare_clip as _prep_research_cr
+                print("[pipeline] clip_review: using AGENTIC clip research")
+
+            clip_dir = ensure_dir(out_dir / "clips")
+
+            cr_suggestions = suggest_full_coverage_clips(
+                segments=segments,
+                topic=effective_topic or audio_path.stem,
+                title=audio_path.stem,
+                audio_duration=timeline_duration,
+                target_clip_seconds=8.0,
+                model=llm_model,
+            )
+            print(f"[pipeline] clip_review: {len(cr_suggestions)} clip segments covering {timeline_duration:.1f}s")
+
+            write_json(out_dir / "clip_review_suggestions.json", [
+                {"timeline_start": s.timeline_start, "timeline_end": s.timeline_end,
+                 "search_query": s.search_query, "reason": s.reason, "mute": s.mute}
+                for s in cr_suggestions
+            ])
+
+            # Download and prepare each clip.
+            cr_prepared: list[_PC_cr] = []
+            _seen_cr_urls: set[str] = set()
+            for ci, sug in enumerate(cr_suggestions):
+                try:
+                    if _use_research_cr:
+                        ctx_start = max(0.0, sug.timeline_start - 15)
+                        ctx_end = sug.timeline_end + 15
+                        ctx_lines = [
+                            f"[{s.start:.1f}-{s.end:.1f}] {s.text}"
+                            for s in segments
+                            if s.start >= ctx_start and s.end <= ctx_end
+                        ]
+                        transcript_ctx = "\n".join(ctx_lines)
+                        pcs = _prep_research_cr(
+                            sug,
+                            dest_dir=clip_dir,
+                            clip_index=ci,
+                            width=video_width,
+                            height=video_height,
+                            topic=effective_topic or audio_path.stem,
+                            transcript_context=transcript_ctx,
+                            llm_model="gpt-4o",
+                            seen_urls=_seen_cr_urls,
+                            max_scrape_pages=5,
+                            max_clips=1,
+                        )
+                        if pcs:
+                            cr_prepared.append(pcs[0])
+                    else:
+                        pc = _prep_cr(
+                            sug,
+                            dest_dir=clip_dir,
+                            clip_index=ci,
+                            width=video_width,
+                            height=video_height,
+                            llm_model=llm_model,
+                            sort_by_views=True,
+                            mode="review",
+                            seen_urls=_seen_cr_urls,
+                        )
+                        if pc is not None:
+                            cr_prepared.append(pc)
+                except Exception:
+                    import traceback; traceback.print_exc()
+
+            print(f"[pipeline] clip_review: {len(cr_prepared)}/{len(cr_suggestions)} clips downloaded")
+
+            # OVERLAY mode: replace every slide with the matching video clip.
+            # Each prepared clip covers a timeline range — find the overlapping slides
+            # and assign the clip.  Unlike commentary INSERT mode, the timeline stays
+            # unchanged; narration continues uninterrupted.
+            cr_prepared.sort(key=lambda p: p.timeline_start)
+
+            # Rebuild the slide list so that every time range is covered by a clip.
+            new_slides: list[Slide] = []
+            for pc in cr_prepared:
+                actual_dur = _clip_dur_cr(pc.path)
+                if actual_dur <= 0:
+                    actual_dur = pc.timeline_end - pc.timeline_start
+                clip_dur = min(actual_dur, pc.timeline_end - pc.timeline_start)
+
+                # Find an existing slide that overlaps this clip time range to
+                # inherit image_path (used as fallback poster if clip fails).
+                fallback_slide = slides[0] if slides else None
+                for sl in slides:
+                    if sl.start < pc.timeline_end and sl.end > pc.timeline_start:
+                        fallback_slide = sl
+                        break
+
+                fb = fallback_slide or slides[0]
+                new_slides.append(Slide(
+                    start=pc.timeline_start,
+                    end=pc.timeline_start + clip_dur,
+                    image_path=fb.image_path, query=fb.query,
+                    headline=fb.headline, subhead=fb.subhead,
+                    source_page=fb.source_page, image_url=fb.image_url,
+                    license_name=fb.license_name, license_url=fb.license_url,
+                    attribution=fb.attribution, motion=fb.motion,
+                    window_text=fb.window_text, window_keywords=fb.window_keywords,
+                    queries_tried=fb.queries_tried,
+                    video_clip_path=str(pc.path),
+                    video_clip_start=0.0,
+                    video_clip_end=clip_dur,
+                    video_clip_mute=True,
+                ))
+
+            # Fill any gaps between prepared clips with image slides from the
+            # original list so there's never a blank screen.
+            if new_slides:
+                gap_fills: list[Slide] = []
+                # Gap before first clip.
+                if new_slides[0].start > 0.5:
+                    fb = slides[0] if slides else new_slides[0]
+                    gap_fills.append(Slide(
+                        start=0.0, end=new_slides[0].start,
+                        image_path=fb.image_path, query=fb.query,
+                        headline=fb.headline, subhead=fb.subhead,
+                        source_page=fb.source_page, image_url=fb.image_url,
+                        license_name=fb.license_name, license_url=fb.license_url,
+                        attribution=fb.attribution, motion=fb.motion,
+                        window_text=fb.window_text, window_keywords=fb.window_keywords,
+                        queries_tried=fb.queries_tried,
+                    ))
+                # Gaps between consecutive clips.
+                for i in range(len(new_slides) - 1):
+                    gap_start = new_slides[i].end
+                    gap_end = new_slides[i + 1].start
+                    if gap_end - gap_start > 0.5:
+                        fb = slides[0] if slides else new_slides[i]
+                        gap_fills.append(Slide(
+                            start=gap_start, end=gap_end,
+                            image_path=fb.image_path, query=fb.query,
+                            headline=fb.headline, subhead=fb.subhead,
+                            source_page=fb.source_page, image_url=fb.image_url,
+                            license_name=fb.license_name, license_url=fb.license_url,
+                            attribution=fb.attribution, motion=fb.motion,
+                            window_text=fb.window_text, window_keywords=fb.window_keywords,
+                            queries_tried=fb.queries_tried,
+                        ))
+                # Gap after last clip.
+                if new_slides[-1].end < timeline_duration - 0.5:
+                    fb = slides[-1] if slides else new_slides[-1]
+                    gap_fills.append(Slide(
+                        start=new_slides[-1].end, end=timeline_duration,
+                        image_path=fb.image_path, query=fb.query,
+                        headline=fb.headline, subhead=fb.subhead,
+                        source_page=fb.source_page, image_url=fb.image_url,
+                        license_name=fb.license_name, license_url=fb.license_url,
+                        attribution=fb.attribution, motion=fb.motion,
+                        window_text=fb.window_text, window_keywords=fb.window_keywords,
+                        queries_tried=fb.queries_tried,
+                    ))
+                new_slides.extend(gap_fills)
+                new_slides.sort(key=lambda s: s.start)
+
+            if new_slides:
+                slides = new_slides
+                print(f"[pipeline] clip_review: {len(slides)} total slides (clips + gap fills)")
+
+            write_json(out_dir / "prepared_clips.json", [
+                {"path": str(pc.path), "timeline_start": pc.timeline_start,
+                 "timeline_end": pc.timeline_end, "source_url": pc.source_url,
+                 "source_title": pc.source_title, "search_query": pc.search_query,
+                 "muted": pc.muted}
+                for pc in cr_prepared
+            ])
+        except Exception:
             import traceback
             traceback.print_exc()
 

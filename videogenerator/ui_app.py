@@ -148,21 +148,21 @@ with col_left:
 
     video_type = st.selectbox(
         "Video type",
-        options=["review (images only)", "explainer (text + images)", "commentary (clip insertion)", "shorts (9:16)", "shorts review (9:16, retention)", "auto"],
+        options=["review (images only)", "explainer (text + images)", "commentary (clip insertion)", "clip review (9:16, full clips)", "shorts (9:16)", "shorts review (9:16, retention)", "auto"],
         index=0,
-        help="Explainer/shorts use LLM-planned text-on-slide storyboards. Commentary auto-inserts referenced clips and compilations.",
+        help="Explainer/shorts use LLM-planned text-on-slide storyboards. Commentary auto-inserts referenced clips and compilations. Clip review fills entire video with muted movie clips.",
     )
 
     # When creating Shorts, retention usually improves with faster cuts and more images.
     # We set dynamic defaults when the user switches video_type.
     last_vt = st.session_state.get("_last_video_type")
     if last_vt != video_type:
-        if video_type.startswith("shorts"):
+        if video_type.startswith("shorts") or video_type.startswith("clip review"):
             st.session_state["max_images_slider"] = 20
             st.session_state["min_seg_seconds_slider"] = 1.8
             st.session_state["transition_sel"] = "none"
             st.session_state["transition_seconds_slider"] = 0.0
-            # Shorts should start immediately; no intro/outro branding.
+            # Shorts / clip review should start immediately; no intro/outro branding.
             st.session_state["intro_seconds_slider"] = 0.0
             st.session_state["outro_seconds_slider"] = 0.0
         else:
@@ -537,6 +537,8 @@ with col_right:
             vt = "explainer"
         elif video_type.startswith("commentary"):
             vt = "commentary"
+        elif video_type.startswith("clip review"):
+            vt = "clip_review"
         elif video_type.startswith("shorts review"):
             vt = "shorts_review"
         elif video_type.startswith("shorts"):
@@ -546,14 +548,14 @@ with col_right:
 
         # Render sizing preset.
         vid_w, vid_h = (1920, 1080)
-        if vt in {"shorts", "shorts_review"}:
+        if vt in {"shorts", "shorts_review", "clip_review"}:
             vid_w, vid_h = (1080, 1920)
 
         # Shorts defaults: no transitions.
         run_max_images = int(max_images) if max_images is not None else None
         run_transition = transition
         run_transition_seconds = float(transition_seconds)
-        if vt in {"shorts", "shorts_review"}:
+        if vt in {"shorts", "shorts_review", "clip_review"}:
             run_transition = "none"
             run_transition_seconds = 0.0
 
@@ -672,8 +674,8 @@ with col_right:
             intro_s = max(0.0, float(intro_seconds))
             outro_s = max(0.0, float(outro_seconds))
 
-            # Shorts: no channel intro/outro branding slates.
-            if vt == "shorts":
+            # Shorts / clip_review: no channel intro/outro branding slates.
+            if vt in {"shorts", "clip_review"}:
                 intro_s = 0.0
                 outro_s = 0.0
 
@@ -682,7 +684,7 @@ with col_right:
                 intro_s = 1.6
                 outro_s = 0.0
 
-            if (vt not in {"shorts", "shorts_review"}) and (intro_s > 0.0 or outro_s > 0.0):
+            if (vt not in {"shorts", "shorts_review", "clip_review"}) and (intro_s > 0.0 or outro_s > 0.0):
                 try:
                     from videogenerator.branding import create_branding_assets
 
