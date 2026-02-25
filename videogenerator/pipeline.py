@@ -541,6 +541,8 @@ def run(
             # Guardrail: if the LLM produced FAR fewer slides than requested
             # (e.g. 3 for a 5-minute audio when max_images=12), expand by evenly
             # distributing heuristic buckets and cycling the LLM queries.
+            # We clear the cycled query for expanded slides so they rely on
+            # per-slide transcript keywords + visual suffix rotation (diversity).
             if planned and audio_duration > 0 and vt not in {"shorts_review"}:
                 _min_slides = max(int(min_images), max(4, int(audio_duration / 60)))  # at least 1 per minute
                 target = max(_min_slides, min(max_images, int(audio_duration / 30)))
@@ -550,7 +552,10 @@ def run(
                     expanded: list[tuple[float, float, str, str, str | None]] = []
                     for i, b in enumerate(buckets):
                         src = planned[i % len(planned)]
-                        expanded.append((float(b.start), float(b.end), src[2], src[3], src[4]))
+                        # Clear the LLM query for slides beyond the original set
+                        # so they don't all repeat the same search query.
+                        q = src[2] if i < len(planned) else ""
+                        expanded.append((float(b.start), float(b.end), q, src[3], src[4]))
                     planned = expanded
         except Exception:
             if storyboard == "llm":
@@ -957,6 +962,54 @@ def run(
     # Shorts Review: burn text only for the 2–3 emphasis beats (hook/pivot/cta).
     burn_in_text_cards = bool(vt == "shorts_review")
 
+    # ── Portrait image pre-processing: blur-behind composite ──
+    _is_portrait_output = int(video_height) > int(video_width) * 1.1
+
+    def _preprocess_portrait_image(src_path: str, *, prefix: str) -> str:
+        """For portrait output with landscape source images, create a blur-behind
+        composite so that the full image is visible (no face/body cutoff).
+        Returns the path to the preprocessed image, or *src_path* unchanged."""
+        if not _is_portrait_output:
+            return src_path
+        try:
+            from PIL import Image, ImageEnhance, ImageFilter
+
+            img = Image.open(src_path).convert("RGB")
+            src_w, src_h = img.size
+            if src_w <= 0 or src_h <= 0:
+                return src_path
+            src_ratio = src_w / src_h
+            tgt_ratio = int(video_width) / max(1, int(video_height))
+            # Only composite when mismatch is extreme (landscape src → portrait out).
+            if src_ratio / max(0.01, tgt_ratio) < 1.4:
+                return src_path
+
+            tw, th = int(video_width), int(video_height)
+
+            # Background: scale to fill target, blur + darken.
+            bg_scale = max(tw / src_w, th / src_h)
+            bg_w, bg_h = int(src_w * bg_scale + 0.5), int(src_h * bg_scale + 0.5)
+            bg = img.resize((bg_w, bg_h), Image.LANCZOS)
+            bx, by = (bg_w - tw) // 2, (bg_h - th) // 2
+            bg = bg.crop((bx, by, bx + tw, by + th))
+            bg = bg.filter(ImageFilter.GaussianBlur(radius=30))
+            bg = ImageEnhance.Brightness(bg).enhance(0.35)
+
+            # Foreground: scale to fit (fully visible, no cropping).
+            fg_scale = min(tw / src_w, th / src_h)
+            fg_w, fg_h = int(src_w * fg_scale + 0.5), int(src_h * fg_scale + 0.5)
+            fg = img.resize((fg_w, fg_h), Image.LANCZOS)
+            fx, fy = (tw - fg_w) // 2, (th - fg_h) // 2
+
+            canvas = bg.copy()
+            canvas.paste(fg, (fx, fy))
+
+            out_path = str(assets_dir / f"{prefix}_portrait.jpg")
+            canvas.save(out_path, quality=95)
+            return out_path
+        except Exception:
+            return src_path
+
     def _hash_file(path_str: str) -> str:
         b = Path(path_str).read_bytes()
         return hashlib.sha256(b).hexdigest()
@@ -1012,7 +1065,11 @@ def run(
             # Prefer aspect ratios closer to the output video frame.
             if w > 0 and h > 0 and target_ratio > 0:
                 aspect = w / h
-                score -= abs(math.log(max(1e-6, aspect / target_ratio)))
+                ratio_penalty = abs(math.log(max(1e-6, aspect / target_ratio)))
+                # For portrait output, heavily penalize landscape images (extreme crop).
+                if _is_portrait_output and aspect > 1.2:
+                    ratio_penalty *= 2.5
+                score -= ratio_penalty
 
             title = str(c.get("title") or "")
             page = str(c.get("page_url") or "")
@@ -1621,7 +1678,8 @@ def run(
 
         # Secondary query: LLM-suggested hints, but still anchored.
         q_llm = q_llm_raw
-        if vt in {"explainer", "shorts", "shorts_review"} and anchor:
+        _anchor_llm = vt in {"explainer", "shorts", "shorts_review"} or (vt == "review" and _is_portrait_output)
+        if _anchor_llm and anchor:
             if q_llm:
                 if anchor.lower() not in q_llm.lower():
                     q_llm = f"{anchor} {q_llm}".strip()
@@ -1629,18 +1687,25 @@ def run(
                 q_llm = ""
 
         # If this looks like TV content, bias toward episode stills/cast.
-        if vt in {"explainer", "shorts", "shorts_review"} and (topic_type == "tv_show"):
+        _tv_enrich = vt in {"explainer", "shorts", "shorts_review"} or (vt == "review" and _is_portrait_output)
+        if _tv_enrich and (topic_type == "tv_show"):
             if q_context and not any(k in q_context.lower() for k in ("still", "stills", "cast", "scene", "episode")):
                 q_context = f"{q_context} TV series scene still".strip()
             if q_llm and not any(k in q_llm.lower() for k in ("still", "stills", "cast", "scene", "episode")):
                 q_llm = f"{q_llm} TV series scene still".strip()
 
-        # Shorts Review: bias toward in-scene imagery.
-        if vt == "shorts_review":
-            if q_context and not any(k in q_context.lower() for k in ("still", "stills", "scene", "screencap", "frame")):
-                q_context = f"{q_context} scene still".strip()
-            if q_context and not any(k in q_context.lower() for k in ("close", "portrait", "face")):
-                q_context = f"{q_context} close up".strip()
+        # Shorts Review or portrait-review: bias toward in-scene imagery.
+        _enrich_queries = (vt == "shorts_review") or (vt == "review" and _is_portrait_output)
+        if _enrich_queries:
+            # Rotate visual suffixes per slide to encourage image variety.
+            _VISUAL_SUFFIXES = [
+                "scene still", "character close up", "cinematic frame",
+                "dramatic moment", "promotional still", "behind the scenes",
+                "cast photo", "key scene", "portrait shot", "wide shot",
+            ]
+            _suffix = _VISUAL_SUFFIXES[i % len(_VISUAL_SUFFIXES)]
+            if q_context and not any(k in q_context.lower() for k in ("still", "stills", "scene", "screencap", "frame", "close", "portrait", "wide", "cinematic")):
+                q_context = f"{q_context} {_suffix}".strip()
 
             # Avoid posters for non-emphasis beats; use scene stills instead.
             if not (is_hook or is_cta):
@@ -1739,6 +1804,8 @@ def run(
             info = last_info
 
         raw_image_path = str(image_path)
+        # Portrait pre-processing: create blur-behind composite to avoid face/body cutoff.
+        raw_image_path = _preprocess_portrait_image(raw_image_path, prefix=f"s{i:02d}")
         last_image_path = raw_image_path
         if headline_key:
             last_headline_key = headline_key
