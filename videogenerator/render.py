@@ -878,6 +878,7 @@ def render_slideshow(
     transition: str | None = "fade",
     transition_seconds: float = 0.35,
     ken_burns: bool = False,
+    subtitle_path: str | Path | None = None,
 ) -> None:
     if not slides:
         raise ValueError("No slides to render")
@@ -1055,15 +1056,20 @@ def render_slideshow(
             ]
 
         # Output options (must come after all inputs).
+        vf_chain = (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height}:(in_w-out_w)/2:(in_h-out_h)/2,"
+            "setsar=1,format=yuv420p"
+        )
+        # Overlay ASS subtitles (animated captions) if provided.
+        if subtitle_path and Path(subtitle_path).exists():
+            ass_escaped = str(Path(subtitle_path).resolve()).replace("\\", "/").replace(":", "\\:")
+            vf_chain += f",ass='{ass_escaped}'"
         cmd += [
             "-fps_mode",
             "cfr",
             "-vf",
-            (
-                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height}:(in_w-out_w)/2:(in_h-out_h)/2,"
-                "setsar=1,format=yuv420p"
-            ),
+            vf_chain,
             "-r",
             str(fps),
             "-pix_fmt",
@@ -1214,7 +1220,14 @@ def render_slideshow(
             v_filters.append(chain)
             v_labels.append(f"[{base_label}]")
 
-        v_filters.append("".join(v_labels) + f"concat=n={len(v_labels)}:v=1:a=0[vout]")
+        # Concat all video segments.
+        if subtitle_path and Path(subtitle_path).exists():
+            # Route through ASS overlay: concat → [vpre] → ass → [vout]
+            ass_escaped = str(Path(subtitle_path).resolve()).replace("\\", "/").replace(":", "\\:")
+            v_filters.append("".join(v_labels) + f"concat=n={len(v_labels)}:v=1:a=0[vpre]")
+            v_filters.append(f"[vpre]ass='{ass_escaped}'[vout]")
+        else:
+            v_filters.append("".join(v_labels) + f"concat=n={len(v_labels)}:v=1:a=0[vout]")
 
         # ── Compute clip timeline ranges (for ducking narrator during clips) ──
         clip_ranges: list[tuple[float, float, int, bool]] = []  # (tl_start, tl_dur, input_idx, muted)

@@ -65,10 +65,10 @@ def _decode_audio_to_float32_mono_16k(audio_path: str | Path) -> np.ndarray:
     return audio
 
 
-def transcribe_with_whisper(audio_path: str | Path, model_name: str = "small") -> list[TranscriptSegment]:
+def transcribe_with_whisper(audio_path: str | Path, model_name: str = "small") -> tuple[list[TranscriptSegment], list[dict]]:
     """Transcribe using local Whisper (openai-whisper).
 
-    Returns segment-level timestamps (start/end) which are sufficient for image timing.
+    Returns (segments, words) where *words* contains per-word timestamps.
     """
 
     try:
@@ -81,8 +81,9 @@ def transcribe_with_whisper(audio_path: str | Path, model_name: str = "small") -
     model = whisper.load_model(model_name)
 
     audio = _decode_audio_to_float32_mono_16k(audio_path)
-    result = model.transcribe(audio, fp16=False)
+    result = model.transcribe(audio, fp16=False, word_timestamps=True)
     segments: list[TranscriptSegment] = []
+    all_words: list[dict] = []
 
     for seg in result.get("segments", []) or []:
         start = float(seg.get("start", 0.0))
@@ -93,6 +94,13 @@ def transcribe_with_whisper(audio_path: str | Path, model_name: str = "small") -
         if end <= start:
             continue
         segments.append(TranscriptSegment(start=start, end=end, text=text))
+        # Collect word-level timestamps.
+        for w in seg.get("words", []) or []:
+            all_words.append({
+                "word": str(w.get("word", "")),
+                "start": float(w.get("start", 0.0)),
+                "end": float(w.get("end", 0.0)),
+            })
 
     if not segments:
         text = str(result.get("text", "")).strip()
@@ -100,7 +108,7 @@ def transcribe_with_whisper(audio_path: str | Path, model_name: str = "small") -
             # Fallback: single segment with unknown end (caller may expand)
             segments.append(TranscriptSegment(start=0.0, end=0.0, text=text))
 
-    return segments
+    return segments, all_words
 
 
 def transcribe_cached(
@@ -158,7 +166,7 @@ def transcribe_cached(
             # Cache read/parse errors fall back to fresh transcription.
             pass
 
-    segments = transcribe_with_whisper(audio_path, model_name=model_name)
+    segments, words = transcribe_with_whisper(audio_path, model_name=model_name)
 
     if use_cache:
         payload = {
@@ -171,6 +179,7 @@ def transcribe_cached(
                 "created_at": datetime.now(timezone.utc).isoformat(),
             },
             "segments": [asdict(s) for s in segments],
+            "words": words,
         }
         write_json(cache_path, payload)
 
@@ -195,3 +204,16 @@ def write_transcript_files(
     txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     return json_path, txt_path
+
+
+def get_transcript_cache_path(
+    audio_path: str | Path,
+    *,
+    model_name: str = "small",
+    cache_dir: str | Path = ".cache/transcripts",
+) -> Path:
+    """Return the cache JSON path for a given audio file (may or may not exist)."""
+    audio_path = Path(audio_path)
+    cache_dir = Path(cache_dir)
+    cache_key = sanitize_filename(f"{audio_path.stem}.{model_name}")
+    return cache_dir / f"{cache_key}.json"

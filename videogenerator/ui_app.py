@@ -232,6 +232,12 @@ with col_left:
         key="transition_seconds_slider",
     )
 
+    animated_captions = st.checkbox(
+        "Animated captions (word-by-word)",
+        value=video_type.startswith("short review"),
+        help="Overlay word-by-word highlighted captions (CapCut style). Best for 9:16 shorts.",
+    )
+
     st.subheader("3) Audio mix")
     bgm_preset = st.selectbox(
         "BGM preset",
@@ -910,6 +916,41 @@ with col_right:
 
             effective_bgm_preset = None if bgm_preset == "(none)" else bgm_preset
 
+            # ── Generate animated captions (ASS subtitles) if enabled ──
+            caption_ass_path: Path | None = None
+            if animated_captions:
+                try:
+                    from videogenerator.captions import (
+                        extract_words_from_whisper_cache,
+                        generate_ass_captions,
+                        words_from_segments_fallback,
+                    )
+                    from videogenerator.transcribe import get_transcript_cache_path
+
+                    cache_path = get_transcript_cache_path(saved_audio, model_name="small")
+                    word_data = extract_words_from_whisper_cache(cache_path)
+                    if not word_data:
+                        # Fallback: approximate words from segment-level transcript.
+                        transcript_json = out_dir / "transcript.json"
+                        if transcript_json.exists():
+                            import json as _json
+                            seg_data = _json.loads(transcript_json.read_text(encoding="utf-8"))
+                            word_data = words_from_segments_fallback(seg_data)
+
+                    if word_data:
+                        caption_ass_path = out_dir / "captions.ass"
+                        generate_ass_captions(
+                            word_data,
+                            caption_ass_path,
+                            width=int(vid_w),
+                            height=int(vid_h),
+                            style="pop",
+                        )
+                        st.caption(f"Generated animated captions ({len(word_data)} words)")
+                except Exception as _cap_err:
+                    st.warning(f"Could not generate captions: {_cap_err}")
+                    caption_ass_path = None
+
             render_slideshow(
                 slides_to_render,
                 str(audio_for_render),
@@ -927,6 +968,7 @@ with col_right:
                 transition=None if run_transition == "none" else run_transition,
                 transition_seconds=float(run_transition_seconds),
                 ken_burns=(vt == "shorts_review"),
+                subtitle_path=str(caption_ass_path) if caption_ass_path else None,
             )
 
             if youtube_metadata:
