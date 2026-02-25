@@ -159,7 +159,9 @@ with col_left:
     if last_vt != video_type:
         if video_type.startswith("shorts") or video_type.startswith("clip review") or video_type.startswith("short review"):
             st.session_state["max_images_slider"] = 20
+            st.session_state["min_images_slider"] = 10
             st.session_state["min_seg_seconds_slider"] = 1.8
+            st.session_state["max_slide_seconds_slider"] = 5.0
             st.session_state["transition_sel"] = "none"
             st.session_state["transition_seconds_slider"] = 0.0
             # Shorts / clip review / short review should start immediately; no intro/outro branding.
@@ -167,7 +169,9 @@ with col_left:
             st.session_state["outro_seconds_slider"] = 0.0
         else:
             st.session_state["max_images_slider"] = 12
+            st.session_state["min_images_slider"] = 4
             st.session_state["min_seg_seconds_slider"] = 6.0
+            st.session_state["max_slide_seconds_slider"] = 0.0
             st.session_state["transition_sel"] = "fade"
             st.session_state["transition_seconds_slider"] = 0.35
             st.session_state["intro_seconds_slider"] = 2.5
@@ -180,11 +184,20 @@ with col_left:
         max_images = st.slider(
             "Max images",
             min_value=4,
-            max_value=24,
+            max_value=40,
             value=int(st.session_state.get("max_images_slider", 12)),
             step=1,
             key="max_images_slider",
         )
+    min_images = st.slider(
+        "Min images",
+        min_value=1,
+        max_value=30,
+        value=int(st.session_state.get("min_images_slider", 4)),
+        step=1,
+        key="min_images_slider",
+        help="Pipeline will expand if the LLM produces fewer slides than this.",
+    )
     min_seg_seconds = st.slider(
         "Min seconds per slide",
         min_value=1.0,
@@ -193,6 +206,15 @@ with col_left:
         step=0.1,
         key="min_seg_seconds_slider",
         help="For Shorts, 1.5–2.2s usually retains better than 6s holds.",
+    )
+    max_slide_seconds = st.slider(
+        "Max seconds per slide",
+        min_value=0.0,
+        max_value=30.0,
+        value=float(st.session_state.get("max_slide_seconds_slider", 0.0)),
+        step=0.5,
+        key="max_slide_seconds_slider",
+        help="0 = no limit. Slides longer than this will be split. For shorts, 3–5s works well.",
     )
 
     transition = st.selectbox(
@@ -576,7 +598,9 @@ with col_right:
                 image_provider=image_provider,
                 serpapi_api_key=os.getenv("SERPAPI_API_KEY"),
                 max_images=(int(run_max_images) if run_max_images is not None else 12),
+                min_images=int(min_images),
                 min_seg_seconds=float(min_seg_seconds),
+                max_slide_seconds=float(max_slide_seconds),
                 whisper_model="small",
                 min_image_width=900,
                 video_width=int(vid_w),
