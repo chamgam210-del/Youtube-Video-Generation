@@ -235,7 +235,35 @@ with col_left:
     animated_captions = st.checkbox(
         "Animated captions (word-by-word)",
         value=video_type.startswith("short review"),
-        help="Overlay word-by-word highlighted captions (CapCut style). Best for 9:16 shorts.",
+        help="Overlay word-by-word highlighted captions. Best for 9:16 shorts.",
+    )
+
+    caption_style = st.selectbox(
+        "Caption style",
+        options=["pop", "box_highlight", "glow", "word_highlight"],
+        index=0,
+        format_func=lambda s: {
+            "pop": "🔥 Hormozi Bold (pop + accent colour)",
+            "box_highlight": "📦 Background Box (CapCut style)",
+            "glow": "✨ Neon Glow",
+            "word_highlight": "📝 Plain Highlight (legacy)",
+        }.get(s, s),
+        help="Visual style for the animated captions overlay.",
+    )
+
+    caption_color = st.selectbox(
+        "Caption accent colour",
+        options=["#FFFF00", "#00F0FF", "#FF2D87", "#39FF14", "#FF6B00", "#FFFFFF"],
+        index=0,
+        format_func=lambda c: {
+            "#FFFF00": "🟡 Yellow",
+            "#00F0FF": "🔵 Electric Cyan",
+            "#FF2D87": "🩷 Hot Pink",
+            "#39FF14": "🟢 Neon Green",
+            "#FF6B00": "🟠 Vibrant Orange",
+            "#FFFFFF": "⚪ White",
+        }.get(c, c),
+        help="Colour used to highlight the currently spoken word.",
     )
 
     st.subheader("3) Audio mix")
@@ -936,10 +964,11 @@ with col_right:
                             caption_ass_path,
                             width=int(vid_w),
                             height=int(vid_h),
-                            style="pop",
+                            style=str(caption_style),
+                            highlight_color=str(caption_color),
                             offset_seconds=float(intro_s),
                         )
-                        st.caption(f"Generated animated captions ({len(word_data)} words)")
+                        st.caption(f"Generated animated captions ({len(word_data)} words) — style: {caption_style}")
                     else:
                         st.warning("No word-level data — captions skipped.")
                 except Exception as _cap_err:
