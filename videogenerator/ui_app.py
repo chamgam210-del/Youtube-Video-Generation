@@ -920,22 +920,14 @@ with col_right:
             caption_ass_path: Path | None = None
             if animated_captions:
                 try:
-                    from videogenerator.captions import (
-                        extract_words_from_whisper_cache,
-                        generate_ass_captions,
-                        words_from_segments_fallback,
-                    )
-                    from videogenerator.transcribe import get_transcript_cache_path
+                    from videogenerator.captions import generate_ass_captions
+                    from videogenerator.transcribe import ensure_word_timestamps
 
-                    cache_path = get_transcript_cache_path(saved_audio, model_name="small")
-                    word_data = extract_words_from_whisper_cache(cache_path)
-                    if not word_data:
-                        # Fallback: approximate words from segment-level transcript.
-                        transcript_json = out_dir / "transcript.json"
-                        if transcript_json.exists():
-                            import json as _json
-                            seg_data = _json.loads(transcript_json.read_text(encoding="utf-8"))
-                            word_data = words_from_segments_fallback(seg_data)
+                    st.write("Loading word-level timestamps for captions…")
+                    word_data = ensure_word_timestamps(
+                        saved_audio,
+                        model_name="small",
+                    )
 
                     if word_data:
                         caption_ass_path = out_dir / "captions.ass"
@@ -945,8 +937,11 @@ with col_right:
                             width=int(vid_w),
                             height=int(vid_h),
                             style="pop",
+                            offset_seconds=float(intro_s),
                         )
                         st.caption(f"Generated animated captions ({len(word_data)} words)")
+                    else:
+                        st.warning("No word-level data — captions skipped.")
                 except Exception as _cap_err:
                     st.warning(f"Could not generate captions: {_cap_err}")
                     caption_ass_path = None

@@ -108,6 +108,7 @@ def generate_ass_captions(
     outline_px: int | None = None,
     max_phrase_words: int = 4,
     style: str = "word_highlight",   # word_highlight | pop
+    offset_seconds: float = 0.0,
 ) -> Path:
     """Generate an ASS subtitle file with animated word-by-word captions.
 
@@ -134,6 +135,9 @@ def generate_ass_captions(
     style:
         ``"word_highlight"`` — CapCut-style per-word colour highlight.
         ``"pop"`` — same, plus a subtle scale pop on each phrase.
+    offset_seconds:
+        Shift all word timestamps by this many seconds (e.g. to account
+        for intro silence padding added before the narration).
 
     Returns
     -------
@@ -168,20 +172,37 @@ def generate_ass_captions(
 
     events: list[str] = []
 
+    _off = float(offset_seconds)
+
     for phrase in phrases:
-        phrase_start = float(phrase[0]["start"])
-        phrase_end = float(phrase[-1]["end"])
+        phrase_start = float(phrase[0]["start"]) + _off
+        phrase_end = float(phrase[-1]["end"]) + _off
         if phrase_end <= phrase_start:
             continue
 
+        # Build clean word list for this phrase up-front.
+        clean_words: list[str] = []
+        for pw in phrase:
+            c = _clean_word(pw.get("word", ""))
+            if c:
+                clean_words.append(c.upper())
+        if not clean_words:
+            continue
+
         for wi, active_word in enumerate(phrase):
-            w_start = float(active_word["start"])
-            w_end = float(active_word["end"])
+            w_start = float(active_word["start"]) + _off
+            # End time: extend to the start of the NEXT word (or phrase end)
+            # so there's no gap where no highlight is shown.
+            if wi + 1 < len(phrase):
+                w_end = float(phrase[wi + 1]["start"]) + _off
+            else:
+                w_end = phrase_end
             if w_end <= w_start:
                 w_end = w_start + 0.15
 
             # Build text with override tags: highlight the active word.
             parts: list[str] = []
+            cw_idx = 0
             for j, pw in enumerate(phrase):
                 clean = _clean_word(pw.get("word", ""))
                 if not clean:
@@ -190,6 +211,7 @@ def generate_ass_captions(
                     parts.append(f"{{\\c{hi_col}}}{clean.upper()}{{\\c{txt_col}}}")
                 else:
                     parts.append(clean.upper())
+                cw_idx += 1
 
             text = " ".join(parts)
             if not text.strip():

@@ -217,3 +217,69 @@ def get_transcript_cache_path(
     cache_dir = Path(cache_dir)
     cache_key = sanitize_filename(f"{audio_path.stem}.{model_name}")
     return cache_dir / f"{cache_key}.json"
+
+
+def ensure_word_timestamps(
+    audio_path: str | Path,
+    *,
+    model_name: str = "small",
+    cache_dir: str | Path = ".cache/transcripts",
+) -> list[dict]:
+    """Return word-level timestamps, re-transcribing if the cache lacks them.
+
+    Checks the Whisper cache JSON for a ``words`` key.  If missing (old cache
+    created without ``word_timestamps=True``), forces a fresh transcription
+    and updates the cache in-place.
+    """
+    import json as _json
+
+    audio_path = Path(audio_path)
+    cache_dir_p = ensure_dir(cache_dir)
+    cache_path = get_transcript_cache_path(audio_path, model_name=model_name, cache_dir=cache_dir)
+
+    # Try reading existing word data from cache.
+    if cache_path.exists():
+        try:
+            data = _json.loads(cache_path.read_text(encoding="utf-8"))
+            # Top-level words list.
+            words = data.get("words")
+            if isinstance(words, list) and words:
+                return words
+            # Also check segments[*].words (Whisper native format).
+            out: list[dict] = []
+            for seg in data.get("segments", []):
+                for w in seg.get("words", []):
+                    if isinstance(w, dict) and "word" in w and "start" in w:
+                        out.append({"word": w["word"], "start": float(w["start"]), "end": float(w.get("end", 0))})
+            if out:
+                # Back-fill top-level words key for future reads.
+                data["words"] = out
+                try:
+                    write_json(cache_path, data)
+                except Exception:
+                    pass
+                return out
+        except Exception:
+            pass
+
+    # No word data — re-transcribe with word_timestamps=True.
+    print("[transcribe] Re-transcribing to obtain word-level timestamps…")
+    segments, words = transcribe_with_whisper(audio_path, model_name=model_name)
+
+    # Update (or create) cache with word data.
+    st = audio_path.stat()
+    content_hash = _audio_content_hash(audio_path)
+    payload = {
+        "meta": {
+            "audio_name": audio_path.name,
+            "audio_size": int(st.st_size),
+            "audio_mtime": float(st.st_mtime),
+            "content_hash": content_hash,
+            "model": model_name,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "segments": [asdict(s) for s in segments],
+        "words": words,
+    }
+    write_json(cache_path, payload)
+    return words
