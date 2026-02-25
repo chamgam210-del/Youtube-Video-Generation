@@ -997,9 +997,17 @@ def render_slideshow(
 
 
     def _build_base(*, use_duck: bool) -> list[str]:
-        cmd: list[str] = [
-            ffmpeg,
-            "-y",
+        cmd: list[str] = [ffmpeg, "-y"]
+
+        # When ASS captions are used, force the concat demuxer to produce
+        # frames at the target fps.  Without this, concat emits ONE frame
+        # per image (at the slide-boundary PTS), so the ass filter only
+        # evaluates per-slide instead of per-frame — the word-by-word
+        # highlight never changes within a slide.
+        if subtitle_path and Path(subtitle_path).exists():
+            cmd += ["-r", str(int(fps))]
+
+        cmd += [
             "-f",
             "concat",
             "-safe",
