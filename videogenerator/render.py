@@ -997,17 +997,9 @@ def render_slideshow(
 
 
     def _build_base(*, use_duck: bool) -> list[str]:
-        cmd: list[str] = [ffmpeg, "-y"]
-
-        # When ASS captions are used, force the concat demuxer to produce
-        # frames at the target fps.  Without this, concat emits ONE frame
-        # per image (at the slide-boundary PTS), so the ass filter only
-        # evaluates per-slide instead of per-frame — the word-by-word
-        # highlight never changes within a slide.
-        if subtitle_path and Path(subtitle_path).exists():
-            cmd += ["-r", str(int(fps))]
-
-        cmd += [
+        cmd: list[str] = [
+            ffmpeg,
+            "-y",
             "-f",
             "concat",
             "-safe",
@@ -1070,9 +1062,13 @@ def render_slideshow(
             "setsar=1,format=yuv420p"
         )
         # Overlay ASS subtitles (animated captions) if provided.
+        # The concat demuxer emits ONE frame per image (at slide-boundary
+        # PTS).  We must insert an fps filter *before* the ass filter so
+        # that libass sees 30 frames/sec and can update the word-by-word
+        # highlight every ~33 ms instead of only at slide transitions.
         if subtitle_path and Path(subtitle_path).exists():
             ass_escaped = str(Path(subtitle_path).resolve()).replace("\\", "/").replace(":", "\\:")
-            vf_chain += f",ass='{ass_escaped}'"
+            vf_chain += f",fps={int(fps)},ass='{ass_escaped}'"
         cmd += [
             "-fps_mode",
             "cfr",
