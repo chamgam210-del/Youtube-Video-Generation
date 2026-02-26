@@ -1,19 +1,13 @@
-"""Animated caption generation (ASS subtitles) — trending short-form styles.
+"""Animated caption generation (ASS subtitles) — CapCut / Hormozi style.
 
 Generates word-by-word highlighted captions in ASS (Advanced SubStation Alpha)
 format, suitable for overlay via FFmpeg's ``ass`` filter.
 
-Available styles (set via ``style`` parameter):
-
-- ``"pop"`` *(default)* — **Hormozi / MrBeast bold**.  Large white text,
-  active word pops to a vivid accent colour with a slight scale bump.
-  2-3 word phrases for punchy readability.  Thick dark outline + drop shadow.
-- ``"box_highlight"`` — **CapCut "Background Box"**.  Active word gets a
-  coloured rounded-rectangle highlight behind it (via ``\\3c`` + ``BorderStyle=3``).
-  Clean modern look used by most viral 2025-era shorts.
-- ``"glow"`` — **Neon glow**.  White text with a soft coloured glow outline on
-  the active word.  Eye-catching on dark/cinematic footage.
-- ``"word_highlight"`` — Legacy plain colour-swap, no animation.
+Style:
+- Large bold text, centered slightly above middle (portrait) or lower-third (landscape)
+- Current word highlighted in yellow; other words white with thick black outline
+- Short phrases (3-5 words) shown at a time
+- Subtle pop-in scale animation on each phrase
 
 Usage::
 
@@ -24,7 +18,6 @@ Usage::
         out_path="captions.ass",
         width=1080,
         height=1920,
-        style="pop",             # or "box_highlight", "glow"
     )
 """
 
@@ -46,14 +39,9 @@ def _ass_color(hex_rgb: str, alpha: int = 0) -> str:
 
 _WHITE = _ass_color("#FFFFFF")
 _YELLOW = _ass_color("#FFFF00")
+_RED = _ass_color("#FF0000")
 _OUTLINE = _ass_color("#000000")
 _SHADOW = _ass_color("#000000", alpha=0x60)
-
-# Trendy accent colours for caption highlights.
-_ACCENT_CYAN = _ass_color("#00F0FF")     # electric cyan
-_ACCENT_GREEN = _ass_color("#39FF14")    # neon green
-_ACCENT_PINK = _ass_color("#FF2D87")     # hot pink
-_ACCENT_ORANGE = _ass_color("#FF6B00")   # vibrant orange
 
 
 # ── Phrase grouping ──────────────────────────────────────────────────────────
@@ -119,8 +107,8 @@ def generate_ass_captions(
     highlight_color: str = "#FFFF00",
     text_color: str = "#FFFFFF",
     outline_px: int | None = None,
-    max_phrase_words: int = 3,
-    style: str = "pop",   # pop | box_highlight | glow | word_highlight
+    max_phrase_words: int = 4,
+    style: str = "word_highlight",   # word_highlight | pop
     offset_seconds: float = 0.0,
 ) -> Path:
     """Generate an ASS subtitle file with animated word-by-word captions.
@@ -134,9 +122,9 @@ def generate_ass_captions(
     width, height:
         Video resolution (used for ASS PlayRes and positioning).
     font_name:
-        Font family name visible to FFmpeg/libass.
+        Font family name visible to FFmpeg/libass.  ``Arial Black`` is safe on all platforms.
     font_size:
-        Override font size.  Default is auto-scaled per style.
+        Override font size.  Default is auto-scaled to ~6.5 % of height.
     highlight_color:
         Hex ``#RRGGBB`` for the currently-spoken word.
     text_color:
@@ -146,10 +134,8 @@ def generate_ass_captions(
     max_phrase_words:
         Maximum words per visible phrase group.
     style:
-        ``"pop"`` — Hormozi/MrBeast bold with scale pop + accent colour.
-        ``"box_highlight"`` — CapCut-style coloured background box on active word.
-        ``"glow"`` — Neon glow outline on active word.
-        ``"word_highlight"`` — Legacy plain colour-swap (no animation).
+        ``"word_highlight"`` — CapCut-style per-word colour highlight.
+        ``"pop"`` — same, plus a subtle scale pop on each phrase.
     offset_seconds:
         Shift all word timestamps by this many seconds (e.g. to account
         for intro silence padding added before the narration).
@@ -159,44 +145,34 @@ def generate_ass_captions(
     Path to the written ``.ass`` file.
     """
     out_path = Path(out_path)
-    is_portrait = height > width
 
     if not words:
-        out_path.write_text(
-            _ass_header(width, height, font_name, font_size or 72, 5, text_color, style=style),
-            encoding="utf-8",
-        )
+        # Write a minimal valid ASS to avoid FFmpeg errors.
+        out_path.write_text(_ass_header(width, height, font_name, font_size or 72, 5, text_color), encoding="utf-8")
         return out_path
 
-    # ── Auto-scale defaults per style ────────────────────────────────
+    # Auto-scale defaults.
+    is_portrait = height > width
     if font_size is None:
-        if style == "box_highlight":
-            font_size = max(52, int(height * 0.046))   # slightly larger for box
-        elif style == "glow":
-            font_size = max(50, int(height * 0.044))
-        else:
-            font_size = max(52, int(height * 0.048))   # pop / word_highlight
+        font_size = max(48, int(height * 0.043))  # ~82 for 1920
     if outline_px is None:
-        if style == "glow":
-            outline_px = max(6, font_size // 8)        # thicker soft glow
-        elif style == "box_highlight":
-            outline_px = max(12, font_size // 4)       # box padding
-        else:
-            outline_px = max(4, font_size // 12)
+        outline_px = max(3, font_size // 16)
 
     hi_col = _ass_color(highlight_color)
     txt_col = _ass_color(text_color)
 
     phrases = _group_words_into_phrases(words, max_words=max_phrase_words)
 
-    # Y-position: centred for portrait, lower-third for landscape.
+    # Y-position: slightly above centre for portrait, lower-third for landscape.
     if is_portrait:
-        y_pos = int(height * 0.50)
+        y_pos = int(height * 0.50)  # dead centre
     else:
         y_pos = int(height * 0.82)
+
     x_pos = width // 2
 
     events: list[str] = []
+
     _off = float(offset_seconds)
 
     for phrase in phrases:
@@ -205,6 +181,7 @@ def generate_ass_captions(
         if phrase_end <= phrase_start:
             continue
 
+        # Build clean word list for this phrase up-front.
         clean_words: list[str] = []
         for pw in phrase:
             c = _clean_word(pw.get("word", ""))
@@ -215,6 +192,8 @@ def generate_ass_captions(
 
         for wi, active_word in enumerate(phrase):
             w_start = float(active_word["start"]) + _off
+            # End time: extend to the start of the NEXT word (or phrase end)
+            # so there's no gap where no highlight is shown.
             if wi + 1 < len(phrase):
                 w_end = float(phrase[wi + 1]["start"]) + _off
             else:
@@ -222,26 +201,28 @@ def generate_ass_captions(
             if w_end <= w_start:
                 w_end = w_start + 0.15
 
-            # ── Build styled text per style ──────────────────────────
-            if style == "box_highlight":
-                text, prefix = _render_box_highlight(
-                    phrase, wi, x_pos, y_pos, hi_col, txt_col, font_size,
-                )
-            elif style == "glow":
-                text, prefix = _render_glow(
-                    phrase, wi, x_pos, y_pos, hi_col, txt_col,
-                )
-            elif style == "pop":
-                text, prefix = _render_pop(
-                    phrase, wi, x_pos, y_pos, hi_col, txt_col, font_size,
-                )
-            else:  # word_highlight (legacy)
-                text, prefix = _render_word_highlight(
-                    phrase, wi, x_pos, y_pos, hi_col, txt_col,
-                )
+            # Build text with override tags: highlight the active word.
+            parts: list[str] = []
+            cw_idx = 0
+            for j, pw in enumerate(phrase):
+                clean = _clean_word(pw.get("word", ""))
+                if not clean:
+                    continue
+                if j == wi:
+                    parts.append(f"{{\\c{hi_col}}}{clean.upper()}{{\\c{txt_col}}}")
+                else:
+                    parts.append(clean.upper())
+                cw_idx += 1
 
+            text = " ".join(parts)
             if not text.strip():
                 continue
+
+            # Position + optional pop-in animation.
+            prefix = f"{{\\an5\\pos({x_pos},{y_pos})}}"
+            if style == "pop" and wi == 0:
+                # Phrase entrance: scale 110% → 100% over 120 ms.
+                prefix += "{\\fscx110\\fscy110\\t(0,120,\\fscx100\\fscy100)}"
 
             line = (
                 f"Dialogue: 0,{_ass_time(w_start)},{_ass_time(w_end)},"
@@ -249,141 +230,23 @@ def generate_ass_captions(
             )
             events.append(line)
 
-    header = _ass_header(width, height, font_name, font_size, outline_px, text_color, style=style)
+    header = _ass_header(width, height, font_name, font_size, outline_px, text_color)
+
+    # ── Subscribe arrow CTA ──────────────────────────────────────────────
+    # If the speaker says "subscribe" near the end, add an animated arrow
+    # pointing down toward the YouTube Shorts subscribe button.
+    is_portrait = height > width
+    if is_portrait:
+        sub_events = _subscribe_arrow_events(
+            words, width, height, offset_seconds=_off,
+        )
+        events.extend(sub_events)
 
     out_path.write_text(
         header + "\n".join(events) + "\n",
         encoding="utf-8",
     )
     return out_path
-
-
-# ── Style renderers ─────────────────────────────────────────────────────────
-
-def _render_pop(
-    phrase: list[dict], wi: int, x: int, y: int,
-    hi_col: str, txt_col: str, font_size: int,
-) -> tuple[str, str]:
-    """Hormozi/MrBeast bold style — scale bump + accent colour on active word.
-
-    - Active word: bright accent, scale 115% → 100% over 100ms, slight Y lift
-    - Other words: white with heavy dark outline
-    - Phrase entrance: subtle scale 108% → 100%
-    """
-    parts: list[str] = []
-    for j, pw in enumerate(phrase):
-        clean = _clean_word(pw.get("word", ""))
-        if not clean:
-            continue
-        word_upper = clean.upper()
-        if j == wi:
-            # Active word: accent colour + scale pop
-            parts.append(
-                f"{{\\c{hi_col}\\fscx115\\fscy115"
-                f"\\t(0,100,\\fscx100\\fscy100)}}"
-                f"{word_upper}{{\\c{txt_col}\\fscx100\\fscy100}}"
-            )
-        else:
-            parts.append(word_upper)
-
-    text = " ".join(parts)
-    # Phrase entrance pop on first word
-    prefix = f"{{\\an5\\pos({x},{y})}}"
-    if wi == 0:
-        prefix += "{\\fscx108\\fscy108\\t(0,120,\\fscx100\\fscy100)}"
-    return text, prefix
-
-
-def _render_box_highlight(
-    phrase: list[dict], wi: int, x: int, y: int,
-    hi_col: str, txt_col: str, font_size: int,
-) -> tuple[str, str]:
-    """CapCut "Background Box" style — coloured box behind active word.
-
-    Uses BorderStyle=3 (opaque box) via inline override on the active word,
-    with a contrasting text colour for readability.
-    """
-    parts: list[str] = []
-    for j, pw in enumerate(phrase):
-        clean = _clean_word(pw.get("word", ""))
-        if not clean:
-            continue
-        word_upper = clean.upper()
-        if j == wi:
-            # Active word: dark text on coloured box background.
-            # \\3c sets outline/box colour, \\bord sets box padding,
-            # \\c sets text colour (dark for contrast).
-            dark_text = _ass_color("#000000")
-            parts.append(
-                f"{{\\c{dark_text}\\3c{hi_col}\\4c{hi_col}"
-                f"\\bord{max(10, font_size // 5)}\\shad0"
-                f"\\fscx105\\fscy105\\t(0,80,\\fscx100\\fscy100)}}"
-                f"{word_upper}"
-                f"{{\\c{txt_col}\\3c{_OUTLINE}\\4c{_SHADOW}"
-                f"\\bord{max(3, font_size // 16)}\\shad2\\fscx100\\fscy100}}"
-            )
-        else:
-            parts.append(word_upper)
-
-    text = " ".join(parts)
-    prefix = f"{{\\an5\\pos({x},{y})}}"
-    if wi == 0:
-        prefix += "{\\fscx106\\fscy106\\t(0,100,\\fscx100\\fscy100)}"
-    return text, prefix
-
-
-def _render_glow(
-    phrase: list[dict], wi: int, x: int, y: int,
-    hi_col: str, txt_col: str,
-) -> tuple[str, str]:
-    """Neon glow style — soft coloured outline glow on active word.
-
-    Active word gets a thick soft-edged coloured outline (glow effect)
-    plus a brighter text fill.
-    """
-    parts: list[str] = []
-    for j, pw in enumerate(phrase):
-        clean = _clean_word(pw.get("word", ""))
-        if not clean:
-            continue
-        word_upper = clean.upper()
-        if j == wi:
-            # Active word: coloured outline "glow" + white text + slight scale
-            parts.append(
-                f"{{\\c{_WHITE}\\3c{hi_col}\\bord8\\blur3"
-                f"\\fscx110\\fscy110\\t(0,100,\\fscx100\\fscy100)}}"
-                f"{word_upper}"
-                f"{{\\c{txt_col}\\3c{_OUTLINE}\\bord4\\blur0"
-                f"\\fscx100\\fscy100}}"
-            )
-        else:
-            parts.append(word_upper)
-
-    text = " ".join(parts)
-    prefix = f"{{\\an5\\pos({x},{y})}}"
-    if wi == 0:
-        prefix += "{\\fscx106\\fscy106\\t(0,120,\\fscx100\\fscy100)}"
-    return text, prefix
-
-
-def _render_word_highlight(
-    phrase: list[dict], wi: int, x: int, y: int,
-    hi_col: str, txt_col: str,
-) -> tuple[str, str]:
-    """Legacy plain colour-swap style — no animation."""
-    parts: list[str] = []
-    for j, pw in enumerate(phrase):
-        clean = _clean_word(pw.get("word", ""))
-        if not clean:
-            continue
-        word_upper = clean.upper()
-        if j == wi:
-            parts.append(f"{{\\c{hi_col}}}{word_upper}{{\\c{txt_col}}}")
-        else:
-            parts.append(word_upper)
-    text = " ".join(parts)
-    prefix = f"{{\\an5\\pos({x},{y})}}"
-    return text, prefix
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -396,6 +259,151 @@ def _clean_word(w: str) -> str:
     return (w or "").strip()
 
 
+# ── Subscribe arrow CTA ─────────────────────────────────────────────────────
+
+def _find_subscribe_word(
+    words: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Return the last occurrence of 'subscribe' in the word list, or None."""
+    result = None
+    for w in words:
+        cleaned = re.sub(r"[^a-zA-Z]", "", str(w.get("word", "")))
+        if cleaned.lower() == "subscribe":
+            result = w
+    return result
+
+
+def _subscribe_arrow_events(
+    words: list[dict[str, Any]],
+    width: int,
+    height: int,
+    *,
+    offset_seconds: float = 0.0,
+    duration: float = 4.0,
+) -> list[str]:
+    """Generate ASS dialogue lines for an animated subscribe arrow CTA.
+
+    Triggered by the word "subscribe" in the transcript.  Shows:
+    1. "SUBSCRIBE" text in a red pill-shaped banner (pop-in)
+    2. Three bouncing arrows (▼) pointing down toward the YouTube subscribe button
+    3. Everything fades out after *duration* seconds
+
+    On YouTube Shorts (9:16), the subscribe button sits at the bottom-right
+    area.  We place our arrow centered near the bottom to draw attention
+    downward.
+    """
+    sub_word = _find_subscribe_word(words)
+    if sub_word is None:
+        return []
+
+    _off = float(offset_seconds)
+    t_start = float(sub_word["start"]) + _off
+    t_end = t_start + duration
+
+    # Colours in ASS &HAABBGGRR format
+    red_fill = _ass_color("#FF0000")       # red
+    dark_red = _ass_color("#990000")       # darker red for outline
+    white = _ass_color("#FFFFFF")
+    black_ol = _ass_color("#000000")
+
+    cx = width // 2
+    sub_y = int(height * 0.70)       # "SUBSCRIBE" banner position
+    arrow_base_y = int(height * 0.78)  # first arrow position
+
+    events: list[str] = []
+
+    # ── 1. Red pill background (ASS vector drawing) ──
+    pill_w, pill_h = 420, 90
+    hw, hh = pill_w // 2, pill_h // 2
+    r = hh  # corner radius
+    pill_drawing = (
+        f"m {-hw + r} {-hh} "
+        f"b {-hw} {-hh} {-hw} {-hh} {-hw} {-hh + r} "
+        f"l {-hw} {hh - r} "
+        f"b {-hw} {hh} {-hw} {hh} {-hw + r} {hh} "
+        f"l {hw - r} {hh} "
+        f"b {hw} {hh} {hw} {hh} {hw} {hh - r} "
+        f"l {hw} {-hh + r} "
+        f"b {hw} {-hh} {hw} {-hh} {hw - r} {-hh} "
+    )
+
+    # Pop-in: 0% → 115% → 100% over 300ms
+    pop_in = (
+        "{\\fscx0\\fscy0"
+        "\\t(0,150,\\fscx115\\fscy115)"
+        "\\t(150,300,\\fscx100\\fscy100)}"
+    )
+    fade_tag = "{\\fad(0,500)}"
+
+    # Red pill background
+    events.append(
+        f"Dialogue: 1,{_ass_time(t_start)},{_ass_time(t_end)},"
+        f"Default,,0,0,0,,"
+        f"{{\\an5\\pos({cx},{sub_y})"
+        f"\\1c{red_fill}\\3c{dark_red}\\bord3\\shad0"
+        f"\\p1}}{pop_in}{fade_tag}{pill_drawing}"
+    )
+
+    # "SUBSCRIBE" text on top of pill
+    events.append(
+        f"Dialogue: 2,{_ass_time(t_start)},{_ass_time(t_end)},"
+        f"Default,,0,0,0,,"
+        f"{{\\an5\\pos({cx},{sub_y})"
+        f"\\fs52\\b1"
+        f"\\1c{white}\\3c{dark_red}\\bord2\\shad0"
+        f"\\fnArial Black}}"
+        f"{pop_in}{fade_tag}SUBSCRIBE"
+    )
+
+    # ── 2. Three bouncing arrows (▼) ──
+    # Each arrow pops in with a stagger, then pulses (scale bounce) in a
+    # repeating cycle.  ASS \\t doesn't loop, so we emit short segments.
+    arrow_spacing = 50
+    bounce_period_ms = 500
+    bounce_period_s = bounce_period_ms / 1000.0
+
+    for i in range(3):
+        a_y = arrow_base_y + i * arrow_spacing
+        stagger_ms = i * 150  # each arrow appears 150ms after the previous
+
+        arrow_start = t_start + stagger_ms / 1000.0
+
+        # Number of bounce cycles that fit in the remaining duration
+        remaining = t_end - arrow_start
+        n_cycles = min(int(remaining / bounce_period_s) + 1, 15)
+
+        for cyc in range(n_cycles):
+            seg_start = arrow_start + cyc * bounce_period_s
+            seg_end = min(seg_start + bounce_period_s, t_end)
+            if seg_end <= seg_start + 0.05:
+                break
+
+            half = bounce_period_ms // 2
+            # Pop-in only on the first cycle
+            first_pop = ""
+            if cyc == 0:
+                first_pop = (
+                    f"\\fscx0\\fscy0"
+                    f"\\t(0,80,\\fscx120\\fscy120)"
+                    f"\\t(80,160,\\fscx100\\fscy100)"
+                )
+
+            events.append(
+                f"Dialogue: 2,{_ass_time(seg_start)},{_ass_time(seg_end)},"
+                f"Default,,0,0,0,,"
+                f"{{\\an5\\pos({cx},{a_y})"
+                f"\\fs55\\b1"
+                f"\\1c{red_fill}\\3c{black_ol}\\bord3\\shad0"
+                f"\\fnArial"
+                f"{first_pop}"
+                f"\\t(0,{half},\\fscy115)"
+                f"\\t({half},{bounce_period_ms},\\fscy100)"
+                f"}}{fade_tag}▼"
+            )
+
+    return events
+
+
 def _ass_header(
     width: int,
     height: int,
@@ -403,27 +411,11 @@ def _ass_header(
     font_size: int,
     outline_px: int,
     text_color: str,
-    *,
-    style: str = "pop",
 ) -> str:
     primary = _ass_color(text_color)
     secondary = _ass_color("#FFFF00")
     outline_col = _OUTLINE
     shadow_col = _SHADOW
-
-    # Style-specific tweaks.
-    bold = -1          # -1 = bold
-    spacing = 3        # wider letter spacing for readability
-    shadow_depth = 3   # visible drop shadow for depth
-    border_style = 1   # 1 = outline + shadow
-
-    if style == "box_highlight":
-        border_style = 3   # 3 = opaque background box
-        shadow_depth = 0
-        spacing = 4
-    elif style == "glow":
-        shadow_depth = 0
-        spacing = 2
 
     return (
         "[Script Info]\n"
@@ -440,8 +432,8 @@ def _ass_header(
         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV\n"
         f"Style: Default,{font_name},{font_size},{primary},{secondary},"
-        f"{outline_col},{shadow_col},{bold},0,0,0,100,100,{spacing},0,{border_style},"
-        f"{outline_px},{shadow_depth},5,20,20,30\n"
+        f"{outline_col},{shadow_col},-1,0,0,0,100,100,2,0,1,"
+        f"{outline_px},0,5,20,20,30\n"
         "\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
