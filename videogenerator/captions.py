@@ -163,9 +163,10 @@ def generate_ass_captions(
 
     phrases = _group_words_into_phrases(words, max_words=max_phrase_words)
 
-    # Y-position: slightly above centre for portrait, lower-third for landscape.
+    # Y-position: lower area for portrait to avoid blocking image center,
+    # lower-third for landscape.
     if is_portrait:
-        y_pos = int(height * 0.50)  # dead centre
+        y_pos = int(height * 0.60)  # below centre — keeps key image content visible
     else:
         y_pos = int(height * 0.82)
 
