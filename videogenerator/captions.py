@@ -107,7 +107,7 @@ def generate_ass_captions(
     highlight_color: str = "#FFFF00",
     text_color: str = "#FFFFFF",
     outline_px: int | None = None,
-    max_phrase_words: int = 4,
+    max_phrase_words: int = 3,
     style: str = "word_highlight",   # word_highlight | pop
     offset_seconds: float = 0.0,
 ) -> Path:
