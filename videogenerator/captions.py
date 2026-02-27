@@ -136,6 +136,7 @@ def generate_ass_captions(
     style:
         ``"word_highlight"`` — CapCut-style per-word colour highlight.
         ``"pop"`` — same, plus a subtle scale pop on each phrase.
+        ``"static"`` — show phrase text without per-word highlight animation.
     offset_seconds:
         Shift all word timestamps by this many seconds (e.g. to account
         for intro silence padding added before the narration).
@@ -191,45 +192,61 @@ def generate_ass_captions(
         if not clean_words:
             continue
 
-        for wi, active_word in enumerate(phrase):
-            w_start = float(active_word["start"]) + _off
-            # End time: extend to the start of the NEXT word (or phrase end)
-            # so there's no gap where no highlight is shown.
-            if wi + 1 < len(phrase):
-                w_end = float(phrase[wi + 1]["start"]) + _off
-            else:
-                w_end = phrase_end
-            if w_end <= w_start:
-                w_end = w_start + 0.15
-
-            # Build text with override tags: highlight the active word.
-            parts: list[str] = []
-            cw_idx = 0
-            for j, pw in enumerate(phrase):
-                clean = _clean_word(pw.get("word", ""))
-                if not clean:
-                    continue
-                if j == wi:
-                    parts.append(f"{{\\c{hi_col}}}{clean.upper()}{{\\c{txt_col}}}")
-                else:
-                    parts.append(clean.upper())
-                cw_idx += 1
-
-            text = " ".join(parts)
-            if not text.strip():
+        if style == "static":
+            # Static mode: show the whole phrase for its full duration,
+            # no per-word colour highlight animation.
+            phrase_text = " ".join(
+                _clean_word(pw.get("word", "")).upper()
+                for pw in phrase
+                if _clean_word(pw.get("word", ""))
+            )
+            if not phrase_text.strip():
                 continue
-
-            # Position + optional pop-in animation.
             prefix = f"{{\\an5\\pos({x_pos},{y_pos})}}"
-            if style == "pop" and wi == 0:
-                # Phrase entrance: scale 110% → 100% over 120 ms.
-                prefix += "{\\fscx110\\fscy110\\t(0,120,\\fscx100\\fscy100)}"
-
             line = (
-                f"Dialogue: 0,{_ass_time(w_start)},{_ass_time(w_end)},"
-                f"Default,,0,0,0,,{prefix}{text}"
+                f"Dialogue: 0,{_ass_time(phrase_start)},{_ass_time(phrase_end)},"
+                f"Default,,0,0,0,,{prefix}{phrase_text}"
             )
             events.append(line)
+        else:
+            # Animated mode: one dialogue event per word with colour highlight.
+            for wi, active_word in enumerate(phrase):
+                w_start = float(active_word["start"]) + _off
+                # End time: extend to the start of the NEXT word (or phrase end)
+                # so there's no gap where no highlight is shown.
+                if wi + 1 < len(phrase):
+                    w_end = float(phrase[wi + 1]["start"]) + _off
+                else:
+                    w_end = phrase_end
+                if w_end <= w_start:
+                    w_end = w_start + 0.15
+
+                # Build text with override tags: highlight the active word.
+                parts: list[str] = []
+                for j, pw in enumerate(phrase):
+                    clean = _clean_word(pw.get("word", ""))
+                    if not clean:
+                        continue
+                    if j == wi:
+                        parts.append(f"{{\\c{hi_col}}}{clean.upper()}{{\\c{txt_col}}}")
+                    else:
+                        parts.append(clean.upper())
+
+                text = " ".join(parts)
+                if not text.strip():
+                    continue
+
+                # Position + optional pop-in animation.
+                prefix = f"{{\\an5\\pos({x_pos},{y_pos})}}"
+                if style == "pop" and wi == 0:
+                    # Phrase entrance: scale 110% → 100% over 120 ms.
+                    prefix += "{\\fscx110\\fscy110\\t(0,120,\\fscx100\\fscy100)}"
+
+                line = (
+                    f"Dialogue: 0,{_ass_time(w_start)},{_ass_time(w_end)},"
+                    f"Default,,0,0,0,,{prefix}{text}"
+                )
+                events.append(line)
 
     header = _ass_header(width, height, font_name, font_size, outline_px, text_color)
 

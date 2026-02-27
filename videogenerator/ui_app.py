@@ -235,36 +235,13 @@ with col_left:
     animated_captions = st.checkbox(
         "Animated captions (word-by-word)",
         value=video_type.startswith("short review"),
-        help="Overlay word-by-word highlighted captions. Best for 9:16 shorts.",
+        help="Overlay word-by-word highlighted captions (CapCut style). Best for 9:16 shorts.",
     )
-
-    caption_style = st.selectbox(
-        "Caption style",
-        options=["pop", "box_highlight", "glow", "word_highlight"],
-        index=0,
-        format_func=lambda s: {
-            "pop": "🔥 Hormozi Bold (pop + accent colour)",
-            "box_highlight": "📦 Background Box (CapCut style)",
-            "glow": "✨ Neon Glow",
-            "word_highlight": "📝 Plain Highlight (legacy)",
-        }.get(s, s),
-        help="Visual style for the animated captions overlay.",
-    )
-
-    caption_color = st.selectbox(
-        "Caption accent colour",
-        options=["#FFFF00", "#00F0FF", "#FF2D87", "#39FF14", "#FF6B00", "#FFFFFF"],
-        index=0,
-        format_func=lambda c: {
-            "#FFFF00": "🟡 Yellow",
-            "#00F0FF": "🔵 Electric Cyan",
-            "#FF2D87": "🩷 Hot Pink",
-            "#39FF14": "🟢 Neon Green",
-            "#FF6B00": "🟠 Vibrant Orange",
-            "#FFFFFF": "⚪ White",
-        }.get(c, c),
-        help="Colour used to highlight the currently spoken word.",
-    )
+    caption_highlight = st.checkbox(
+        "Caption highlight animation",
+        value=True,
+        help="Highlight the active word in yellow as it's spoken. Uncheck for static white captions.",
+    ) if animated_captions else True
 
     st.subheader("3) Audio mix")
     bgm_preset = st.selectbox(
@@ -959,16 +936,16 @@ with col_right:
 
                     if word_data:
                         caption_ass_path = out_dir / "captions.ass"
+                        _cap_style = "pop" if caption_highlight else "static"
                         generate_ass_captions(
                             word_data,
                             caption_ass_path,
                             width=int(vid_w),
                             height=int(vid_h),
-                            style=str(caption_style),
-                            highlight_color=str(caption_color),
+                            style=_cap_style,
                             offset_seconds=float(intro_s),
                         )
-                        st.caption(f"Generated animated captions ({len(word_data)} words) — style: {caption_style}")
+                        st.caption(f"Generated animated captions ({len(word_data)} words)")
                     else:
                         st.warning("No word-level data — captions skipped.")
                 except Exception as _cap_err:
