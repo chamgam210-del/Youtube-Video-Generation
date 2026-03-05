@@ -3541,31 +3541,37 @@ def run_scripted_short(
         _clip_api_key = os.getenv("OPENAI_API_KEY")
         _clip_queries: dict[int, list[str]] = {}  # section index → list of queries
 
+        # Use the short topic slug (e.g. "sinners") for cleaner queries.
+        _clip_topic = _topic_slug or effective_topic or "unknown"
+
         if _clip_api_key:
             _sections_for_llm = []
             for si, sec in enumerate(sections):
                 _sections_for_llm.append({
                     "index": si,
                     "label": sec.label or "",
-                    "osd": getattr(sec, "on_screen_text", "") or "",
-                    "text": (sec.text or "")[:300],
+                    # Only narration text — OSD bullet points are conceptual, not visual.
+                    "narration": (sec.text or "")[:400],
                 })
 
             _clip_sys = (
-                "You are generating YouTube search queries to find SHORT CLIPS from "
-                "trailers, movie scenes, or TV show clips on YouTube.\n\n"
-                f"The topic is: \"{effective_topic or 'unknown'}\"\n\n"
-                "For each section of the script, generate 2-3 search queries that will "
-                "find ACTUAL FOOTAGE from this movie/show/topic on YouTube.\n\n"
-                "Rules:\n"
-                "- Every query MUST include the topic name (movie/show title)\n"
-                "- Add scene-descriptive words from the narration (e.g. \"vampire\", "
-                "\"fight\", \"smoke\", \"twins\", \"chase\")\n"
-                "- Target: trailers, official clips, scene compilations, behind the scenes\n"
-                "- Keep queries 3-6 words: \"{topic} {scene description} scene/clip/trailer\"\n"
-                "- Examples: \"sinners vampire scene\", \"sinners smoke stack clip\", "
-                "\"sinners movie trailer\", \"sinners twins fight scene\"\n\n"
-                "Return ONLY valid JSON — an array of objects:\n"
+                "You are generating YouTube search queries to find SHORT MOVIE/TV CLIPS.\n\n"
+                f"Topic (movie/show title): \"{_clip_topic}\"\n\n"
+                "For each script section, generate 2-3 search queries that will find "
+                "ACTUAL FOOTAGE from this movie/show on YouTube — trailers, official scene "
+                "clips, scene compilations, or behind-the-scenes.\n\n"
+                "CRITICAL RULES:\n"
+                "1. Every query MUST start with the movie/show title: \"" + _clip_topic + " ...\"\n"
+                "2. Pick CONCRETE VISUAL or PHYSICAL things from the narration that would "
+                "actually appear on camera: characters by name, locations, actions, objects, "
+                "creatures. NOT abstract concepts or themes.\n"
+                "   ✓ GOOD: \"sinners vampire dance scene\", \"sinners juke joint fight\", "
+                "\"sinners twin brothers scene\", \"sinners cotton field\"\n"
+                "   ✗ BAD: \"sinners colonizers clip\", \"sinners assimilation scene\", "
+                "\"sinners individuality trailer\"\n"
+                "3. Queries must be 3-6 words total.\n"
+                "4. End each query with: scene / clip / trailer / footage / official\n\n"
+                "Return ONLY valid JSON — an array:\n"
                 '[{"index": 0, "queries": ["query1", "query2"]}, ...]'
             )
 
@@ -3601,19 +3607,19 @@ def run_scripted_short(
         for si in range(len(sections)):
             if si not in _clip_queries:
                 base = sections[si].search_query or sections[si].label or ""
-                q1 = f"{base} scene" if _topic_name.lower() in base.lower() else f"{base} {_topic_name} scene"
-                q2 = f"{_topic_name} trailer" if _topic_name else f"{base} clip"
-                _clip_queries[si] = [q1.strip(), q2.strip()]
+                q1 = f"{_clip_topic} {base} scene".strip() if base else f"{_clip_topic} trailer"
+                q2 = f"{_clip_topic} clip"
+                _clip_queries[si] = [q1, q2]
 
         # ── Topic keyword set for relevance filtering ─────────────────
         # Build a set of lowercased words from the topic to filter results.
         # e.g. "The Sinners 2025 movie" → {"sinners"}
         _topic_kw_set: set[str] = set()
-        if _topic_name:
+        if _clip_topic and _clip_topic != "unknown":
             _stop = {"the", "a", "an", "of", "in", "to", "and", "or", "for", "is",
                      "movie", "film", "show", "series", "tv", "part", "season"}
             _topic_kw_set = {
-                w.lower() for w in _topic_name.split()
+                w.lower() for w in _clip_topic.split()
                 if len(w) >= 3 and w.lower() not in _stop
             }
 
