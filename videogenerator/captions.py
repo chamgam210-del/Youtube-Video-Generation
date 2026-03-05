@@ -94,6 +94,102 @@ def _ass_time(seconds: float) -> str:
     return f"{h}:{m:02d}:{sec:02d}.{cs:02d}"
 
 
+# ── Caption spelling fix from script ───────────────────────────────────────
+
+def fix_caption_spelling(
+    word_data: list[dict[str, Any]],
+    script_sections: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Fix misspelled Whisper words using the ground-truth script as reference.
+
+    This is a **text-only** correction — Whisper's timestamps and word count
+    are never modified.  For each Whisper word, if a close match exists in
+    the script vocabulary, the text is replaced.
+
+    Parameters
+    ----------
+    word_data:
+        Whisper output: ``[{"word": str, "start": float, "end": float}, ...]``.
+    script_sections:
+        Parsed script sections (needs ``"text"`` key per section).
+
+    Returns
+    -------
+    corrected:
+        Same length as *word_data*, same timestamps, just text fixes.
+    corrections:
+        Human-readable list of ``"whisper → script"`` changes.
+    """
+    import difflib
+    import re
+
+    if not word_data:
+        return list(word_data), []
+
+    # Build script vocabulary (unique lower-case → preferred casing).
+    # Split on whitespace first, then further split on punctuation like
+    # slashes, em-dashes, etc. so compound tokens ("assimilation/colonization")
+    # become individual vocab entries.
+    _split_re = re.compile(r"[/—–\-]+")
+    vocab: dict[str, str] = {}
+    for sec in script_sections:
+        for raw_w in (sec.get("text") or "").split():
+            parts = _split_re.split(raw_w)
+            for p in parts:
+                clean = p.strip(".,!?…;:'\"\u2018\u2019\u201c\u201d()")
+                key = clean.lower()
+                if key and len(key) >= 2 and key not in vocab:
+                    vocab[key] = clean  # keep first occurrence's casing
+
+    if not vocab:
+        return list(word_data), []
+
+    _PUNCT = ".,!?…;:'\"\u2018\u2019\u201c\u201d()"
+
+    corrected: list[dict[str, Any]] = []
+    corrections: list[str] = []
+
+    for wd in word_data:
+        original = str(wd.get("word", ""))
+        stripped = original.strip()
+        key = stripped.lower().strip(_PUNCT)
+
+        if not key or key in vocab:
+            # Exact match or empty — keep original word unchanged.
+            corrected.append(dict(wd))
+        elif len(key) < 5:
+            # Short words (< 5 chars) are almost never misspelled by
+            # Whisper in a meaningful way and cause too many false
+            # positives (e.g. "four" → "for", "fan" → "Fans").
+            corrected.append(dict(wd))
+        else:
+            # No exact match — find closest word in script vocab.
+            # Only consider vocab entries of similar length (±2 chars).
+            close = [
+                v for v in vocab
+                if abs(len(v) - len(key)) <= 2
+            ]
+            candidates = difflib.get_close_matches(key, close, n=1, cutoff=0.82)
+            if candidates:
+                best = candidates[0]
+                # Preserve leading whitespace and trailing punctuation
+                # from the original Whisper word.
+                leading = original[: len(original) - len(stripped)]
+                trail_start = len(stripped) - len(stripped.rstrip(_PUNCT))
+                trailing = stripped[-trail_start:] if trail_start else ""
+                new_word = leading + vocab[best] + trailing
+                corrected.append({
+                    "word": new_word,
+                    "start": wd["start"],
+                    "end": wd["end"],
+                })
+                corrections.append(f"{stripped} → {vocab[best]}")
+            else:
+                corrected.append(dict(wd))
+
+    return corrected, corrections
+
+
 # ── ASS generation ──────────────────────────────────────────────────────────
 
 def generate_ass_captions(
@@ -167,7 +263,7 @@ def generate_ass_captions(
     # Y-position: lower area for portrait to avoid blocking image center,
     # lower-third for landscape.
     if is_portrait:
-        y_pos = int(height * 0.60)  # below centre — keeps key image content visible
+        y_pos = int(height * 0.72)  # lower third — keeps key image content visible
     else:
         y_pos = int(height * 0.82)
 
@@ -456,6 +552,290 @@ def _ass_header(
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
+
+
+# ── On-screen text overlays (scripted shorts) ───────────────────────────────
+
+_NORM_WORD_RE = re.compile(r"[^\w']", re.UNICODE)
+
+
+def _normalize_for_match(w: str) -> str:
+    """Lowercase + strip punctuation for fuzzy word matching."""
+    return _NORM_WORD_RE.sub("", w.lower()).strip("'")
+
+
+def _match_sections_to_audio(
+    sections: list[dict],
+    words: list[dict[str, Any]],
+) -> list[float]:
+    """Return the audio start-time for each section.
+
+    Uses a greedy forward search: for each section (in script order),
+    the first few narration words are fuzzy-matched against Whisper
+    word timestamps, searching forward from the previous match position.
+    """
+    results: list[float] = []
+    search_from = 0
+    n_words = len(words)
+
+    if not words:
+        return [0.0] * len(sections)
+
+    for sec in sections:
+        # Build match text: label + on_screen_text + narration.
+        # The user typically speaks the section label / number announcement
+        # ("Number one, Vampires as colonizers") BEFORE the body narration,
+        # so matching against the label gives an earlier, correct trigger.
+        label = sec.get("label", "") or ""
+        osd = sec.get("on_screen_text", "") or ""
+        narration = sec.get("text", "") or ""
+        # Strip numbering prefixes like "1)" from OSD — the user says
+        # "number one" not "one parenthesis".
+        import re as _re_inner
+        osd_clean = _re_inner.sub(r'^\d+[)\.]\s*', '', osd).strip()
+        match_text = f"{label} {osd_clean} {narration}".strip()
+        tokens = [_normalize_for_match(w) for w in match_text.split()]
+        match_tokens = [t for t in tokens if len(t) > 1][:6]
+
+        if not match_tokens:
+            t = float(words[min(search_from, n_words - 1)]["start"])
+            results.append(t)
+            continue
+
+        best_idx = search_from
+        best_score = -1
+        # Accept threshold: once we find a window scoring at least this well,
+        # stop scanning — prevents latching onto a later better-scoring window
+        # which causes the image to appear after the narration has begun.
+        _accept_thresh = max(len(match_tokens), len(match_tokens) * 2 - 1)
+
+        for i in range(search_from, n_words):
+            score = 0
+            for j, mt in enumerate(match_tokens):
+                if i + j >= n_words:
+                    break
+                wt = _normalize_for_match(words[i + j].get("word", ""))
+                if mt == wt:
+                    score += 2
+                elif mt in wt or wt in mt:
+                    score += 1
+            if score > best_score:
+                best_score = score
+                best_idx = i
+            # Stop as soon as we hit a good-enough match — don't scan ahead.
+            if best_score >= _accept_thresh:
+                break
+
+        # Shift the slide start back slightly so the image appears just before
+        # the matching word is spoken, not after.
+        _pre_roll = 0.15
+        results.append(max(0.0, float(words[best_idx]["start"]) - _pre_roll))
+        search_from = best_idx + max(1, len(match_tokens) // 2)
+
+    return results
+
+
+def generate_on_screen_text_ass(
+    script_sections: list[dict],
+    words: list[dict[str, Any]],
+    out_path: str | Path,
+    *,
+    width: int = 1080,
+    height: int = 1920,
+    offset_seconds: float = 0.0,
+    display_duration: float = 3.5,
+    existing_ass_path: str | Path | None = None,
+) -> Path | None:
+    """Generate audio-synced on-screen text overlays as ASS events.
+
+    Each section in *script_sections* that has an ``on_screen_text`` value
+    gets a timed overlay styled as an eye-catching title card with
+    coloured text, positioned in the upper area of the frame.
+
+    Timing is derived from Whisper word timestamps — the text appears
+    when its section's narration is spoken, NOT at the script timestamps.
+
+    If *existing_ass_path* is given, the events are appended to that file
+    (allowing captions + OSD in a single ASS).  Otherwise a standalone
+    ASS file is created.
+
+    Returns the written file path, or ``None`` if there were no OSD items.
+    """
+    out_path = Path(out_path)
+
+    # Filter sections that have on-screen text.
+    osd_indices = [
+        i for i, s in enumerate(script_sections)
+        if (s.get("on_screen_text") or "").strip()
+    ]
+    if not osd_indices:
+        # Nothing to overlay — keep existing file untouched.
+        if existing_ass_path and Path(existing_ass_path).exists():
+            if Path(existing_ass_path).resolve() != out_path.resolve():
+                import shutil
+                shutil.copy2(existing_ass_path, out_path)
+            return out_path
+        return None
+
+    # Match ALL sections to audio for correct forward-search ordering.
+    all_starts = _match_sections_to_audio(script_sections, words)
+
+    is_portrait = height > width
+    _off = float(offset_seconds)
+
+    # ── Title-card styling ──
+    font_size = max(52, int(height * 0.048))
+    y_pos = int(height * 0.22) if is_portrait else int(height * 0.18)
+    x_pos = width // 2
+    max_chars_line = max(10, int(width * 0.78 / max(1, font_size * 0.52)))
+
+    # Rotating accent colours (bright, eye-catching, never white).
+    _ACCENT_COLORS = [
+        "&H0042D4FF",  # gold/yellow  (#FFD442 → ASS BGR)
+        "&H00FF6633",  # coral/orange (#3366FF → ASS BGR)
+        "&H0000CCFF",  # bright cyan  (#FFCC00 → ASS BGR)
+        "&H004040FF",  # red          (#FF4040 → ASS BGR)
+        "&H0000FF80",  # green        (#80FF00 → ASS BGR)
+        "&H00FFAA00",  # teal/blue    (#00AAFF → ASS BGR)
+    ]
+
+    events: list[str] = []
+
+    for ci, sec_idx in enumerate(osd_indices):
+        sec = script_sections[sec_idx]
+        raw_text = (sec.get("on_screen_text") or "").strip()
+        if not raw_text:
+            continue
+
+        t_start = all_starts[sec_idx] + _off
+
+        # OSD stays visible for the ENTIRE slide / section duration.
+        # End time = start of the NEXT section (any section, not just OSD ones).
+        if sec_idx + 1 < len(all_starts):
+            t_end = all_starts[sec_idx + 1] + _off - 0.15  # tiny gap before next slide
+        else:
+            # Last section — use display_duration as fallback.
+            t_end = t_start + display_duration
+        t_end = max(t_end, t_start + 1.0)  # at least 1 second
+
+        # ── Word-wrap and prepare display text ──
+        lines: list[str] = []
+        for src_line in raw_text.split("\n"):
+            src_line = src_line.strip()
+            if not src_line:
+                continue
+            cur_words = src_line.split()
+            cur = ""
+            for cw in cur_words:
+                test = f"{cur} {cw}".strip()
+                if len(test) > max_chars_line and cur:
+                    lines.append(cur.upper())
+                    cur = cw
+                else:
+                    cur = test
+            if cur:
+                lines.append(cur.upper())
+
+        if not lines:
+            continue
+
+        accent = _ACCENT_COLORS[ci % len(_ACCENT_COLORS)]
+
+        # ── Animations ──
+        # Slide-up entrance + fade out.
+        slide_dist = int(font_size * 0.8)
+        entrance = (
+            f"\\move({x_pos},{y_pos + slide_dist},{x_pos},{y_pos},0,250)"
+            f"\\fad(0,350)"
+            f"\\t(0,200,\\frz0)"  # subtle settle
+        )
+
+        # Each line rendered separately with staggered entrance for title feel.
+        line_h = int(font_size * 1.4)
+        block_top = y_pos - (len(lines) * line_h) // 2
+
+        # ── Layer 6 — semi-transparent dark background panel ──
+        # Ensures OSD text is visible on ANY background image.
+        total_block_h = len(lines) * line_h
+        panel_cy = block_top + total_block_h // 2
+        panel_cy_from = panel_cy + slide_dist
+        max_chars = max(len(l) for l in lines)
+        approx_text_w = int(max_chars * font_size * 0.52)
+        panel_hw = min(
+            approx_text_w // 2 + int(font_size * 0.7),
+            width // 2 - 10,
+        )
+        panel_hh = total_block_h // 2 + int(font_size * 0.45)
+        # Rounded-corner rectangle via cubic bezier arcs.
+        cr = min(int(font_size * 0.25), panel_hw // 4, panel_hh // 4)
+        draw_rect = (
+            f"m {-panel_hw + cr} {-panel_hh} "
+            f"l {panel_hw - cr} {-panel_hh} "
+            f"b {panel_hw} {-panel_hh} {panel_hw} {-panel_hh} {panel_hw} {-panel_hh + cr} "
+            f"l {panel_hw} {panel_hh - cr} "
+            f"b {panel_hw} {panel_hh} {panel_hw} {panel_hh} {panel_hw - cr} {panel_hh} "
+            f"l {-panel_hw + cr} {panel_hh} "
+            f"b {-panel_hw} {panel_hh} {-panel_hw} {panel_hh} {-panel_hw} {panel_hh - cr} "
+            f"l {-panel_hw} {-panel_hh + cr} "
+            f"b {-panel_hw} {-panel_hh} {-panel_hw} {-panel_hh} {-panel_hw + cr} {-panel_hh}"
+        )
+        events.append(
+            f"Dialogue: 6,{_ass_time(t_start)},{_ass_time(t_end)},"
+            f"Default,,0,0,0,,"
+            f"{{\\an5\\move({x_pos},{panel_cy_from},{x_pos},{panel_cy},0,280)"
+            f"\\1c&H00000000\\1a&H66\\bord0\\shad0\\p1"
+            f"\\fad(200,350)}}"
+            f"{draw_rect}"
+        )
+
+        for li, line_text in enumerate(lines):
+            line_y = block_top + li * line_h + line_h // 2
+            stagger_ms = li * 80  # each line 80ms after previous
+            line_start = t_start + stagger_ms / 1000.0
+
+            # Slide-up per line.
+            ly_from = line_y + slide_dist
+            move_tag = f"\\move({x_pos},{ly_from},{x_pos},{line_y},0,280)"
+
+            # Scale pop: 105% → 100%.
+            pop = "\\fscx105\\fscy105\\t(0,250,\\fscx100\\fscy100)"
+
+            # Layer 7 — drop shadow (offset black text).
+            shadow_offset = max(2, font_size // 20)
+            events.append(
+                f"Dialogue: 7,{_ass_time(line_start)},{_ass_time(t_end)},"
+                f"Default,,0,0,0,,"
+                f"{{\\an5\\move({x_pos + shadow_offset},{ly_from + shadow_offset},"
+                f"{x_pos + shadow_offset},{line_y + shadow_offset},0,280)"
+                f"\\fs{font_size}\\b1\\fnArial Black\\fsp3"
+                f"\\1c&H00000000\\3c&H00000000\\bord0\\shad0\\blur2"
+                f"\\1a&H60"
+                f"{pop}\\fad(0,350)}}{line_text}"
+            )
+
+            # Layer 8 — main coloured text with thick outline.
+            events.append(
+                f"Dialogue: 8,{_ass_time(line_start)},{_ass_time(t_end)},"
+                f"Default,,0,0,0,,"
+                f"{{\\an5{move_tag}"
+                f"\\fs{font_size}\\b1\\fnArial Black\\fsp3"
+                f"\\1c{accent}\\3c&H00000000\\bord7\\shad0\\blur0.5"
+                f"{pop}\\fad(0,350)}}{line_text}"
+            )
+
+    if not events:
+        return None
+
+    # ── Write or merge into ASS file ──
+    if existing_ass_path and Path(existing_ass_path).exists():
+        content = Path(existing_ass_path).read_text(encoding="utf-8")
+        content = content.rstrip("\n") + "\n" + "\n".join(events) + "\n"
+    else:
+        header = _ass_header(width, height, "Arial Black", font_size, 5, "#FFFFFF")
+        content = header + "\n".join(events) + "\n"
+
+    out_path.write_text(content, encoding="utf-8")
+    return out_path
 
 
 # ── Word-level timestamp extraction from Whisper cache ───────────────────────

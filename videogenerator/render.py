@@ -1012,6 +1012,21 @@ def render_slideshow(
 
         needs_audio_filter = bool(bgm_path or bgm_generate or adelay or outro_s > 0.0)
 
+        # ── Build video filter chain ──
+        # NOTE: When -filter_complex is needed (BGM, audio adjustments),
+        # we must route the video through the SAME filter_complex instead
+        # of using a separate -vf flag.  FFmpeg 7.x can silently drop
+        # the video stream when -filter_complex and -vf coexist with
+        # mixed-codec concat inputs (e.g. PNG + JPEG).
+        vf_chain = (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height}:(in_w-out_w)/2:(in_h-out_h)/2,"
+            "setsar=1,format=yuv420p"
+        )
+        if subtitle_path and Path(subtitle_path).exists():
+            ass_escaped = str(Path(subtitle_path).resolve()).replace("\\", "/").replace(":", "\\:")
+            vf_chain += f",fps={int(fps)},ass='{ass_escaped}'"
+
         if bgm_path or bgm_generate:
             if bgm_path:
                 cmd += [
@@ -1029,51 +1044,50 @@ def render_slideshow(
                 ]
 
             filter_complex, audio_map = _audio_filters(use_duck=use_duck, voice_label="1:a", bgm_label="2:a")
+            # Combine video + audio into one unified filter_complex.
+            video_frag = f"[0:v]{vf_chain}[vout]"
+            combined_fc = f"{video_frag};{filter_complex}" if filter_complex else video_frag
             cmd += [
                 "-filter_complex",
-                filter_complex or "",
+                combined_fc,
                 "-map",
-                "0:v:0",
+                "[vout]",
                 "-map",
                 (f"[{audio_map}]" if audio_map.startswith("a") else audio_map),
             ]
         elif needs_audio_filter:
             filter_complex, audio_map = _audio_filters(use_duck=use_duck, voice_label="1:a", bgm_label=None)
+            # Combine video + audio into one unified filter_complex.
+            video_frag = f"[0:v]{vf_chain}[vout]"
+            combined_fc = f"{video_frag};{filter_complex}" if filter_complex else video_frag
             cmd += [
                 "-filter_complex",
-                filter_complex or "",
+                combined_fc,
                 "-map",
-                "0:v:0",
+                "[vout]",
                 "-map",
                 (f"[{audio_map}]" if audio_map.startswith("a") else audio_map),
             ]
         else:
+            # No audio filter needed.  Still route video through
+            # -filter_complex so mixed-codec concat inputs (PNG rgb24
+            # + JPEG yuvj420p) are handled uniformly.  Using bare
+            # ``-vf`` with ``-map 0:v:0`` can silently produce zero
+            # video frames on FFmpeg 7.x when the concat demuxer
+            # switches codecs mid-stream.
+            video_frag = f"[0:v]{vf_chain}[vout]"
             cmd += [
+                "-filter_complex",
+                video_frag,
                 "-map",
-                "0:v:0",
+                "[vout]",
                 "-map",
                 "1:a:0",
             ]
 
-        # Output options (must come after all inputs).
-        vf_chain = (
-            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height}:(in_w-out_w)/2:(in_h-out_h)/2,"
-            "setsar=1,format=yuv420p"
-        )
-        # Overlay ASS subtitles (animated captions) if provided.
-        # The concat demuxer emits ONE frame per image (at slide-boundary
-        # PTS).  We must insert an fps filter *before* the ass filter so
-        # that libass sees 30 frames/sec and can update the word-by-word
-        # highlight every ~33 ms instead of only at slide transitions.
-        if subtitle_path and Path(subtitle_path).exists():
-            ass_escaped = str(Path(subtitle_path).resolve()).replace("\\", "/").replace(":", "\\:")
-            vf_chain += f",fps={int(fps)},ass='{ass_escaped}'"
         cmd += [
             "-fps_mode",
             "cfr",
-            "-vf",
-            vf_chain,
             "-r",
             str(fps),
             "-pix_fmt",
@@ -1082,7 +1096,8 @@ def render_slideshow(
             "aac",
             "-b:a",
             "192k",
-            "-shortest",
+            "-t",
+            f"{total_duration:.3f}",
             "-movflags",
             "+faststart",
         ]
@@ -1344,7 +1359,8 @@ def render_slideshow(
             "aac",
             "-b:a",
             "192k",
-            "-shortest",
+            "-t",
+            f"{total_duration:.3f}",
             "-movflags",
             "+faststart",
         ]

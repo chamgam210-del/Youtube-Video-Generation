@@ -11,7 +11,7 @@ import streamlit as st
 
 from dotenv import load_dotenv
 
-from videogenerator.pipeline import run
+from videogenerator.pipeline import run, run_scripted_short
 from videogenerator.render import bgm_preset_available, render_slideshow
 from videogenerator.models import Slide
 from videogenerator.verify_video import verify_local
@@ -148,16 +148,62 @@ with col_left:
 
     video_type = st.selectbox(
         "Video type",
-        options=["review (images only)", "short review (9:16, images only)", "explainer (text + images)", "commentary (clip insertion)", "clip review (9:16, full clips)", "shorts (9:16)", "shorts review (9:16, retention)", "auto"],
+        options=["review (images only)", "short review (9:16, images only)", "explainer (text + images)", "commentary (clip insertion)", "clip review (9:16, full clips)", "shorts (9:16)", "shorts review (9:16, retention)", "scripted short (9:16, from script)", "auto"],
         index=0,
-        help="Explainer/shorts use LLM-planned text-on-slide storyboards. Commentary auto-inserts referenced clips and compilations. Clip review fills entire video with muted movie clips.",
+        help="Explainer/shorts use LLM-planned text-on-slide storyboards. Commentary auto-inserts referenced clips and compilations. Clip review fills entire video with muted movie clips. Scripted short uses a timestamped script you paste to search one image per section.",
     )
 
     # When creating Shorts, retention usually improves with faster cuts and more images.
     # We set dynamic defaults when the user switches video_type.
+    # ── Scripted Short: script text area ──
+    scripted_short_script = ""
+    if video_type.startswith("scripted short"):
+        scripted_short_script = st.text_area(
+            "Paste your timestamped script",
+            value="",
+            height=350,
+            placeholder=(
+                '0:00–0:03 — Hook\n'
+                '"Before A24 made it a movie… the Backrooms was just one photo."\n\n'
+                'On-screen text: No location • No story\n\n'
+                '0:03–0:10 — The image\n'
+                '"In the early 2000s, a picture of empty yellow rooms circulated online."'
+            ),
+            help=(
+                "Each section needs a timestamp range (M:SS–M:SS) on its own line, "
+                "followed by the narration in quotes. Add 'On-screen text: …' for overlay text. "
+                "'Beat.' lines are ignored."
+            ),
+        )
+
+        # ── User-provided reference images ──
+        st.markdown("**Reference images** *(optional)*")
+        st.caption(
+            "Upload photos and give each a title. "
+            "If a title matches a script section, that image is used instead of searching."
+        )
+        _uploaded_images = st.file_uploader(
+            "Upload reference images",
+            type=["jpg", "jpeg", "png", "webp", "bmp"],
+            accept_multiple_files=True,
+            key="scripted_short_user_images",
+        )
+        # Collect titles for each uploaded image.
+        _user_image_titles: list[tuple] = []  # [(UploadedFile, title_str), ...]
+        if _uploaded_images:
+            for _uf in _uploaded_images:
+                _title = st.text_input(
+                    f"Title for {_uf.name}",
+                    value=Path(_uf.name).stem.replace("_", " ").replace("-", " "),
+                    key=f"img_title_{_uf.name}",
+                )
+                _user_image_titles.append((_uf, _title.strip()))
+
+        st.divider()
+
     last_vt = st.session_state.get("_last_video_type")
     if last_vt != video_type:
-        if video_type.startswith("shorts") or video_type.startswith("clip review") or video_type.startswith("short review"):
+        if video_type.startswith("shorts") or video_type.startswith("clip review") or video_type.startswith("short review") or video_type.startswith("scripted short"):
             st.session_state["max_images_slider"] = 20
             st.session_state["min_images_slider"] = 10
             st.session_state["min_seg_seconds_slider"] = 1.8
@@ -234,7 +280,7 @@ with col_left:
 
     animated_captions = st.checkbox(
         "Animated captions (word-by-word)",
-        value=video_type.startswith("short review"),
+        value=video_type.startswith("short review") or video_type.startswith("scripted short"),
         help="Overlay word-by-word highlighted captions (CapCut style). Best for 9:16 shorts.",
     )
     caption_highlight = st.checkbox(
@@ -567,6 +613,7 @@ with col_right:
 
         vt = "review"
         _is_short_review_images = video_type.startswith("short review")
+        _is_scripted_short = video_type.startswith("scripted short")
         if video_type.startswith("explainer"):
             vt = "explainer"
         elif video_type.startswith("commentary"):
@@ -575,6 +622,8 @@ with col_right:
             vt = "clip_review"
         elif video_type.startswith("shorts review"):
             vt = "shorts_review"
+        elif _is_scripted_short:
+            vt = "scripted_short"
         elif video_type.startswith("shorts"):
             vt = "shorts"
         elif _is_short_review_images:
@@ -584,14 +633,14 @@ with col_right:
 
         # Render sizing preset.
         vid_w, vid_h = (1920, 1080)
-        if vt in {"shorts", "shorts_review", "clip_review"} or _is_short_review_images:
+        if vt in {"shorts", "shorts_review", "clip_review", "scripted_short"} or _is_short_review_images:
             vid_w, vid_h = (1080, 1920)
 
         # Shorts defaults: no transitions.
         run_max_images = int(max_images) if max_images is not None else None
         run_transition = transition
         run_transition_seconds = float(transition_seconds)
-        if vt in {"shorts", "shorts_review", "clip_review"} or _is_short_review_images:
+        if vt in {"shorts", "shorts_review", "clip_review", "scripted_short"} or _is_short_review_images:
             run_transition = "none"
             run_transition_seconds = 0.0
 
@@ -601,32 +650,91 @@ with col_right:
             effective_reuse_images = bool(reuse_images) and (not bool(fresh_images_this_run))
             if fresh_images_this_run:
                 st.caption("Fresh images enabled: not reusing prior output assets for this run.")
-            run(
-                audio_path=str(saved_audio),
-                out_dir=out_dir,
-                topic=(str(image_subject).strip() or str(topic).strip() or None),
-                video_type=vt,
-                image_provider=image_provider,
-                serpapi_api_key=os.getenv("SERPAPI_API_KEY"),
-                max_images=(int(run_max_images) if run_max_images is not None else 12),
-                min_images=int(min_images),
-                min_seg_seconds=float(min_seg_seconds),
-                max_slide_seconds=float(max_slide_seconds),
-                whisper_model="small",
-                min_image_width=900,
-                video_width=int(vid_w),
-                video_height=int(vid_h),
-                cache_transcript=True,
-                cache_dir=None,
-                storyboard="auto",
-                llm_model="gpt-4o-mini",
-                llm_pick_images=True,
-                reuse_images=bool(effective_reuse_images),
-                mix_video_clips=bool(mix_video_clips),
-                max_video_clips=int(max_video_clips),
-                clip_queries=clip_queries,
-                clip_research=bool(clip_research),
-            )
+
+            if _is_scripted_short:
+                # ── Scripted Short pipeline ──
+                if not scripted_short_script.strip():
+                    st.error("Paste a timestamped script in the left panel first.")
+                    st.stop()
+                from videogenerator.script_parser import parse_script as _parse_script
+                try:
+                    _sections = _parse_script(scripted_short_script)
+                except ValueError as _pe:
+                    st.error(f"Script parse error: {_pe}")
+                    st.stop()
+                st.caption(f"Parsed {len(_sections)} sections from script")
+                # Save raw script for debugging.
+                try:
+                    (out_dir / "script_raw.txt").write_text(scripted_short_script, encoding="utf-8")
+                except Exception:
+                    pass
+                # Show parsed on-screen text count.
+                _n_osd_parsed = sum(1 for s in _sections if (s.on_screen_text or "").strip())
+                if _n_osd_parsed:
+                    st.caption(f"  → {_n_osd_parsed} section(s) have on-screen text")
+                else:
+                    st.caption("  → No on-screen text found (add 'On-screen text: …' lines to script)")
+
+                # ── Save user-uploaded reference images to disk ──
+                _user_images_for_pipeline: list[dict] = []
+                if _user_image_titles:
+                    _ref_dir = out_dir / "user_images"
+                    _ref_dir.mkdir(parents=True, exist_ok=True)
+                    for _uf, _title in _user_image_titles:
+                        if not _title:
+                            continue
+                        _ext = Path(_uf.name).suffix or ".jpg"
+                        _safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in _title)
+                        _dest = _ref_dir / f"{_safe}{_ext}"
+                        _dest.write_bytes(_uf.getvalue())
+                        _user_images_for_pipeline.append({
+                            "title": _title,
+                            "path": str(_dest),
+                        })
+                    if _user_images_for_pipeline:
+                        st.caption(f"  → {len(_user_images_for_pipeline)} reference image(s) uploaded")
+
+                run_scripted_short(
+                    audio_path=str(saved_audio),
+                    out_dir=out_dir,
+                    script_sections=_sections,
+                    topic=(str(image_subject).strip() or str(topic).strip() or None),
+                    image_provider=image_provider,
+                    serpapi_api_key=os.getenv("SERPAPI_API_KEY"),
+                    min_image_width=900,
+                    video_width=int(vid_w),
+                    video_height=int(vid_h),
+                    llm_model="gpt-4o-mini",
+                    user_images=_user_images_for_pipeline or None,
+                    reuse_images=bool(effective_reuse_images),
+                )
+            else:
+                run(
+                    audio_path=str(saved_audio),
+                    out_dir=out_dir,
+                    topic=(str(image_subject).strip() or str(topic).strip() or None),
+                    video_type=vt,
+                    image_provider=image_provider,
+                    serpapi_api_key=os.getenv("SERPAPI_API_KEY"),
+                    max_images=(int(run_max_images) if run_max_images is not None else 12),
+                    min_images=int(min_images),
+                    min_seg_seconds=float(min_seg_seconds),
+                    max_slide_seconds=float(max_slide_seconds),
+                    whisper_model="small",
+                    min_image_width=900,
+                    video_width=int(vid_w),
+                    video_height=int(vid_h),
+                    cache_transcript=True,
+                    cache_dir=None,
+                    storyboard="auto",
+                    llm_model="gpt-4o-mini",
+                    llm_pick_images=True,
+                    reuse_images=bool(effective_reuse_images),
+                    mix_video_clips=bool(mix_video_clips),
+                    max_video_clips=int(max_video_clips),
+                    clip_queries=clip_queries,
+                    clip_research=bool(clip_research),
+                )
 
             # Show reuse decision (if any) from pipeline metadata.
             try:
@@ -712,8 +820,8 @@ with col_right:
             intro_s = max(0.0, float(intro_seconds))
             outro_s = max(0.0, float(outro_seconds))
 
-            # Shorts / clip_review / short review images: no channel intro/outro branding slates.
-            if vt in {"shorts", "clip_review"} or _is_short_review_images:
+            # Shorts / clip_review / short review images / scripted short: no channel intro/outro branding slates.
+            if vt in {"shorts", "clip_review", "scripted_short"} or _is_short_review_images:
                 intro_s = 0.0
                 outro_s = 0.0
 
@@ -923,6 +1031,7 @@ with col_right:
 
             # ── Generate animated captions (ASS subtitles) if enabled ──
             caption_ass_path: Path | None = None
+            word_data = None
             if animated_captions:
                 try:
                     from videogenerator.captions import generate_ass_captions
@@ -951,6 +1060,63 @@ with col_right:
                 except Exception as _cap_err:
                     st.warning(f"Could not generate captions: {_cap_err}")
                     caption_ass_path = None
+
+            # ── On-screen text overlays + spelling fix for scripted shorts ──
+            if _is_scripted_short:
+                try:
+                    _ss_path = out_dir / "script_sections.json"
+                    if _ss_path.exists():
+                        _ss_data = json.loads(_ss_path.read_text(encoding="utf-8"))
+
+                        # ── Fix Whisper spelling mistakes using script vocab ──
+                        if word_data and caption_ass_path and animated_captions:
+                            try:
+                                from videogenerator.captions import (
+                                    fix_caption_spelling,
+                                    generate_ass_captions as _gen_ass,
+                                )
+                                _fixed, _fixes = fix_caption_spelling(word_data, _ss_data)
+                                if _fixes:
+                                    _cap_style = "pop" if caption_highlight else "static"
+                                    _gen_ass(
+                                        _fixed,
+                                        caption_ass_path,
+                                        width=int(vid_w),
+                                        height=int(vid_h),
+                                        style=_cap_style,
+                                        offset_seconds=float(intro_s),
+                                    )
+                                    word_data = _fixed
+                                    st.caption(f"Fixed {len(_fixes)} spelling mistake(s): {', '.join(_fixes[:10])}")
+                            except Exception as _sp_err:
+                                st.warning(f"Spelling fix failed: {_sp_err}")
+
+                        # ── On-screen text overlays ──
+                        _has_osd = any((s.get("on_screen_text") or "").strip() for s in _ss_data)
+                        if _has_osd:
+                            # Load Whisper words if not already loaded (captions off).
+                            if word_data is None:
+                                from videogenerator.transcribe import ensure_word_timestamps
+                                st.write("Loading word timestamps for on-screen text sync…")
+                                word_data = ensure_word_timestamps(saved_audio, model_name="small")
+                            if word_data:
+                                from videogenerator.captions import generate_on_screen_text_ass
+                                _osd_out = out_dir / "captions_final.ass"
+                                _osd_result = generate_on_screen_text_ass(
+                                    _ss_data,
+                                    word_data,
+                                    _osd_out,
+                                    width=int(vid_w),
+                                    height=int(vid_h),
+                                    offset_seconds=float(intro_s),
+                                    existing_ass_path=str(caption_ass_path) if caption_ass_path else None,
+                                )
+                                if _osd_result:
+                                    caption_ass_path = _osd_result
+                                    _n_osd = sum(1 for s in _ss_data if (s.get("on_screen_text") or "").strip())
+                                    st.caption(f"Added {_n_osd} on-screen text overlay(s) synced to audio")
+                except Exception as _osd_err:
+                    st.warning(f"On-screen text overlay failed: {_osd_err}")
 
             render_slideshow(
                 slides_to_render,

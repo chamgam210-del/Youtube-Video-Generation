@@ -252,7 +252,9 @@ def run(
     # For non-review videos, we want a stable topic hint to keep image searches on the right subject.
     effective_topic: str | None = (topic or "").strip() or None
     topic_type: str | None = None
-    if vt in {"explainer", "shorts", "shorts_review", "commentary", "clip_review", "auto"} and not effective_topic:
+    # For long-form reviews, treat image topic inference like shorts/commentary
+    # so that image search benefits from the same LLM “agentic” planning.
+    if vt in {"review", "explainer", "shorts", "shorts_review", "commentary", "clip_review", "auto"} and not effective_topic:
         if use_llm:
             try:
                 from .llm_storyboard import infer_topic_with_llm
@@ -270,7 +272,7 @@ def run(
             topic_type = inferred.topic_type
 
     # Heuristic: if transcript strongly suggests TV content, treat as tv_show.
-    if vt in {"explainer", "shorts", "shorts_review", "commentary", "clip_review"} and (topic_type is None or topic_type == "other"):
+    if vt in {"review", "explainer", "shorts", "shorts_review", "commentary", "clip_review"} and (topic_type is None or topic_type == "other"):
         try:
             tail = " ".join(s.text for s in merged[-25:]).lower()
         except Exception:
@@ -2661,4 +2663,877 @@ def run(
     except Exception:
         pass
 
+    return out_dir
+
+
+# ---------------------------------------------------------------------------
+# Scripted Short — user provides a timestamped script + audio; we search
+# one image per section and output a timeline.json (portrait 9:16).
+# ---------------------------------------------------------------------------
+
+def run_scripted_short(
+    *,
+    audio_path: str | Path,
+    out_dir: str | Path,
+    script_sections: list,  # list[ScriptSection] from script_parser
+    topic: str | None = None,
+    image_provider: str = "google_images",
+    serpapi_api_key: str | None = None,
+    min_image_width: int = 900,
+    video_width: int = 1080,
+    video_height: int = 1920,
+    llm_model: str = "gpt-4o-mini",
+    user_images: list[dict] | None = None,
+    reuse_images: bool = True,
+) -> Path:
+    """Build a timeline for a **Scripted Short**.
+
+    The *script_sections* drive image search queries and on-screen text
+    overlays.  Slide timing is derived from Whisper word-level timestamps
+    so each image appears when the narrator reaches its section.
+
+    *user_images* is an optional list of ``{"title": str, "path": str}``
+    dicts.  When a title semantically matches a section (label or
+    narration), that image is used directly — no search needed.
+
+    Pipeline:
+    1. Matches user-provided reference images to sections by title.
+    2. Uses the LLM to generate an ideal image-search query per section.
+    3. Searches, ranks, and downloads one image per section.
+    4. Applies portrait pre-processing (blur-behind composite).
+    5. Syncs slide timing to audio via word-level timestamps.
+    6. Writes ``timeline.json`` and ``run_meta.json``.
+
+    Returns *out_dir*.
+    """
+
+    from .script_parser import ScriptSection  # type-check convenience
+
+    audio_path = Path(audio_path)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    assets_dir = ensure_dir(out_dir / "assets")
+
+    audio_stat = audio_path.stat()
+    audio_duration = get_audio_duration_seconds(audio_path)
+
+    sections: list[ScriptSection] = list(script_sections)
+    if not sections:
+        raise ValueError("script_sections is empty")
+
+    effective_topic = (topic or "").strip() or None
+
+    # ── Shorten topic for better image search queries ──
+    # Verbose topics like "True story of backrooms" produce poor queries.
+    # Strip common filler prefixes to get the core subject.
+    _TOPIC_FILLER_PREFIXES = [
+        "the true story of", "true story of", "the story of", "story of",
+        "the history of", "history of", "the real story of", "real story of",
+        "the truth about", "truth about", "everything about",
+        "a look at", "an introduction to", "introduction to",
+        "the rise of", "rise of", "the fall of", "fall of",
+        "the mystery of", "mystery of", "the secret of", "secret of",
+        "what is", "what are", "who is", "who are",
+        "how the", "why the", "the best of", "best of",
+    ]
+    if effective_topic:
+        t_lower = effective_topic.lower().strip()
+        for prefix in _TOPIC_FILLER_PREFIXES:
+            if t_lower.startswith(prefix):
+                remainder = effective_topic[len(prefix):].strip()
+                if remainder:
+                    effective_topic = remainder
+                break
+
+    # ── 1. Generate search queries per section ──
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    # ── Short, punchy transcript-based queries ──
+    # Goal: 2-4 word Google image searches like "sinners vampires",
+    # "smoke stack sinners", "twins sinners" — not long sentence fragments.
+    import re as _re
+
+    # Derive a short "slug" from the topic for appending to every query.
+    # e.g. "The Sinners 2025 movie" → "sinners"
+    #      "Bad Bunny Halftime Show" → "bad bunny"
+    #      "Backrooms explained" → "backrooms"
+    _TOPIC_DROP = _re.compile(
+        r"\b(movie|film|show|series|tv|explained|theories|theory|season|episode"
+        r"|part|20\d\d|the|a|an)\b",
+        _re.IGNORECASE,
+    )
+    _topic_slug = ""
+    if effective_topic:
+        _slug_words = _TOPIC_DROP.sub("", effective_topic).split()
+        _topic_slug = " ".join(_slug_words[:2]).strip().lower()  # max 2 words
+
+    # Stopwords that add no search value in an OSD label
+    _OSD_NOISE = {
+        "as", "the", "a", "an", "of", "in", "to", "and", "or", "for",
+        "is", "are", "its", "vs", "vs.", "it", "this", "that", "why",
+        "does", "not", "actually", "real", "true", "two", "three",
+        "machine", "language", "strategy", "strategies",
+        # additional filler words
+        "keep", "promise", "alternate", "selves", "survival",
+        "colonizers", "assimilation", "competing", "internal",
+        "literal", "alternate", "version", "versions",
+    }
+
+    def _osd_to_keywords(osd_text: str, max_kw: int = 2) -> str:
+        """Strip numbering + noise words; return top N content words."""
+        # Remove leading "1)" / "Number 1:" etc.
+        text = _re.sub(
+            r"^(?:number\s*)?\d+[\.\:\)\-]?\s*", "", osd_text, flags=_re.IGNORECASE
+        )
+        # Remove punctuation except letters/digits/spaces
+        text = _re.sub(r"[^\w\s]", " ", text)
+        words = [w.lower() for w in text.split() if w.lower() not in _OSD_NOISE and len(w) >= 3]
+        return " ".join(words[:max_kw])
+
+    for i, s in enumerate(sections):
+        label = (s.label or "").strip()
+        osd   = (s.on_screen_text or "").strip() if hasattr(s, "on_screen_text") else ""
+
+        # INTRO → just the topic slug (e.g. "sinners")
+        if label.upper() == "INTRO":
+            s.search_query = _topic_slug or effective_topic or label
+            print(f"  [query s{i:02d}] INTRO → {s.search_query!r}")
+            continue
+
+        # Core: key words from OSD label (most concise description of section)
+        core = _osd_to_keywords(osd or label, max_kw=3)
+
+        # If OSD gave nothing useful, fall back to top keywords from narration
+        if not core:
+            core = " ".join(extract_keywords(s.text, max_words=3))
+
+        # Final query: "[core concept] [topic slug]" — short and specific
+        if _topic_slug and _topic_slug not in core:
+            query = f"{core} {_topic_slug}".strip()
+        else:
+            query = core.strip() or _topic_slug or effective_topic or label
+
+        s.search_query = query or "background"
+        print(f"  [query s{i:02d}] osd={osd!r}  → {s.search_query!r}")
+
+    print(f"[scripted_short] Transcript-based queries generated")
+
+    # Fallback: derive queries from section text content.
+    # Extract the most distinctive terms from each section's narration.
+    for i, s in enumerate(sections):
+        if not s.search_query:
+            kws = extract_keywords(s.text, max_words=5)
+            if effective_topic:
+                # Combine topic + section-specific keywords.
+                kw_str = " ".join(kws[:4]).strip()
+                if kw_str and effective_topic.lower() not in kw_str.lower():
+                    s.search_query = f"{effective_topic} {kw_str}"
+                elif kw_str:
+                    s.search_query = kw_str
+                else:
+                    s.search_query = f"{effective_topic} {s.label}"
+            else:
+                s.search_query = " ".join(kws[:5]).strip() or s.label or "background"
+
+    print(f"[scripted_short] {len(sections)} sections, queries:")
+    for i, s in enumerate(sections):
+        print(f"  [{i}] {s.start:.1f}-{s.end:.1f} ({s.label}): {s.search_query}")
+
+    # ── 1b. Match user-provided reference images to sections ──
+    # Maps section index → local file path (pre-assigned, skip search).
+    _user_image_map: dict[int, str] = {}
+    if user_images:
+        _ui_items = [ui for ui in user_images if ui.get("title") and ui.get("path") and Path(ui["path"]).exists()]
+        if _ui_items and api_key:
+            # Use LLM to semantically match titles to sections.
+            try:
+                from .llm_storyboard import _openai_chat_completions
+                import json as _json
+
+                _sec_descs = []
+                for idx, s in enumerate(sections):
+                    _sec_descs.append(f"Section {idx} \"{s.label}\": {s.text[:200]}")
+                _img_descs = []
+                for idx, ui in enumerate(_ui_items):
+                    _img_descs.append(f"Image {idx}: \"{ui['title']}\"")
+
+                _match_sys = (
+                    "You match user-provided reference images to video script sections.\n"
+                    "Each image has a descriptive title. Match it to the section whose "
+                    "content it best illustrates.\n\n"
+                    "Return ONLY valid JSON: {\"matches\": [{\"image\": 0, \"section\": 2}, ...]}\n"
+                    "Only include confident matches. If an image title doesn't clearly "
+                    "match any section, omit it.\n"
+                )
+                _match_user = (
+                    "Sections:\n" + "\n".join(_sec_descs) + "\n\n"
+                    "Images:\n" + "\n".join(_img_descs) + "\n\n"
+                    "Match each image to the most relevant section."
+                )
+                _match_resp = _openai_chat_completions(
+                    api_key=api_key,
+                    model=llm_model,
+                    messages=[
+                        {"role": "system", "content": _match_sys},
+                        {"role": "user", "content": _match_user},
+                    ],
+                )
+                import re as _re
+                _ms = _match_resp.strip()
+                _mf = _re.search(r"```(?:json)?\s*\n?(.*?)```", _ms, _re.DOTALL)
+                if _mf:
+                    _ms = _mf.group(1).strip()
+                _parsed_matches = _json.loads(_ms)
+                _m_list = _parsed_matches.get("matches", []) if isinstance(_parsed_matches, dict) else []
+                for _m in _m_list:
+                    _img_idx = int(_m.get("image", -1))
+                    _sec_idx = int(_m.get("section", -1))
+                    if 0 <= _img_idx < len(_ui_items) and 0 <= _sec_idx < len(sections):
+                        _user_image_map[_sec_idx] = _ui_items[_img_idx]["path"]
+                        print(f"  [user image] Section {_sec_idx} ({sections[_sec_idx].label}) ← \"{_ui_items[_img_idx]['title']}\"")
+            except Exception as _e:
+                print(f"[scripted_short] LLM image-title matching failed: {_e}")
+
+        if not _user_image_map and _ui_items:
+            # Fallback: simple keyword overlap matching (no LLM).
+            for ui in _ui_items:
+                title_words = set(ui["title"].lower().split())
+                best_idx, best_score = -1, 0
+                for idx, s in enumerate(sections):
+                    if idx in _user_image_map:
+                        continue
+                    section_words = set((s.label + " " + s.text[:200]).lower().split())
+                    overlap = len(title_words & section_words)
+                    if overlap > best_score:
+                        best_score = overlap
+                        best_idx = idx
+                if best_idx >= 0 and best_score >= 1:
+                    _user_image_map[best_idx] = ui["path"]
+                    print(f"  [user image] Section {best_idx} ({sections[best_idx].label}) ← \"{ui['title']}\" (keyword match)")
+
+        if _user_image_map:
+            print(f"[scripted_short] {len(_user_image_map)} section(s) pre-assigned from user images")
+        elif user_images:
+            print(f"[scripted_short] No user images matched any section")
+
+    # ── 2. Image search helpers (same logic as main pipeline) ──
+    _is_portrait = int(video_height) > int(video_width) * 1.1
+
+    used_image_hashes: set[str] = set()
+    used_source_pages: list[str] = []
+
+    def _hash_file(p: str) -> str:
+        return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+    def _search(qstr: str) -> list[dict]:
+        """Search images using Playwright (primary) with SerpAPI/DuckDuckGo fallback."""
+        if not qstr:
+            return []
+
+        # Primary: Playwright-based Google Images scraping (free, no API key).
+        try:
+            from .playwright_images import playwright_google_image_search
+            results = playwright_google_image_search(
+                qstr, max_results=25, min_width=min_image_width,
+            )
+            if results:
+                return results
+        except Exception as e:
+            print(f"[scripted_short] Playwright image search failed: {e}")
+
+        # Fallback: SerpAPI if available.
+        if image_provider == "google_images" and serpapi_api_key:
+            try:
+                from .serpapi_provider import search_google_images_candidates_via_serpapi
+                return search_google_images_candidates_via_serpapi(
+                    qstr, api_key=serpapi_api_key,
+                    min_width=min_image_width, max_results=25,
+                )
+            except Exception as e:
+                print(f"[scripted_short] SerpAPI fallback failed: {e}")
+
+        # Last resort: DuckDuckGo.
+        try:
+            from .playwright_images import _ddg_image_fallback
+            return _ddg_image_fallback(qstr, max_results=25, min_width=min_image_width)
+        except Exception:
+            pass
+
+        return []
+
+    def _download_unique(info: dict, *, prefix: str) -> str | None:
+        dl_url = info.get("original_url") or info.get("image_url")
+        if not dl_url:
+            return None
+        p = download_image(dl_url, assets_dir, prefix=prefix)
+        h = _hash_file(str(p))
+        if h in used_image_hashes:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass
+            return None
+        used_image_hashes.add(h)
+        return str(p)
+
+    # ── Poster / bad-image filters ──
+
+    _POSTER_KWS = frozenset((
+        "poster", "cover", "artwork", "official-art", "keyart",
+        "key-art", "dvd", "bluray", "blu-ray", "boxart", "flyer",
+        "logo", "wordmark", "merchandise", "tshirt", "t-shirt",
+        "wallpaper", "fan-art", "fanart", "album", "soundtrack",
+        "theatrical", "one-sheet", "teaser_poster", "banner",
+    ))
+
+    def _is_bad_candidate(cand: dict) -> bool:
+        """Return True if candidate should be rejected outright."""
+        _url = (cand.get("original_url") or cand.get("image_url") or "").lower()
+        _title = (cand.get("title") or "").lower()
+        _page = (cand.get("page_url") or "").lower()
+        _blob = f"{_url} {_title} {_page}"
+
+        if any(kw in _blob for kw in _POSTER_KWS):
+            return True
+        if "/posters/" in _url or "/covers/" in _url:
+            return True
+        if "image.tmdb.org/t/p/" in _url:
+            return True
+        if "imdb.com" in _url and ("mediaviewer" in _page or "_V1_" in _url):
+            _w = cand.get("width") or 0
+            _h = cand.get("height") or 1
+            if _w and _h and (_h / max(1, _w)) > 1.2:
+                return True
+        # Very tall images are almost certainly posters.
+        _w = cand.get("width") or 0
+        _h = cand.get("height") or 0
+        if _w and _h and _h > 0 and (_h / max(1, _w)) > 1.6:
+            return True
+        return False
+
+    # ── LLM agent panel for image selection ──
+
+    def _agent_pick_image(
+        candidates: list[dict],
+        *,
+        section_label: str,
+        section_text: str,
+        query: str,
+        topic: str,
+    ) -> int:
+        """Use a panel of LLM 'agents' to discuss and select the best image.
+
+        Three perspectives debate which candidate is best:
+          - Visual Director: wants the most cinematic, specific scene still
+          - Fact Checker: ensures the image matches the actual content
+          - Anti-Poster Agent: vetoes anything that looks like a poster/promo
+
+        Returns the index into *candidates* of the chosen image.
+        """
+        import json as _json
+        from .llm_storyboard import _openai_chat_completions
+        _api_key = os.getenv("OPENAI_API_KEY")
+        if not _api_key or not candidates:
+            return 0  # fallback to first candidate
+
+        compact = []
+        for ci, c in enumerate(candidates[:12]):
+            compact.append({
+                "i": ci,
+                "title": (c.get("title") or "")[:120],
+                "source": (c.get("page_url") or "")[:120],
+                "url": (c.get("original_url") or c.get("image_url") or "")[:120],
+                "w": int(c.get("width") or 0),
+                "h": int(c.get("height") or 0),
+            })
+
+        system = (
+            "You are a panel of three expert agents selecting the BEST image for a "
+            "YouTube Short video slide. You must debate and agree on ONE image.\n\n"
+            "AGENT 1 — Visual Director:\n"
+            "  Wants a real PHOTOGRAPH or movie/TV SCENE STILL showing a recognizable "
+            "  person or moment. Prefers close-ups of actors in character, dramatic shots, "
+            "  candid moments. Hates generic stock photos.\n\n"
+            "AGENT 2 — Fact Checker:\n"
+            "  Ensures the image actually matches the section topic. The title, URL, and "
+            "  source page give clues. If the title mentions a different movie/show/person, "
+            "  reject it. Prefers images from reputable entertainment sites.\n\n"
+            "AGENT 3 — Anti-Poster Agent:\n"
+            "  VETOES any image that is likely a movie poster, DVD cover, promotional art, "
+            "  logo, text-heavy graphic, fan art, or merchandise. Clues: tall aspect ratio "
+            "  (h > w × 1.3), 'poster'/'cover'/'artwork' in title/URL, TMDB/IMDB poster URLs, "
+            "  stock photo sites (shutterstock, alamy, getty). Also vetoes images from "
+            "  Pinterest, Etsy, Redbubble, Amazon product pages.\n\n"
+            "PROCESS:\n"
+            "1. Each agent briefly evaluates the candidates (1 sentence each)\n"
+            "2. They discuss disagreements\n"
+            "3. They agree on the best index\n\n"
+            "Return ONLY valid JSON (no markdown):\n"
+            '{"discussion": "brief 2-3 sentence summary of the debate", '
+            '"chosen_index": <int>}'
+        )
+
+        user = _json.dumps({
+            "topic": topic,
+            "section_label": section_label,
+            "section_narration": section_text[:300],
+            "search_query": query,
+            "candidates": compact,
+        }, ensure_ascii=False)
+
+        try:
+            content = _openai_chat_completions(
+                api_key=_api_key,
+                model=llm_model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                timeout_s=25,
+            )
+            stripped = content.strip()
+            fence = _re_mod.search(r"```(?:json)?\s*\n?(.*?)```", stripped, _re_mod.DOTALL)
+            if fence:
+                stripped = fence.group(1).strip()
+            result = _json.loads(stripped)
+            idx = int(result.get("chosen_index", 0))
+            discussion = result.get("discussion", "")
+            if discussion:
+                print(f"    [agents] {discussion[:120]}")
+            if 0 <= idx < len(candidates):
+                return idx
+        except Exception as e:
+            print(f"    [agents] LLM pick failed ({e}), using first candidate")
+        return 0
+
+    import re as _re_mod
+
+    def _preprocess_portrait(src: str, *, prefix: str) -> str:
+        if not _is_portrait:
+            return src
+        try:
+            from PIL import Image, ImageEnhance, ImageFilter
+
+            img = Image.open(src).convert("RGB")
+            sw, sh = img.size
+            if sw <= 0 or sh <= 0:
+                return src
+            ratio = sw / sh
+            tgt_ratio = video_width / max(1, video_height)
+            if ratio / max(0.01, tgt_ratio) < 1.4:
+                # Aspect ratio already close to target — no blur-behind
+                # composite needed.  Still resize to exact target dims
+                # and save as JPEG so ALL concat inputs share the same
+                # codec (avoids PNG-vs-JPEG mismatch in FFmpeg concat).
+                tw, th = video_width, video_height
+                fg_scale = min(tw / sw, th / sh)
+                resized = img.resize(
+                    (max(1, int(sw * fg_scale + 0.5)),
+                     max(1, int(sh * fg_scale + 0.5))),
+                    Image.LANCZOS,
+                )
+                canvas = Image.new("RGB", (tw, th), (0, 0, 0))
+                fx = (tw - resized.width) // 2
+                fy = (th - resized.height) // 2
+                canvas.paste(resized, (fx, fy))
+                out = str(assets_dir / f"{prefix}_portrait.jpg")
+                canvas.save(out, quality=95)
+                return out
+            tw, th = video_width, video_height
+            bg_scale = max(tw / sw, th / sh)
+            bg = img.resize((int(sw * bg_scale + 0.5), int(sh * bg_scale + 0.5)), Image.LANCZOS)
+            bx, by = (bg.width - tw) // 2, (bg.height - th) // 2
+            bg = bg.crop((bx, by, bx + tw, by + th))
+            bg = bg.filter(ImageFilter.GaussianBlur(radius=30))
+            bg = ImageEnhance.Brightness(bg).enhance(0.35)
+            fg_scale = min(tw / sw, th / sh)
+            fg = img.resize((int(sw * fg_scale + 0.5), int(sh * fg_scale + 0.5)), Image.LANCZOS)
+            fx, fy = (tw - fg.width) // 2, (th - fg.height) // 2
+            canvas = bg.copy()
+            canvas.paste(fg, (fx, fy))
+            out = str(assets_dir / f"{prefix}_portrait.jpg")
+            canvas.save(out, quality=95)
+            return out
+        except Exception:
+            return src
+
+    def _burn_on_screen_text(src: str, text: str, *, prefix: str) -> str:
+        """Burn on-screen text into the lower-third of a slide image.
+
+        Returns the path to the modified image, or *src* unchanged on error.
+        """
+        if not text.strip():
+            return src
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+
+            img = Image.open(src).convert("RGB")
+            w, h = img.size
+            draw = ImageDraw.Draw(img)
+
+            # Pick a bold font.
+            font_size = max(24, int(w * 0.038))
+            font = None
+            for fp in [
+                r"C:\Windows\Fonts\seguisb.ttf",
+                r"C:\Windows\Fonts\segoeuib.ttf",
+                r"C:\Windows\Fonts\arialbd.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            ]:
+                try:
+                    font = ImageFont.truetype(fp, font_size)
+                    break
+                except Exception:
+                    continue
+            if font is None:
+                font = ImageFont.load_default()
+
+            lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+            margin_x = int(w * 0.06)
+            max_text_w = w - 2 * margin_x
+
+            # Word-wrap each line.
+            wrapped: list[str] = []
+            for line in lines:
+                words = line.split()
+                cur = ""
+                for word in words:
+                    test = f"{cur} {word}".strip()
+                    bbox = draw.textbbox((0, 0), test, font=font)
+                    if (bbox[2] - bbox[0]) > max_text_w and cur:
+                        wrapped.append(cur)
+                        cur = word
+                    else:
+                        cur = test
+                if cur:
+                    wrapped.append(cur)
+
+            if not wrapped:
+                return src
+
+            line_h = int(font_size * 1.35)
+            block_h = len(wrapped) * line_h
+            pad_y = int(line_h * 0.5)
+            pad_x = int(margin_x * 0.7)
+
+            # Position: lower third of the frame (above caption zone).
+            box_top = int(h * 0.38) - block_h // 2
+            box_bottom = box_top + block_h + 2 * pad_y
+
+            # Semi-transparent dark pill behind text.
+            overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            od = ImageDraw.Draw(overlay)
+            # Find the widest line for pill width.
+            max_line_w = 0
+            for ln in wrapped:
+                bbox = draw.textbbox((0, 0), ln, font=font)
+                max_line_w = max(max_line_w, bbox[2] - bbox[0])
+            pill_w = max_line_w + 2 * pad_x
+            pill_x = (w - pill_w) // 2
+            od.rounded_rectangle(
+                [pill_x, box_top, pill_x + pill_w, box_bottom],
+                radius=int(font_size * 0.4),
+                fill=(0, 0, 0, 160),
+            )
+            img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+            draw = ImageDraw.Draw(img)
+
+            # Draw text lines centered.
+            y = box_top + pad_y
+            for ln in wrapped:
+                bbox = draw.textbbox((0, 0), ln, font=font)
+                lw = bbox[2] - bbox[0]
+                x = (w - lw) // 2
+                # White text with thin dark outline for readability.
+                for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1), (-2, 0), (2, 0), (0, -2), (0, 2)]:
+                    draw.text((x + dx, y + dy), ln, font=font, fill=(0, 0, 0))
+                draw.text((x, y), ln, font=font, fill=(255, 255, 255))
+                y += line_h
+
+            out = str(assets_dir / f"{prefix}_osd.jpg")
+            img.save(out, quality=95)
+            return out
+        except Exception:
+            import traceback; traceback.print_exc()
+            return src
+
+    # ── 3. Search + download: first unique valid image wins ──
+
+    # Locate a prior scripted-short output for the same audio (image reuse).
+    def _find_prior_scripted_dir() -> Path | None:
+        if not reuse_images:
+            return None
+        cwd = Path.cwd()
+        stem_lower = audio_path.stem.lower()
+        best: Path | None = None
+        best_mtime = 0.0
+        for d in cwd.iterdir():
+            if not d.is_dir() or not d.name.startswith("output_"):
+                continue
+            if stem_lower not in d.name.lower():
+                continue
+            if d.resolve() == Path(out_dir).resolve():
+                continue  # skip the current output dir
+            assets_d = d / "assets"
+            if not assets_d.is_dir():
+                continue
+            if not list(assets_d.glob("s00*")):
+                continue
+            m = d.stat().st_mtime
+            if m > best_mtime:
+                best_mtime = m
+                best = d
+        return best
+
+    _reuse_src: Path | None = _find_prior_scripted_dir()
+    if _reuse_src:
+        print(f"[scripted_short] Reusing assets from: {_reuse_src.name}")
+    elif reuse_images:
+        print("[scripted_short] No prior run found — downloading fresh images")
+
+    slides: list[Slide] = []
+    last_image: str | None = None
+
+    for i, sec in enumerate(tqdm(sections, desc="Searching images")):
+        image_path: str | None = None
+        info: dict | None = None
+
+        # ── Priority: use user-provided image if pre-assigned ──
+        if i in _user_image_map:
+            _upath = _user_image_map[i]
+            if Path(_upath).exists():
+                import shutil as _shutil
+                _dst = str(assets_dir / f"s{i:02d}_user{Path(_upath).suffix}")
+                _shutil.copy2(_upath, _dst)
+                image_path = _dst
+                print(f"  [s{i:02d}] Using user-provided image (skipping search)")
+
+        # ── Priority 2: reuse portrait image from prior run ──
+        if image_path is None and _reuse_src is not None:
+            _reuse_assets_dir = _reuse_src / "assets"
+            # Prefer *_portrait.jpg (processed), fall back to any s{i:02d}* image.
+            _reuse_cands = sorted(_reuse_assets_dir.glob(f"s{i:02d}_portrait*.jpg"))
+            if not _reuse_cands:
+                _reuse_cands = sorted(
+                    p for p in _reuse_assets_dir.glob(f"s{i:02d}*")
+                    if p.suffix.lower() in (".jpg", ".jpeg", ".png")
+                    and "_osd" not in p.name
+                )
+            if _reuse_cands:
+                import shutil as _shutil_reuse
+                _rsrc = _reuse_cands[-1]
+                _rdst = assets_dir / _rsrc.name
+                if not _rdst.exists():
+                    _shutil_reuse.copy2(_rsrc, _rdst)
+                image_path = str(_rdst)
+                print(f"  [s{i:02d}] Reused from prior run: {_rsrc.name}")
+
+        # Try primary query, then topic-only fallback.
+        queries = [sec.search_query]
+        if effective_topic and effective_topic.lower() not in sec.search_query.lower():
+            queries.append(f"{effective_topic} {sec.label}")
+        if effective_topic:
+            queries.append(effective_topic)
+
+        for q in queries:
+            if image_path:
+                break
+            print(f"  [s{i:02d}] querying: {q}")
+            try:
+                candidates = _search(q)
+            except Exception:
+                candidates = []
+
+            # Pre-filter obviously bad candidates (posters, covers, etc.)
+            filtered = [c for c in candidates if not _is_bad_candidate(c)]
+            if not filtered:
+                filtered = candidates  # if ALL rejected, try them anyway
+
+            if not filtered:
+                continue
+
+            # Use agent panel to pick the best candidate.
+            best_idx = _agent_pick_image(
+                filtered,
+                section_label=sec.label,
+                section_text=sec.text,
+                query=q,
+                topic=effective_topic or "",
+            )
+
+            # Try the agent's pick first, then fall through to others.
+            _order = [best_idx] + [j for j in range(len(filtered)) if j != best_idx]
+            for ci in _order:
+                if ci >= len(filtered):
+                    continue
+                cand = filtered[ci]
+                try:
+                    p = _download_unique(cand, prefix=f"s{i:02d}")
+                except Exception:
+                    p = None
+                if p:
+                    image_path = p
+                    info = cand
+                    if cand.get("page_url"):
+                        used_source_pages.append(str(cand["page_url"]))
+                    _pick_label = "agent pick" if ci == best_idx else f"fallback #{ci}"
+                    print(f"  [s{i:02d}] ✓ got image ({_pick_label})")
+                    break
+
+        if not image_path:
+            if last_image:
+                image_path = last_image
+            else:
+                continue  # skip (should be very rare)
+
+        image_path = _preprocess_portrait(image_path, prefix=f"s{i:02d}")
+        last_image = image_path
+
+        # On-screen text is now rendered as audio-synced ASS overlays at
+        # render time (see captions.generate_on_screen_text_ass), NOT
+        # burned into slide images.
+
+        # Timing placeholder — set below via Whisper word-timestamp matching.
+        slides.append(Slide(
+            start=0.0,
+            end=0.0,
+            image_path=image_path,
+            query=sec.search_query,
+        ))
+
+    if not slides:
+        raise RuntimeError("Could not download any images for the scripted sections.")
+
+    # ── Sync slide timing to audio via Whisper word-level alignment ──
+    # Load Whisper word timestamps first — needed for both slide timing and
+    # caption/OSD generation later.
+    try:
+        from .transcribe import ensure_word_timestamps
+        word_data = ensure_word_timestamps(audio_path, model_name="small")
+    except Exception:
+        word_data = []
+
+    if word_data:
+        # For each section, find where its text actually starts in the audio
+        # by searching for the opening words in the Whisper word stream.
+        import difflib
+
+        whisper_lower = [str(w.get("word", "")).strip().lower().rstrip(".,!?…;:'\"") for w in word_data]
+
+        def _find_section_start(script_text: str, search_from: int = 0) -> float | None:
+            """Find the Whisper timestamp where *script_text* starts."""
+            sw = script_text.split()
+            if not sw:
+                return None
+            # Try to match the first 3-5 words as a fingerprint.
+            needle = [w.lower().rstrip(".,!?…;:'\"") for w in sw[:5]]
+            best_score = 0.0
+            best_idx = -1
+            for i in range(search_from, len(whisper_lower) - len(needle) + 1):
+                chunk = whisper_lower[i:i + len(needle)]
+                score = difflib.SequenceMatcher(None, needle, chunk).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_idx = i
+                if score >= 0.8:
+                    break  # good enough — take first match
+            if best_idx >= 0 and best_score >= 0.5:
+                return float(word_data[best_idx]["start"])
+            return None
+
+        section_starts: list[float] = []
+        search_cursor = 0
+        for idx, sec in enumerate(sections):
+            # Include label + on_screen_text before narration body so we
+            # match the moment the speaker says "Number one, Vampires as
+            # colonizers" rather than the later explanation body.
+            import re as _re_inner
+            _label = sec.label or ""
+            _osd = sec.on_screen_text or ""
+            _osd_clean = _re_inner.sub(r'^\d+[)\.]\s*', '', _osd).strip()
+            _match_text = f"{_label} {_osd_clean} {sec.text}".strip()
+            t = _find_section_start(_match_text, search_from=search_cursor)
+            if t is not None:
+                section_starts.append(t)
+                # Advance cursor past this hit so sections stay ordered.
+                for ci in range(search_cursor, len(whisper_lower)):
+                    if float(word_data[ci]["start"]) >= t:
+                        search_cursor = ci + 1
+                        break
+            else:
+                # Fallback: interpolate from neighbors.
+                section_starts.append(-1.0)  # placeholder, resolved below
+
+        # Resolve any -1 placeholders by linear interpolation.
+        for idx in range(len(section_starts)):
+            if section_starts[idx] < 0:
+                prev_t = section_starts[idx - 1] if idx > 0 else 0.0
+                next_t = audio_duration
+                for j in range(idx + 1, len(section_starts)):
+                    if section_starts[j] >= 0:
+                        next_t = section_starts[j]
+                        break
+                section_starts[idx] = round((prev_t + next_t) / 2, 3)
+
+        print("[scripted_short] Slide timing (Whisper-aligned):")
+        for idx in range(len(slides)):
+            t_start = section_starts[idx]
+            t_end = section_starts[idx + 1] if idx + 1 < len(section_starts) else float(audio_duration)
+            slides[idx] = Slide(
+                start=round(t_start, 3),
+                end=round(t_end, 3),
+                image_path=slides[idx].image_path,
+                query=slides[idx].query,
+            )
+            print(f"  s{idx:02d} {t_start:.2f}–{t_end:.2f}s")
+
+    else:
+        # No Whisper data — fall back to word-count proportional.
+        section_word_counts = [len(s.text.split()) for s in sections]
+        total_words = sum(section_word_counts) or 1
+        cumulative = 0
+        for idx in range(len(slides)):
+            t_start = round(cumulative / total_words * audio_duration, 3)
+            cumulative += section_word_counts[idx] if idx < len(section_word_counts) else 0
+            t_end = round(cumulative / total_words * audio_duration, 3) if idx + 1 < len(slides) else float(audio_duration)
+            slides[idx] = Slide(start=t_start, end=t_end,
+                                image_path=slides[idx].image_path, query=slides[idx].query)
+        print("[scripted_short] Slide timing (word-count proportional fallback)")
+
+    # Always start from 0, end at full duration.
+    slides[0] = Slide(start=0.0, end=slides[0].end,
+                      image_path=slides[0].image_path, query=slides[0].query)
+    slides[-1] = Slide(start=slides[-1].start, end=float(audio_duration),
+                       image_path=slides[-1].image_path, query=slides[-1].query)
+
+    # ── 4. Write outputs ──
+    write_json(out_dir / "timeline.json", [asdict(s) for s in slides])
+
+    # Save the parsed script for reference.
+    write_json(out_dir / "script_sections.json", [
+        {"start": s.start, "end": s.end, "label": s.label, "text": s.text,
+         "on_screen_text": s.on_screen_text, "search_query": s.search_query}
+        for s in sections
+    ])
+
+    try:
+        write_json(out_dir / "run_meta.json", {
+            "audio_name": audio_path.name,
+            "audio_stem": audio_path.stem,
+            "audio_size": int(audio_stat.st_size),
+            "audio_mtime": float(audio_stat.st_mtime),
+            "render_audio_path": None,
+            "video_type": "scripted_short",
+            "video_width": int(video_width),
+            "video_height": int(video_height),
+            "topic": effective_topic,
+            "topic_type": None,
+            "image_provider": image_provider,
+            "created_at": time.time(),
+            "cwd": os.getcwd(),
+        })
+    except Exception:
+        pass
+
+    print(f"[scripted_short] timeline.json written with {len(slides)} slides")
     return out_dir
