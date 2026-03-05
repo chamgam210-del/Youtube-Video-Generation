@@ -404,7 +404,7 @@ with col_left:
     mix_video_clips = st.checkbox(
         "Mix in video clips (B-roll)",
         value=False,
-        help="Use AI to find and splice relevant video clips (e.g. movie trailers, scenes) into the video as B-roll. Requires SERPAPI_API_KEY and yt-dlp.",
+        help="Use AI to find and splice relevant video clips (e.g. movie trailers, scenes) into the video as B-roll. Requires Playwright and yt-dlp.",
     )
     max_video_clips = 6
     if mix_video_clips:

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +21,7 @@ def _ffmpeg_exe() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
-# ── SerpAPI video search ────────────────────────────────────────────────────
+# ── Playwright YouTube search ───────────────────────────────────────────────
 
 
 @dataclass
@@ -70,6 +71,133 @@ def _parse_view_count(raw: Any) -> int | None:
     return int(num)
 
 
+def _playwright_youtube_search(
+    query: str,
+    *,
+    max_results: int = 5,
+    sort_by_views: bool = False,
+) -> list[VideoSearchResult]:
+    """Search YouTube via headless Playwright and scrape video results.
+
+    Returns a list of ``VideoSearchResult`` with title, URL, duration, and
+    approximate view count.  Requires ``playwright`` with Chromium installed.
+    """
+    import asyncio as _asyncio
+    from urllib.parse import quote_plus
+
+    if sys.platform == "win32":
+        _asyncio.set_event_loop_policy(_asyncio.WindowsProactorEventLoopPolicy())
+
+    from playwright.sync_api import sync_playwright
+
+    # YouTube search URL.  sp=CAMSAhAB sorts by view count.
+    encoded_q = quote_plus(query)
+    yt_url = f"https://www.youtube.com/results?search_query={encoded_q}"
+    if sort_by_views:
+        yt_url += "&sp=CAMSAhAB"
+
+    results: list[VideoSearchResult] = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        ctx = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1400, "height": 900},
+            locale="en-US",
+        )
+        page = ctx.new_page()
+        page.add_init_script(
+            'Object.defineProperty(navigator, "webdriver", {get: () => false})'
+        )
+
+        page.goto(yt_url, timeout=25000, wait_until="domcontentloaded")
+        page.wait_for_timeout(3000)  # let JS render results
+
+        # Accept cookie consent if present (YouTube's EU cookie banner).
+        try:
+            consent = page.query_selector(
+                "button[aria-label*='Accept'], tp-yt-paper-button.ytd-consent-bump-v2-lightbox"
+            )
+            if consent:
+                consent.click()
+                page.wait_for_timeout(1500)
+        except Exception:
+            pass
+
+        # Scroll down once to load more results.
+        page.keyboard.press("End")
+        page.wait_for_timeout(1500)
+
+        # ── Extract video results from the DOM ──
+        # YouTube renders <ytd-video-renderer> elements for each result.
+        renderers = page.query_selector_all("ytd-video-renderer")
+
+        for renderer in renderers:
+            if len(results) >= max_results:
+                break
+            try:
+                # Title + link live inside the <a id="video-title"> element.
+                title_el = renderer.query_selector("a#video-title")
+                if not title_el:
+                    continue
+                title = (title_el.get_attribute("title") or title_el.inner_text() or "").strip()
+                href = title_el.get_attribute("href") or ""
+                if not href:
+                    continue
+                # Build full URL.
+                if href.startswith("/"):
+                    video_url = f"https://www.youtube.com{href}"
+                else:
+                    video_url = href
+                # Only keep youtube watch URLs.
+                if "/watch?v=" not in video_url and "/shorts/" not in video_url:
+                    continue
+
+                # Duration badge: <span class="style-scope ytd-thumbnail-overlay-time-status-renderer">
+                dur_el = renderer.query_selector(
+                    "ytd-thumbnail-overlay-time-status-renderer span#text, "
+                    "span.ytd-thumbnail-overlay-time-status-renderer"
+                )
+                dur_text = dur_el.inner_text().strip() if dur_el else None
+                dur = _parse_duration(dur_text)
+
+                # View count text: "1.2M views" or "123K views"
+                meta_el = renderer.query_selector(
+                    "#metadata-line span.inline-metadata-item, "
+                    "#metadata-line span.style-scope.ytd-video-meta-block"
+                )
+                views_text = meta_el.inner_text().strip() if meta_el else None
+                views = _parse_view_count(views_text)
+
+                # Thumbnail
+                thumb_el = renderer.query_selector("img#img")
+                thumb = thumb_el.get_attribute("src") if thumb_el else None
+
+                results.append(
+                    VideoSearchResult(
+                        title=title,
+                        url=video_url,
+                        source="youtube",
+                        duration_seconds=dur,
+                        thumbnail=thumb,
+                        view_count=views,
+                    )
+                )
+            except Exception:
+                continue
+
+        browser.close()
+
+    return results
+
+
 def search_video_clips(
     query: str,
     *,
@@ -77,115 +205,38 @@ def search_video_clips(
     preferred_max_duration: float = 300.0,
     sort_by_views: bool = False,
 ) -> list[VideoSearchResult]:
-    """Search for video clips using SerpAPI YouTube search.
+    """Search for video clips on YouTube using Playwright.
 
-    When *sort_by_views* is True the results are requested sorted by view-count
+    When *sort_by_views* is True the results are sorted by view-count
     so the most popular / viral clips appear first.
-
-    Falls back to Google Video search if YouTube-specific search isn't available.
     """
-
-    api_key = os.getenv("SERPAPI_API_KEY")
-    if not api_key:
-        print(f"[clip_search] SERPAPI_API_KEY not set — skipping search for: {query}")
-        return []
-
-    import requests
-
-    print(f"[clip_search] Searching YouTube: {query!r}  (sort_by_views={sort_by_views})")
+    print(f"[clip_search] Searching YouTube (Playwright): {query!r}  (sort_by_views={sort_by_views})")
     results: list[VideoSearchResult] = []
 
-    # Strategy 1: SerpAPI YouTube search.
+    # Strategy 1: Direct YouTube search via Playwright.
     try:
-        params = {
-            "engine": "youtube",
-            "search_query": query,
-            "api_key": api_key,
-        }
-        # sp=CAMSAhAB → sort by view count (most popular first)
-        if sort_by_views:
-            params["sp"] = "CAMSAhAB"
-        resp = requests.get("https://serpapi.com/search.json", params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+        results = _playwright_youtube_search(
+            query,
+            max_results=max_results * 2,
+            sort_by_views=sort_by_views,
+        )
+    except Exception as e:
+        print(f"[clip_search] Playwright YouTube search failed: {e}")
 
-        for item in data.get("video_results", [])[:max_results * 2]:
-            url = item.get("link") or ""
-            title = item.get("title") or ""
-            dur = _parse_duration(item.get("length", {}).get("text") if isinstance(item.get("length"), dict) else item.get("length"))
-            thumb = None
-            thumbnails = item.get("thumbnail", {})
-            if isinstance(thumbnails, dict):
-                thumb = thumbnails.get("static") or thumbnails.get("rich")
-            elif isinstance(thumbnails, str):
-                thumb = thumbnails
+    # Filter by preferred max duration.
+    results = [
+        r for r in results
+        if r.duration_seconds is None or r.duration_seconds <= preferred_max_duration
+    ]
 
-            # Parse view count for popularity ranking.
-            views = _parse_view_count(item.get("views"))
-
-            if not url or "youtube.com" not in url:
-                continue
-            if dur and dur > preferred_max_duration:
-                continue
-
-            results.append(
-                VideoSearchResult(
-                    title=title,
-                    url=url,
-                    source="youtube",
-                    duration_seconds=dur,
-                    thumbnail=thumb,
-                    view_count=views,
-                )
-            )
-            if len(results) >= max_results:
-                break
-    except Exception:
-        pass
-
-    # Strategy 2: If YouTube search returned nothing, try Google Video search.
-    if not results:
-        try:
-            params = {
-                "engine": "google_videos",
-                "q": query,
-                "api_key": api_key,
-            }
-            resp = requests.get("https://serpapi.com/search.json", params=params, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-
-            for item in data.get("video_results", [])[:max_results * 2]:
-                url = item.get("link") or ""
-                title = item.get("title") or ""
-                dur_text = None
-                rich = item.get("rich_snippet", {})
-                if isinstance(rich, dict):
-                    dur_text = rich.get("duration")
-                dur = _parse_duration(dur_text)
-                thumb = item.get("thumbnail", {})
-                if isinstance(thumb, dict):
-                    thumb = thumb.get("src")
-
-                if not url:
-                    continue
-                if dur and dur > preferred_max_duration:
-                    continue
-
-                source = "youtube" if "youtube.com" in url or "youtu.be" in url else "web"
-                results.append(
-                    VideoSearchResult(
-                        title=title,
-                        url=url,
-                        source=source,
-                        duration_seconds=dur,
-                        thumbnail=thumb if isinstance(thumb, str) else None,
-                    )
-                )
-                if len(results) >= max_results:
-                    break
-        except Exception:
-            pass
+    # Deduplicate by URL.
+    seen: set[str] = set()
+    deduped: list[VideoSearchResult] = []
+    for r in results:
+        if r.url not in seen:
+            seen.add(r.url)
+            deduped.append(r)
+    results = deduped[:max_results]
 
     print(f"[clip_search] Found {len(results)} results for {query!r}")
     for r in results[:5]:
