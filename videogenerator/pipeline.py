@@ -3605,6 +3605,27 @@ def run_scripted_short(
                 q2 = f"{_topic_name} trailer" if _topic_name else f"{base} clip"
                 _clip_queries[si] = [q1.strip(), q2.strip()]
 
+        # ── Topic keyword set for relevance filtering ─────────────────
+        # Build a set of lowercased words from the topic to filter results.
+        # e.g. "The Sinners 2025 movie" → {"sinners"}
+        _topic_kw_set: set[str] = set()
+        if _topic_name:
+            _stop = {"the", "a", "an", "of", "in", "to", "and", "or", "for", "is",
+                     "movie", "film", "show", "series", "tv", "part", "season"}
+            _topic_kw_set = {
+                w.lower() for w in _topic_name.split()
+                if len(w) >= 3 and w.lower() not in _stop
+            }
+
+        def _rank_by_relevance(results: list) -> list:
+            """Re-order results so those whose title contains topic keywords come first."""
+            if not _topic_kw_set:
+                return results
+            def _score(r) -> int:
+                title_lower = (r.title or "").lower()
+                return sum(1 for kw in _topic_kw_set if kw in title_lower)
+            return sorted(results, key=_score, reverse=True)
+
         # ── Step B: Download source videos (trailers / clips) ─────────
         #    Cache downloaded raw files so the same YouTube video can provide
         #    multiple different segments to different sub-slides.
@@ -3675,10 +3696,12 @@ def run_scripted_short(
                     try:
                         results = search_video_clips(
                             q,
-                            max_results=6,
+                            max_results=8,
                             preferred_max_duration=600.0,
-                            sort_by_views=True,
+                            sort_by_views=False,  # use YouTube relevance ranking
                         )
+                        # Re-rank: results whose title contains topic keywords first.
+                        results = _rank_by_relevance(results)
                         # Try each result until download succeeds.
                         for ri, chosen in enumerate(results):
                             raw_path = _download_raw(chosen.url, prefix=f"{clip_tag}_r{ri}")
