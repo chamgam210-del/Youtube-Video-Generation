@@ -148,16 +148,16 @@ with col_left:
 
     video_type = st.selectbox(
         "Video type",
-        options=["review (images only)", "short review (9:16, images only)", "explainer (text + images)", "commentary (clip insertion)", "clip review (9:16, full clips)", "shorts (9:16)", "shorts review (9:16, retention)", "scripted short (9:16, from script)", "auto"],
+        options=["review (images only)", "short review (9:16, images only)", "explainer (text + images)", "commentary (clip insertion)", "clip review (9:16, full clips)", "shorts (9:16)", "shorts review (9:16, retention)", "scripted short (9:16, from script)", "video short (9:16, clips from script)", "auto"],
         index=0,
-        help="Explainer/shorts use LLM-planned text-on-slide storyboards. Commentary auto-inserts referenced clips and compilations. Clip review fills entire video with muted movie clips. Scripted short uses a timestamped script you paste to search one image per section.",
+        help="Explainer/shorts use LLM-planned text-on-slide storyboards. Commentary auto-inserts referenced clips and compilations. Clip review fills entire video with muted movie clips. Scripted short uses a timestamped script you paste to search one image per section. Video short is like scripted short but uses YouTube clips instead of images.",
     )
 
     # When creating Shorts, retention usually improves with faster cuts and more images.
     # We set dynamic defaults when the user switches video_type.
     # ── Scripted Short: script text area ──
     scripted_short_script = ""
-    if video_type.startswith("scripted short"):
+    if video_type.startswith("scripted short") or video_type.startswith("video short"):
         scripted_short_script = st.text_area(
             "Paste your timestamped script",
             value="",
@@ -613,7 +613,8 @@ with col_right:
 
         vt = "review"
         _is_short_review_images = video_type.startswith("short review")
-        _is_scripted_short = video_type.startswith("scripted short")
+        _is_scripted_short = video_type.startswith("scripted short") or video_type.startswith("video short")
+        _is_video_short = video_type.startswith("video short")
         if video_type.startswith("explainer"):
             vt = "explainer"
         elif video_type.startswith("commentary"):
@@ -623,7 +624,7 @@ with col_right:
         elif video_type.startswith("shorts review"):
             vt = "shorts_review"
         elif _is_scripted_short:
-            vt = "scripted_short"
+            vt = "video_short" if _is_video_short else "scripted_short"
         elif video_type.startswith("shorts"):
             vt = "shorts"
         elif _is_short_review_images:
@@ -633,14 +634,14 @@ with col_right:
 
         # Render sizing preset.
         vid_w, vid_h = (1920, 1080)
-        if vt in {"shorts", "shorts_review", "clip_review", "scripted_short"} or _is_short_review_images:
+        if vt in {"shorts", "shorts_review", "clip_review", "scripted_short", "video_short"} or _is_short_review_images:
             vid_w, vid_h = (1080, 1920)
 
         # Shorts defaults: no transitions.
         run_max_images = int(max_images) if max_images is not None else None
         run_transition = transition
         run_transition_seconds = float(transition_seconds)
-        if vt in {"shorts", "shorts_review", "clip_review", "scripted_short"} or _is_short_review_images:
+        if vt in {"shorts", "shorts_review", "clip_review", "scripted_short", "video_short"} or _is_short_review_images:
             run_transition = "none"
             run_transition_seconds = 0.0
 
@@ -707,6 +708,7 @@ with col_right:
                     llm_model="gpt-4o-mini",
                     user_images=_user_images_for_pipeline or None,
                     reuse_images=bool(effective_reuse_images),
+                    use_clips=_is_video_short,
                 )
             else:
                 run(
@@ -821,7 +823,7 @@ with col_right:
             outro_s = max(0.0, float(outro_seconds))
 
             # Shorts / clip_review / short review images / scripted short: no channel intro/outro branding slates.
-            if vt in {"shorts", "clip_review", "scripted_short"} or _is_short_review_images:
+            if vt in {"shorts", "clip_review", "scripted_short", "video_short"} or _is_short_review_images:
                 intro_s = 0.0
                 outro_s = 0.0
 

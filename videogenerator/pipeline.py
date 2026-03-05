@@ -2685,6 +2685,7 @@ def run_scripted_short(
     llm_model: str = "gpt-4o-mini",
     user_images: list[dict] | None = None,
     reuse_images: bool = True,
+    use_clips: bool = False,
 ) -> Path:
     """Build a timeline for a **Scripted Short**.
 
@@ -3506,6 +3507,120 @@ def run_scripted_short(
     slides[-1] = Slide(start=slides[-1].start, end=float(audio_duration),
                        image_path=slides[-1].image_path, query=slides[-1].query)
 
+    # ── 3b. Video Short: overlay muted YouTube clips on each section ──
+    if use_clips:
+        from .clip_tools import (
+            search_video_clips,
+            download_clip,
+            download_clip_section,
+            trim_clip,
+            find_best_clip_segment,
+            get_video_duration,
+        )
+
+        clip_dir = ensure_dir(out_dir / "clips")
+        _seen_clip_urls: set[str] = set()
+
+        # Max clip duration per section — keep short for copyright safety.
+        _MAX_CLIP_S = 8.0
+
+        print(f"[video_short] Searching & downloading clips for {len(slides)} sections…")
+        for si, slide in enumerate(slides):
+            section_dur = slide.end - slide.start
+            clip_dur = min(_MAX_CLIP_S, section_dur)  # cap at 8s per clip
+            if clip_dur < 2.0:
+                continue
+
+            query = slide.query or sections[si].search_query if si < len(sections) else ""
+            if not query:
+                continue
+
+            # Append "scene" or "clip" to bias towards actual footage.
+            clip_query = f"{query} scene clip"
+
+            try:
+                results = search_video_clips(
+                    clip_query,
+                    max_results=6,
+                    preferred_max_duration=300.0,
+                    sort_by_views=True,
+                )
+                # Filter out already-used URLs.
+                results = [r for r in results if r.url not in _seen_clip_urls] or results[:1]
+                if not results:
+                    print(f"  [clip s{si:02d}] no results — keeping image")
+                    continue
+
+                # Pick the first YouTube result (most viewed).
+                chosen = results[0]
+                _seen_clip_urls.add(chosen.url)
+
+                # Download just a section of the video.
+                raw_path = download_clip_section(
+                    chosen.url,
+                    clip_dir / "raw",
+                    start=0.0,
+                    end=min(60.0, clip_dur * 3),
+                    prefix=f"s{si:02d}",
+                )
+                if raw_path is None:
+                    # Fallback: full download.
+                    raw_path = download_clip(
+                        chosen.url,
+                        clip_dir / "raw",
+                        prefix=f"s{si:02d}",
+                        max_duration=120.0,
+                    )
+
+                if raw_path is None:
+                    print(f"  [clip s{si:02d}] download failed — keeping image")
+                    continue
+
+                # Find the best segment within the clip.
+                seg_start, seg_dur = find_best_clip_segment(
+                    raw_path,
+                    target_duration=clip_dur,
+                    model=llm_model,
+                    search_query=query,
+                    video_title=chosen.title,
+                )
+
+                # Trim + scale to portrait.
+                trimmed = clip_dir / f"prepared_s{si:02d}.mp4"
+                trim_clip(
+                    raw_path,
+                    trimmed,
+                    start=seg_start,
+                    duration=seg_dur,
+                    width=video_width,
+                    height=video_height,
+                    mute=True,  # always muted — narrator plays over
+                )
+
+                actual_dur = get_video_duration(trimmed)
+                if actual_dur <= 0:
+                    actual_dur = seg_dur
+
+                # Replace slide with clip version (image stays as fallback).
+                slides[si] = Slide(
+                    start=slide.start,
+                    end=slide.end,
+                    image_path=slide.image_path,
+                    query=slide.query,
+                    video_clip_path=str(trimmed),
+                    video_clip_start=0.0,
+                    video_clip_end=min(actual_dur, section_dur),
+                    video_clip_mute=True,
+                )
+                print(f"  [clip s{si:02d}] ✓ {chosen.title[:60]} ({seg_dur:.1f}s)")
+
+            except Exception as _clip_err:
+                import traceback; traceback.print_exc()
+                print(f"  [clip s{si:02d}] error: {_clip_err} — keeping image")
+
+        n_clips = sum(1 for s in slides if s.video_clip_path)
+        print(f"[video_short] {n_clips}/{len(slides)} sections have video clips")
+
     # ── 4. Write outputs ──
     write_json(out_dir / "timeline.json", [asdict(s) for s in slides])
 
@@ -3523,7 +3638,7 @@ def run_scripted_short(
             "audio_size": int(audio_stat.st_size),
             "audio_mtime": float(audio_stat.st_mtime),
             "render_audio_path": None,
-            "video_type": "scripted_short",
+            "video_type": "video_short" if use_clips else "scripted_short",
             "video_width": int(video_width),
             "video_height": int(video_height),
             "topic": effective_topic,
