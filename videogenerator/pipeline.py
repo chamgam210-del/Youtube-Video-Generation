@@ -3507,8 +3507,19 @@ def run_scripted_short(
     slides[-1] = Slide(start=slides[-1].start, end=float(audio_duration),
                        image_path=slides[-1].image_path, query=slides[-1].query)
 
-    # ── 3b. Video Short: overlay muted YouTube clips on each section ──
+    # ── 3b. Video Short: fill video entirely with YouTube clips ─────────
+    #
+    # Strategy:
+    # 1) LLM generates scene-specific clip queries from the transcript
+    #    (e.g. "sinners vampire attack scene", "smoke stack sinners movie clip")
+    # 2) Search YouTube for trailers / movie clips / scene compilations
+    # 3) Download longer source videos; extract multiple distinct ~6-8s segments
+    # 4) Split each section into sub-slides so clips fill the entire video
+    # 5) Keep each individual clip ≤ 8 s for copyright safety
+    #
     if use_clips:
+        import json as _clip_json
+        import math as _clip_math
         from .clip_tools import (
             search_video_clips,
             download_clip,
@@ -3517,109 +3528,243 @@ def run_scripted_short(
             find_best_clip_segment,
             get_video_duration,
         )
+        from .llm_storyboard import _openai_chat_completions
 
         clip_dir = ensure_dir(out_dir / "clips")
         _seen_clip_urls: set[str] = set()
 
-        # Max clip duration per section — keep short for copyright safety.
-        _MAX_CLIP_S = 8.0
+        # ── Copyright-safe bounds ──
+        _MAX_CLIP_S = 8.0   # max seconds per individual clip
+        _MIN_CLIP_S = 3.0   # don't bother with clips shorter than this
 
-        print(f"[video_short] Searching & downloading clips for {len(slides)} sections…")
-        for si, slide in enumerate(slides):
-            section_dur = slide.end - slide.start
-            clip_dur = min(_MAX_CLIP_S, section_dur)  # cap at 8s per clip
-            if clip_dur < 2.0:
-                continue
+        # ── Step A: LLM generates scene-specific clip queries ─────────
+        _clip_api_key = os.getenv("OPENAI_API_KEY")
+        _clip_queries: dict[int, list[str]] = {}  # section index → list of queries
 
-            query = slide.query or sections[si].search_query if si < len(sections) else ""
-            if not query:
-                continue
+        if _clip_api_key:
+            _sections_for_llm = []
+            for si, sec in enumerate(sections):
+                _sections_for_llm.append({
+                    "index": si,
+                    "label": sec.label or "",
+                    "osd": getattr(sec, "on_screen_text", "") or "",
+                    "text": (sec.text or "")[:300],
+                })
 
-            # Append "scene" or "clip" to bias towards actual footage.
-            clip_query = f"{query} scene clip"
+            _clip_sys = (
+                "You are generating YouTube search queries to find SHORT CLIPS from "
+                "trailers, movie scenes, or TV show clips on YouTube.\n\n"
+                f"The topic is: \"{effective_topic or 'unknown'}\"\n\n"
+                "For each section of the script, generate 2-3 search queries that will "
+                "find ACTUAL FOOTAGE from this movie/show/topic on YouTube.\n\n"
+                "Rules:\n"
+                "- Every query MUST include the topic name (movie/show title)\n"
+                "- Add scene-descriptive words from the narration (e.g. \"vampire\", "
+                "\"fight\", \"smoke\", \"twins\", \"chase\")\n"
+                "- Target: trailers, official clips, scene compilations, behind the scenes\n"
+                "- Keep queries 3-6 words: \"{topic} {scene description} scene/clip/trailer\"\n"
+                "- Examples: \"sinners vampire scene\", \"sinners smoke stack clip\", "
+                "\"sinners movie trailer\", \"sinners twins fight scene\"\n\n"
+                "Return ONLY valid JSON — an array of objects:\n"
+                '[{"index": 0, "queries": ["query1", "query2"]}, ...]'
+            )
 
             try:
-                results = search_video_clips(
-                    clip_query,
-                    max_results=6,
-                    preferred_max_duration=300.0,
-                    sort_by_views=True,
-                )
-                # Filter out already-used URLs.
-                results = [r for r in results if r.url not in _seen_clip_urls] or results[:1]
-                if not results:
-                    print(f"  [clip s{si:02d}] no results — keeping image")
-                    continue
-
-                # Pick the first YouTube result (most viewed).
-                chosen = results[0]
-                _seen_clip_urls.add(chosen.url)
-
-                # Download just a section of the video.
-                raw_path = download_clip_section(
-                    chosen.url,
-                    clip_dir / "raw",
-                    start=0.0,
-                    end=min(60.0, clip_dur * 3),
-                    prefix=f"s{si:02d}",
-                )
-                if raw_path is None:
-                    # Fallback: full download.
-                    raw_path = download_clip(
-                        chosen.url,
-                        clip_dir / "raw",
-                        prefix=f"s{si:02d}",
-                        max_duration=120.0,
-                    )
-
-                if raw_path is None:
-                    print(f"  [clip s{si:02d}] download failed — keeping image")
-                    continue
-
-                # Find the best segment within the clip.
-                seg_start, seg_dur = find_best_clip_segment(
-                    raw_path,
-                    target_duration=clip_dur,
+                _clip_resp = _openai_chat_completions(
+                    api_key=_clip_api_key,
                     model=llm_model,
-                    search_query=query,
-                    video_title=chosen.title,
+                    messages=[
+                        {"role": "system", "content": _clip_sys},
+                        {"role": "user", "content": _clip_json.dumps(_sections_for_llm, ensure_ascii=False)},
+                    ],
+                    timeout_s=30,
                 )
+                _stripped = _clip_resp.strip()
+                import re as _cre
+                _fence = _cre.search(r"```(?:json)?\s*\n?(.*?)```", _stripped, _cre.DOTALL)
+                if _fence:
+                    _stripped = _fence.group(1).strip()
+                _parsed_queries = _clip_json.loads(_stripped)
+                for item in _parsed_queries:
+                    idx = int(item.get("index", -1))
+                    qs = item.get("queries", [])
+                    if 0 <= idx < len(sections) and qs:
+                        _clip_queries[idx] = [str(q) for q in qs]
+                print(f"[video_short] LLM generated clip queries for {len(_clip_queries)} sections")
+                for idx, qs in _clip_queries.items():
+                    print(f"  [s{idx:02d}] {qs}")
+            except Exception as _llm_err:
+                print(f"[video_short] LLM query generation failed: {_llm_err} — using fallback queries")
 
-                # Trim + scale to portrait.
-                trimmed = clip_dir / f"prepared_s{si:02d}.mp4"
-                trim_clip(
-                    raw_path,
-                    trimmed,
-                    start=seg_start,
-                    duration=seg_dur,
-                    width=video_width,
-                    height=video_height,
-                    mute=True,  # always muted — narrator plays over
+        # Fallback: build queries from existing search_query + topic
+        _topic_name = effective_topic or ""
+        for si in range(len(sections)):
+            if si not in _clip_queries:
+                base = sections[si].search_query or sections[si].label or ""
+                q1 = f"{base} scene" if _topic_name.lower() in base.lower() else f"{base} {_topic_name} scene"
+                q2 = f"{_topic_name} trailer" if _topic_name else f"{base} clip"
+                _clip_queries[si] = [q1.strip(), q2.strip()]
+
+        # ── Step B: Download source videos (trailers / clips) ─────────
+        #    Cache downloaded raw files so the same YouTube video can provide
+        #    multiple different segments to different sub-slides.
+        _raw_cache: dict[str, Path | None] = {}  # url → raw file path
+
+        def _download_raw(url: str, prefix: str) -> Path | None:
+            if url in _raw_cache:
+                return _raw_cache[url]
+            raw = download_clip_section(
+                url, clip_dir / "raw",
+                start=0.0, end=180.0,  # grab up to 3 min from trailers
+                prefix=prefix,
+            )
+            if raw is None:
+                raw = download_clip(
+                    url, clip_dir / "raw",
+                    prefix=prefix,
+                    max_duration=300.0,
                 )
+            _raw_cache[url] = raw
+            return raw
 
-                actual_dur = get_video_duration(trimmed)
-                if actual_dur <= 0:
-                    actual_dur = seg_dur
+        # ── Step C: Build clip sub-slides for every section ───────────
+        new_slides: list[Slide] = []
+        _sub_counter = 0
+        _used_segments: dict[str, list[tuple[float, float]]] = {}  # path → list of (start, end)
 
-                # Replace slide with clip version (image stays as fallback).
-                slides[si] = Slide(
-                    start=slide.start,
-                    end=slide.end,
-                    image_path=slide.image_path,
-                    query=slide.query,
-                    video_clip_path=str(trimmed),
-                    video_clip_start=0.0,
-                    video_clip_end=min(actual_dur, section_dur),
-                    video_clip_mute=True,
-                )
-                print(f"  [clip s{si:02d}] ✓ {chosen.title[:60]} ({seg_dur:.1f}s)")
+        def _segment_overlaps(path: str, start: float, dur: float) -> bool:
+            """Check if a segment overlaps with any already-used segment from the same source."""
+            for (s, e) in _used_segments.get(path, []):
+                if start < e and (start + dur) > s:
+                    return True
+            return False
 
-            except Exception as _clip_err:
-                import traceback; traceback.print_exc()
-                print(f"  [clip s{si:02d}] error: {_clip_err} — keeping image")
+        def _mark_segment(path: str, start: float, dur: float) -> None:
+            _used_segments.setdefault(path, []).append((start, start + dur))
 
+        print(f"\n[video_short] Building clips for {len(slides)} sections (clips only, no images)…")
+
+        for si, slide in enumerate(slides):
+            section_dur = slide.end - slide.start
+            if section_dur < _MIN_CLIP_S:
+                # Tiny section — single clip
+                new_slides.append(slide)
+                continue
+
+            # How many sub-clips needed to fill this section?
+            n_subclips = max(1, _clip_math.ceil(section_dur / _MAX_CLIP_S))
+            sub_dur = section_dur / n_subclips  # even split
+
+            queries = _clip_queries.get(si, [f"{_topic_name} clip"])
+            section_clips_ok = 0
+
+            for sub_i in range(n_subclips):
+                sub_start = slide.start + sub_i * sub_dur
+                sub_end = sub_start + sub_dur
+                if sub_i == n_subclips - 1:
+                    sub_end = slide.end  # absorb rounding
+
+                actual_sub_dur = sub_end - sub_start
+                clip_tag = f"s{si:02d}c{sub_i}"
+                got_clip = False
+
+                # Try each query in order until one produces a clip.
+                for qi, q in enumerate(queries):
+                    if got_clip:
+                        break
+                    try:
+                        results = search_video_clips(
+                            q,
+                            max_results=6,
+                            preferred_max_duration=600.0,
+                            sort_by_views=True,
+                        )
+                        # Try each result until download succeeds.
+                        for ri, chosen in enumerate(results):
+                            raw_path = _download_raw(chosen.url, prefix=f"{clip_tag}_r{ri}")
+                            if raw_path is None:
+                                continue
+
+                            raw_dur = get_video_duration(raw_path)
+                            if raw_dur < _MIN_CLIP_S:
+                                continue
+
+                            # Find a segment that doesn't overlap with already-used parts.
+                            seg_start, seg_dur = find_best_clip_segment(
+                                raw_path,
+                                target_duration=min(actual_sub_dur, _MAX_CLIP_S),
+                                model=llm_model,
+                                search_query=q,
+                                video_title=chosen.title,
+                            )
+
+                            # Avoid reusing the same exact part of a video.
+                            raw_key = str(raw_path)
+                            if _segment_overlaps(raw_key, seg_start, seg_dur):
+                                # Try an offset segment instead.
+                                alt_start = seg_start + seg_dur + 2.0
+                                if alt_start + seg_dur <= raw_dur:
+                                    seg_start = alt_start
+                                else:
+                                    # Try from beginning area
+                                    alt_start = max(0.0, seg_start - seg_dur - 2.0)
+                                    if not _segment_overlaps(raw_key, alt_start, seg_dur):
+                                        seg_start = alt_start
+                                    else:
+                                        continue  # fully used up, try next result
+
+                            # Trim to portrait.
+                            trimmed = clip_dir / f"prepared_{clip_tag}.mp4"
+                            trim_clip(
+                                raw_path,
+                                trimmed,
+                                start=seg_start,
+                                duration=min(seg_dur, actual_sub_dur),
+                                width=video_width,
+                                height=video_height,
+                                mute=True,
+                            )
+
+                            actual_dur = get_video_duration(trimmed)
+                            if actual_dur <= 0:
+                                actual_dur = seg_dur
+
+                            _mark_segment(raw_key, seg_start, seg_dur)
+
+                            new_slides.append(Slide(
+                                start=sub_start,
+                                end=sub_end,
+                                image_path=slide.image_path,  # kept as render fallback
+                                query=q,
+                                video_clip_path=str(trimmed),
+                                video_clip_start=0.0,
+                                video_clip_end=min(actual_dur, actual_sub_dur),
+                                video_clip_mute=True,
+                            ))
+                            got_clip = True
+                            section_clips_ok += 1
+                            print(f"  [{clip_tag}] ✓ {chosen.title[:50]} "
+                                  f"@{seg_start:.1f}s ({min(seg_dur, actual_sub_dur):.1f}s)")
+                            break
+
+                    except Exception as _clip_err:
+                        import traceback; traceback.print_exc()
+                        print(f"  [{clip_tag}] query {qi} error: {_clip_err}")
+
+                if not got_clip:
+                    # Last resort: insert the sub-slide without a clip (image shows).
+                    # In a clips-only short this shouldn't happen often.
+                    new_slides.append(Slide(
+                        start=sub_start, end=sub_end,
+                        image_path=slide.image_path, query=slide.query,
+                    ))
+                    print(f"  [{clip_tag}] ✗ no clip found — image fallback")
+
+            print(f"  [section {si:02d}] {section_clips_ok}/{n_subclips} sub-clips filled")
+
+        slides = new_slides
         n_clips = sum(1 for s in slides if s.video_clip_path)
-        print(f"[video_short] {n_clips}/{len(slides)} sections have video clips")
+        print(f"[video_short] {n_clips}/{len(slides)} total sub-slides have video clips")
 
     # ── 4. Write outputs ──
     write_json(out_dir / "timeline.json", [asdict(s) for s in slides])
