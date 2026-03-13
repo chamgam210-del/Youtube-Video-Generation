@@ -52,11 +52,9 @@ def playwright_google_image_search(
                 'Object.defineProperty(navigator, "webdriver", {get: () => false})'
             )
 
-            # Add negative keywords to suppress posters/covers in results.
-            _search_q = f"{query} -poster -cover -logo -dvd"
-            encoded_q = quote_plus(_search_q)
-            # tbs=itp:photo = filter to photographs only (no clipart/drawings/posters).
-            url = f"https://www.google.com/search?q={encoded_q}&tbm=isch&hl=en&tbs=itp:photo"
+            # Search Google Images — use the query as-is, no forced negative keywords.
+            encoded_q = quote_plus(query)
+            url = f"https://www.google.com/search?q={encoded_q}&tbm=isch&hl=en"
             page.goto(url, timeout=20000, wait_until="domcontentloaded")
             page.wait_for_timeout(3000)
 

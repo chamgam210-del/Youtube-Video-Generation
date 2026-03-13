@@ -600,13 +600,17 @@ def pick_image_with_llm(
         )
 
     system = (
-        "You are an assistant that selects the best Wikimedia Commons image candidate for a YouTube review video background. "
+        "You are an assistant that selects the best image candidate for a YouTube review video background. "
         "Return ONLY valid JSON (no markdown). "
         "Output schema: {\"index\": <int>} where index is one of the provided candidate i values. "
         "Choose an image that best matches the slide query and the transcript window. "
         "Avoid images whose source_page is already used if possible. "
-        "Strongly prefer: real photos, on-topic stills, portraits of relevant people, or generic b-roll that matches the described scene/mood. "
-        "Strongly avoid: typography/wordmarks, logos, title cards, book scans, PDF page renders, document scans, and unrelated artwork."
+        "You MUST choose images that look like actual frames captured from inside the movie or TV show "
+        "(i.e. screencaps, film stills showing actors in character, in-scene footage). "
+        "NEVER choose: behind-the-scenes photos, on-set production photos, press/premiere/red carpet photos, "
+        "interviews, photocalls, posters, logos, title cards, book scans, PDF page renders, document scans, "
+        "or unrelated artwork. If in doubt, prefer an image whose title mentions \"scene\", \"still\", "
+        "\"screencap\", \"screenshot\", or \"frame\"."
     )
 
     user = {

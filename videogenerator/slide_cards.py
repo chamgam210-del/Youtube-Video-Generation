@@ -12,6 +12,146 @@ class SlideCardSpec:
     subhead: str | None = None
 
 
+def render_text_card(
+    *,
+    out_path: str | Path,
+    text: str,
+    width: int,
+    height: int,
+    bg_color: tuple[int, int, int] = (0, 0, 0),
+    text_color: tuple[int, int, int] = (255, 255, 255),
+    font_size_ratio: float = 0.12,
+) -> Path:
+    """Render a pure-text card (no background image) — e.g. "5 Bad movies from 2025" or just "5"."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    im = Image.new("RGB", (width, height), bg_color)
+    draw = ImageDraw.Draw(im)
+
+    max_size = max(40, int(width * font_size_ratio))
+    min_size = max(30, int(max_size * 0.5))
+    font = _pick_font(
+        text, width,
+        max_size=max_size, min_size=min_size,
+        prefer=[
+            r"C:\\Windows\\Fonts\\segoeuib.ttf",
+            r"C:\\Windows\\Fonts\\arialbd.ttf",
+            r"C:\\Windows\\Fonts\\impact.ttf",
+        ],
+    )
+
+    margin_x = int(width * 0.08)
+    lines = _wrap_to_width(draw, text, font, max_width=width - 2 * margin_x)
+
+    # Compute block height.
+    line_gap = int(font.size * 0.20)
+    block_h = len(lines) * int(font.size) + max(0, len(lines) - 1) * line_gap
+    y = max(0, (height - block_h) // 2)
+
+    _draw_centered_lines(
+        draw,
+        lines=lines,
+        font=font,
+        cx=width // 2,
+        y=y,
+        fill=text_color,
+        stroke_width=max(2, min(4, width // 320)),
+        stroke_fill=(0, 0, 0),
+        line_gap=line_gap,
+    )
+
+    im.save(out_path, format="PNG")
+    return out_path
+
+
+def burn_title_on_image(
+    *,
+    image_path: str | Path,
+    out_path: str | Path,
+    title: str,
+    width: int,
+    height: int,
+    text_color: tuple[int, int, int] = (255, 255, 0),
+    position: str = "top",
+) -> Path:
+    """Overlay a title heading on an existing image and save to *out_path*.
+
+    The image is first resized/cropped to *width*×*height*, then a semi-transparent
+    dark band is drawn behind the title text for legibility.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with Image.open(image_path) as im:
+        im = im.convert("RGB")
+
+        # Cover-crop to target aspect.
+        src_w, src_h = im.size
+        target_ratio = width / float(height)
+        src_ratio = src_w / float(src_h)
+        if src_ratio > target_ratio:
+            new_w = int(src_h * target_ratio)
+            left = (src_w - new_w) // 2
+            im = im.crop((left, 0, left + new_w, src_h))
+        else:
+            new_h = int(src_w / target_ratio)
+            top = (src_h - new_h) // 2
+            im = im.crop((0, top, src_w, top + new_h))
+        im = im.resize((width, height), Image.Resampling.LANCZOS)
+
+        draw = ImageDraw.Draw(im)
+
+        def _scale_px(px_1080: int) -> int:
+            return max(10, int(round(float(px_1080) * (float(width) / 1080.0))))
+
+        font = _pick_font(
+            title, width,
+            max_size=_scale_px(100),
+            min_size=_scale_px(60),
+            prefer=[
+                r"C:\\Windows\\Fonts\\segoeuib.ttf",
+                r"C:\\Windows\\Fonts\\arialbd.ttf",
+                r"C:\\Windows\\Fonts\\impact.ttf",
+            ],
+        )
+
+        margin_x = int(width * 0.06)
+        lines = _wrap_to_width(draw, title, font, max_width=width - 2 * margin_x)
+        line_gap = int(font.size * 0.18)
+        block_h = len(lines) * int(font.size) + max(0, len(lines) - 1) * line_gap
+
+        # Draw semi-transparent dark band behind the text.
+        pad_y = int(height * 0.02)
+        if position == "top":
+            band_y0 = int(height * 0.06)
+        else:
+            band_y0 = int(height * 0.75) - block_h // 2
+        band_y1 = band_y0 + block_h + 2 * pad_y
+
+        band = Image.new("RGBA", (width, band_y1 - band_y0), (0, 0, 0, 160))
+        im_rgba = im.convert("RGBA")
+        im_rgba.paste(band, (0, band_y0), band)
+        im = im_rgba.convert("RGB")
+        draw = ImageDraw.Draw(im)
+
+        text_y = band_y0 + pad_y
+        _draw_centered_lines(
+            draw,
+            lines=lines,
+            font=font,
+            cx=width // 2,
+            y=text_y,
+            fill=text_color,
+            stroke_width=max(2, min(4, width // 320)),
+            stroke_fill=(0, 0, 0),
+            line_gap=line_gap,
+        )
+
+        im.save(out_path, format="PNG")
+    return out_path
+
+
 def render_slide_card(
     *,
     background_image: str | Path,

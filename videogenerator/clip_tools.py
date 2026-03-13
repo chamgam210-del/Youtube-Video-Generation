@@ -384,6 +384,7 @@ def get_video_info(url: str) -> dict[str, Any] | None:
         cmd = [
             ytdlp,
             "--no-playlist",
+            "--js-runtimes", "node",
             "--print", "%(title)s\n%(duration)s",
             "--no-download",
             "--no-warnings",
@@ -438,8 +439,9 @@ def download_clip_section(
     cmd = [
         ytdlp,
         "--no-playlist",
+        "--js-runtimes", "node",
         "--ffmpeg-location", ffmpeg_dir,
-        "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best",
+        "-f", "bestvideo[height>=720][height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height>=720][height<=1080][ext=mp4]/best[height>=720][height<=1080]/best[height>=720]",
         "--merge-output-format", "mp4",
         "-o", out_template,
         "--socket-timeout", "30",
@@ -466,8 +468,9 @@ def download_clip_section(
         cmd_fallback = [
             ytdlp,
             "--no-playlist",
+            "--js-runtimes", "node",
             "--ffmpeg-location", ffmpeg_dir,
-            "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best",
+            "-f", "bestvideo[height>=720][height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height>=720][height<=1080][ext=mp4]/best[height>=720][height<=1080]/best[height>=720]",
             "--merge-output-format", "mp4",
             "-o", out_template,
             "--max-filesize", "200M",
@@ -518,11 +521,12 @@ def download_clip(
     cmd = [
         ytdlp,
         "--no-playlist",
+        "--js-runtimes", "node",
         "--ffmpeg-location", ffmpeg_dir,
-        "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best",
+        "-f", "bestvideo[height>=720][height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height>=720][height<=1080][ext=mp4]/best[height>=720][height<=1080]/best[height>=720]",
         "--merge-output-format", "mp4",
         "-o", out_template,
-        "--max-filesize", "100M",
+        "--max-filesize", "200M",
         "--socket-timeout", "30",
         "--retries", "2",
         "--no-overwrites",
@@ -619,10 +623,19 @@ def trim_clip(
 
     source_has_audio = _has_audio_stream(input_path)
 
-    vf = (
-        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+    # Blur-background technique: fill frame with a blurred/scaled version of the
+    # source, then overlay the content scaled to *fit* (no cropping) centred on top.
+    # This avoids cutting off any part of the original frame while still filling
+    # the target canvas (no black bars).
+    video_filter = (
+        f"[0:v]split=2[bg][fg];"
+        f"[bg]scale={width}:{height}:force_original_aspect_ratio=increase,"
         f"crop={width}:{height}:(in_w-out_w)/2:(in_h-out_h)/2,"
-        f"setsar=1,format=yuv420p"
+        f"gblur=sigma=20,setsar=1[blurred];"
+        f"[fg]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"setsar=1[content];"
+        f"[blurred][content]overlay=(W-w)/2:(H-h)/2,"
+        f"format=yuv420p[vout]"
     )
 
     cmd = [
@@ -637,21 +650,21 @@ def trim_clip(
 
     cmd += [
         "-t", f"{duration:.3f}",
-        "-vf", vf,
+        "-filter_complex", video_filter,
+        "-map", "[vout]",
         "-c:v", "libx264",
         "-preset", "fast",
         "-crf", "23",
         "-r", "30",
-        "-pix_fmt", "yuv420p",
     ]
 
     if mute:
         cmd += ["-an"]
     elif source_has_audio:
-        cmd += ["-c:a", "aac", "-b:a", "128k"]
+        cmd += ["-map", "0:a", "-c:a", "aac", "-b:a", "128k"]
     else:
         # Map video from first input, audio from anullsrc.
-        cmd += ["-map", "0:v", "-map", "1:a", "-shortest", "-c:a", "aac", "-b:a", "128k"]
+        cmd += ["-map", "1:a", "-shortest", "-c:a", "aac", "-b:a", "128k"]
 
     cmd.append(str(output_path))
 

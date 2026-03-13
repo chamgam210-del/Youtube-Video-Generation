@@ -40,6 +40,7 @@ def run(
     llm_model: str = "gpt-4o-mini",
     llm_pick_images: bool = True,
     reuse_images: bool = True,
+    pool_image_paths: list[str | Path] | None = None,
     mix_video_clips: bool = False,
     max_video_clips: int = 6,
     clip_queries: list[str] | None = None,
@@ -1017,30 +1018,49 @@ def run(
         return hashlib.sha256(b).hexdigest()
 
     def _search_candidates(qstr: str) -> list[dict]:
+        """Search images — Playwright primary, SerpAPI/Wikimedia fallback."""
         if not qstr:
             return []
-        if image_provider == "serpapi":
-            if not serpapi_api_key:
-                raise RuntimeError("--image-provider serpapi requires --serpapi-key or SERPAPI_API_KEY")
-            from .serpapi_provider import search_commons_candidates_via_serpapi
 
+        # Primary: Playwright-based Google Images scraping (free, no API key).
+        try:
+            from .playwright_images import playwright_google_image_search
+            results = playwright_google_image_search(
+                qstr, max_results=25, min_width=min_image_width,
+            )
+            if results:
+                return results
+        except Exception as e:
+            print(f"[image_search] Playwright failed for {qstr!r}: {e}")
+
+        # Fallback: SerpAPI if available and configured.
+        if image_provider == "serpapi" and serpapi_api_key:
+            from .serpapi_provider import search_commons_candidates_via_serpapi
             return search_commons_candidates_via_serpapi(
                 qstr,
                 api_key=serpapi_api_key,
                 min_width=min_image_width,
                 max_results=25,
             )
-        if image_provider == "google_images":
-            if not serpapi_api_key:
-                raise RuntimeError("--image-provider google_images requires --serpapi-key or SERPAPI_API_KEY")
+        if image_provider == "google_images" and serpapi_api_key:
             from .serpapi_provider import search_google_images_candidates_via_serpapi
-
             return search_google_images_candidates_via_serpapi(
                 qstr,
                 api_key=serpapi_api_key,
                 min_width=min_image_width,
                 max_results=25,
             )
+
+        # Last resort: DuckDuckGo.
+        try:
+            from .playwright_images import _ddg_image_fallback
+            results = _ddg_image_fallback(qstr, max_results=25, min_width=min_image_width)
+            if results:
+                return results
+        except Exception:
+            pass
+
+        # Wikimedia Commons (always available).
         return search_commons_images(qstr, min_width=min_image_width, max_results=25)
 
     def _tokenize(s: str) -> set[str]:
@@ -1082,8 +1102,14 @@ def run(
             if any(b in blob for b in bad):
                 score -= 2.5
 
+            # Penalize production / press / BTS results — not actual movie frames.
+            bad_prod = ["behind the scenes", "on set", "press", "premiere", "red carpet",
+                        "photocall", "production still", "interview", "arrivals", "junket"]
+            if any(b in blob for b in bad_prod):
+                score -= 2.0
+
             # Bonus for scene still / portrait hints.
-            good = ["still", "scene", "screencap", "frame", "portrait", "close", "face"]
+            good = ["still", "scene", "screencap", "frame", "screenshot", "close", "face"]
             if any(g in blob for g in good):
                 score += 0.8
 
@@ -1559,10 +1585,12 @@ def run(
 
     # Seed image: try to download at least one image for the topic.
     seed_topic = effective_topic or (topic or "").strip() or None
+    _cached_seed_candidates: list[dict] = []  # reused by pool block below
     if (reuse_source_dir is None) and seed_topic:
         try:
             seed_candidates = _search_candidates(seed_topic)
             seed_candidates = _rerank_candidates(seed_candidates, qstr=seed_topic)
+            _cached_seed_candidates = seed_candidates
             seed = seed_candidates[0] if seed_candidates else None
             if seed and seed.get("image_url"):
                 p = download_image(seed["image_url"], assets_dir, prefix="seed")
@@ -1580,6 +1608,47 @@ def run(
 
     hook_raw_bg_image: str | None = None
     hook_info_for_reuse: dict | None = None
+
+    # ── Review still-pool: single query, top 20 images ──
+    # Skipped when the caller already provided pool_image_paths (e.g. UI image picker).
+    if pool_image_paths:
+        _provided = [Path(p) for p in pool_image_paths if Path(p).exists()]
+        if _provided:
+            import random as _rng_review
+            _rng_review.shuffle(_provided)
+            reuse_image_paths = _provided
+            print(f"[review] Using {len(reuse_image_paths)} UI-selected images")
+    elif vt == "review" and not reuse_image_paths and seed_topic:
+        import random as _rng_review
+
+        _still_query = seed_topic.strip()
+        _still_pool_paths: list[Path] = []
+        # Reuse results already fetched for the seed image (same query) to avoid a
+        # duplicate search.
+        if _cached_seed_candidates:
+            _pool_cands = _cached_seed_candidates
+        else:
+            try:
+                _pool_cands = _search_candidates(_still_query)
+            except Exception:
+                _pool_cands = []
+            _pool_cands = _rerank_candidates(_pool_cands, qstr=_still_query)
+        for _cand in _pool_cands[:20]:
+            try:
+                _p = _download_unique(_cand, prefix=f"pool{len(_still_pool_paths):02d}")
+            except Exception:
+                _p = None
+            if _p:
+                _still_pool_paths.append(Path(_p))
+                if _cand.get("page_url"):
+                    used_source_pages.append(str(_cand.get("page_url")))
+                    _d = _domain(str(_cand.get("page_url")))
+                    if _d:
+                        used_source_domains.add(_d)
+        if _still_pool_paths:
+            _rng_review.shuffle(_still_pool_paths)
+            reuse_image_paths = _still_pool_paths
+            print(f"[review] Pre-fetched {len(_still_pool_paths)} stills for {_still_query!r}")
 
     for i, (start, end, llm_query, headline, subhead) in enumerate(tqdm(planned, desc="Finding images")):
         # Caption integrity (Shorts Review): if the on-screen caption doesn't change,
@@ -1680,7 +1749,7 @@ def run(
 
         # Secondary query: LLM-suggested hints, but still anchored.
         q_llm = q_llm_raw
-        _anchor_llm = vt in {"explainer", "shorts", "shorts_review"} or (vt == "review" and _is_portrait_output)
+        _anchor_llm = vt in {"explainer", "shorts", "shorts_review"}
         if _anchor_llm and anchor:
             if q_llm:
                 if anchor.lower() not in q_llm.lower():
@@ -1689,7 +1758,7 @@ def run(
                 q_llm = ""
 
         # If this looks like TV content, bias toward episode stills/cast.
-        _tv_enrich = vt in {"explainer", "shorts", "shorts_review"} or (vt == "review" and _is_portrait_output)
+        _tv_enrich = vt in {"explainer", "shorts", "shorts_review"}
         if _tv_enrich and (topic_type == "tv_show"):
             if q_context and not any(k in q_context.lower() for k in ("still", "stills", "cast", "scene", "episode")):
                 q_context = f"{q_context} TV series scene still".strip()
@@ -1697,7 +1766,7 @@ def run(
                 q_llm = f"{q_llm} TV series scene still".strip()
 
         # Shorts Review or portrait-review: bias toward in-scene imagery.
-        _enrich_queries = (vt == "shorts_review") or (vt == "review" and _is_portrait_output)
+        _enrich_queries = vt in {"shorts_review"}
         if _enrich_queries:
             # Rotate visual suffixes per slide to encourage image variety.
             _VISUAL_SUFFIXES = [
@@ -1868,132 +1937,188 @@ def run(
             "No images could be found/downloaded for the selected segments. Try a different --topic, increase --max-images, or lower --min-image-width."
         )
 
-    # ── Video clip mixing: LLM suggests clips → search → download → trim → assign ──
-    # Skip this basic path when --clip-queries or --clip-research is used (handled below).
+    # ── Video clip mixing: official trailers → 7s clips → fill every slide ──
+    # Skip this path when --clip-queries or --clip-research is used (handled below).
     if mix_video_clips and vt in {"review", "review_long"} and not clip_queries and not clip_research:
         try:
-            from .clip_suggestions import suggest_video_clips
-            from .clip_tools import prepare_clip_for_suggestion
+            from .clip_tools import (
+                search_video_clips,
+                download_clip,
+                download_clip_section,
+                trim_clip,
+                get_video_duration as _rv_clip_dur,
+            )
+            import random as _rv_rnd
 
             clip_dir = ensure_dir(out_dir / "clips")
+            _rv_raw_dir = ensure_dir(clip_dir / "raw")
+            _clip_topic = effective_topic or audio_path.stem
+            _rv_clip_secs = 7.0
+            _rv_skip_secs = 12.0  # skip opening credits
 
-            suggestions = suggest_video_clips(
-                segments=segments,
-                topic=effective_topic or audio_path.stem,
-                title=audio_path.stem,
-                video_type=vt,
-                audio_duration=timeline_duration,
-                max_clips=max_video_clips,
-                model=llm_model,
-            )
-            write_json(out_dir / "clip_suggestions.json", [
-                {"timeline_start": s.timeline_start, "timeline_end": s.timeline_end,
-                 "search_query": s.search_query, "reason": s.reason, "mute": s.mute}
-                for s in suggestions
-            ])
+            _REJECT_RV = {
+                "reaction", "react", "review", "explained", "breakdown", "analysis",
+                "commentary", "opinion", "discuss", "theory", "theories", "ranking",
+                "tier list", "video essay", "response", "rant", "hot take",
+            }
 
-            prepared_clips = []
-            for ci, sug in enumerate(suggestions):
-                try:
-                    pc = prepare_clip_for_suggestion(
-                        sug,
-                        dest_dir=clip_dir,
-                        clip_index=ci,
-                        width=video_width,
-                        height=video_height,
-                        llm_model=llm_model,
-                    )
-                    if pc is not None:
-                        prepared_clips.append(pc)
-                except Exception:
-                    pass  # Non-fatal; skip this clip.
+            def _is_official_rv(t: str) -> bool:
+                tl = t.lower()
+                for rw in _REJECT_RV:
+                    if rw in tl:
+                        return False
+                return True
 
-            # Assign prepared clips to matching slides.
-            # For each prepared clip, find the slide whose time range best overlaps
-            # and split it: [image before] [video clip] [image after].
-            from .clip_tools import get_video_duration as _clip_dur
+            # ── Reuse raw trailers from a prior run if available ──
+            _rv_raw_trailers: list[tuple[Path, float]] = []
+            _rv_seen_files: set[str] = set()
 
-            for pc in prepared_clips:
-                best_idx = -1
-                best_overlap = 0.0
-                for si, sl in enumerate(slides):
-                    if sl.video_clip_path:
+            _prior_raw_dirs = []
+            if reuse_source_dir is not None:
+                _prior_raw_dirs.append(reuse_source_dir / "clips" / "raw")
+            _prior_raw_dirs.append(_rv_raw_dir)
+
+            for _prd in _prior_raw_dirs:
+                if not _prd.is_dir():
+                    continue
+                for _rf in sorted(_prd.glob("trailer_*.mp4")):
+                    if _rf.name in _rv_seen_files:
                         continue
-                    overlap_start = max(sl.start, pc.timeline_start)
-                    overlap_end = min(sl.end, pc.timeline_end)
-                    overlap = max(0.0, overlap_end - overlap_start)
-                    if overlap > best_overlap:
-                        best_overlap = overlap
-                        best_idx = si
+                    _rd = _rv_clip_dur(_rf)
+                    if _rd >= 15.0:
+                        _dst = _rv_raw_dir / _rf.name
+                        if not _dst.exists() and _rf.resolve() != _dst.resolve():
+                            import shutil as _rv_sh
+                            _rv_sh.copy2(_rf, _dst)
+                        _rv_raw_trailers.append((_dst, _rd))
+                        _rv_seen_files.add(_rf.name)
+                        print(f"[clip_mix] Reused trailer: {_rf.name} ({_rd:.0f}s)")
+                        if len(_rv_raw_trailers) >= 3:
+                            break
+                if len(_rv_raw_trailers) >= 3:
+                    break
 
-                if best_idx >= 0 and best_overlap > 0.5:
-                    sl = slides[best_idx]
-                    actual_clip_dur = _clip_dur(pc.path)
-                    if actual_clip_dur <= 0:
-                        actual_clip_dur = pc.timeline_end - pc.timeline_start
+            # Download fresh trailers if needed.
+            if len(_rv_raw_trailers) < 3:
+                print(f"[clip_mix] Searching for official trailers of '{_clip_topic}'…")
+                _seen_urls: set[str] = set()
+                for _tq in [
+                    f"{_clip_topic} official trailer",
+                    f"{_clip_topic} official trailer 2",
+                    f"{_clip_topic} trailer HD",
+                    f"{_clip_topic} trailer",
+                ]:
+                    if len(_rv_raw_trailers) >= 3:
+                        break
+                    try:
+                        _results = search_video_clips(
+                            _tq, max_results=10, preferred_max_duration=600.0,
+                            sort_by_views=False,
+                        )
+                        _results = [r for r in _results if _is_official_rv(r.title) and r.url not in _seen_urls]
+                        for _ch in _results:
+                            if len(_rv_raw_trailers) >= 3:
+                                break
+                            _tidx = len(_rv_raw_trailers) + 1
+                            _rp = download_clip_section(
+                                _ch.url, _rv_raw_dir,
+                                start=0.0, end=300.0,
+                                prefix=f"trailer_{_tidx:02d}",
+                            )
+                            if _rp is None:
+                                _rp = download_clip(_ch.url, _rv_raw_dir, prefix=f"trailer_{_tidx:02d}", max_duration=400.0)
+                            if _rp and _rv_clip_dur(_rp) >= 15.0:
+                                _seen_urls.add(_ch.url)
+                                _rd = _rv_clip_dur(_rp)
+                                _rv_raw_trailers.append((_rp, _rd))
+                                print(f"[clip_mix] Downloaded trailer {_tidx}: {_ch.title[:60]} ({_rd:.0f}s)")
+                    except Exception as _te:
+                        print(f"[clip_mix] trailer search error: {_te}")
 
-                    # Clamp clip duration to fit within the slide.
-                    clip_dur = min(actual_clip_dur, sl.end - sl.start)
+            # Cut all non-overlapping 7s clips from each trailer (skip first 12s).
+            _rv_all_clips: list[Path] = []
+            for _tidx, (_rp, _rd) in enumerate(_rv_raw_trailers):
+                _seg = _rv_skip_secs
+                _end_limit = _rd - 2.0
+                _cidx = 0
+                while _seg + _rv_clip_secs <= _end_limit:
+                    _out = clip_dir / f"rv_t{_tidx+1:02d}_c{_cidx+1:03d}.mp4"
+                    if not (_out.exists() and _rv_clip_dur(_out) > 0):
+                        try:
+                            trim_clip(_rp, _out, start=_seg, duration=_rv_clip_secs,
+                                      width=video_width, height=video_height, mute=True)
+                        except Exception as _ce:
+                            print(f"[clip_mix] trim error t{_tidx+1} c{_cidx+1}: {_ce}")
+                    if _out.exists() and _rv_clip_dur(_out) > 0:
+                        _rv_all_clips.append(_out)
+                    _seg += _rv_clip_secs
+                    _cidx += 1
 
-                    # Determine where the clip sits within the slide.
-                    clip_start_in_tl = max(sl.start, pc.timeline_start)
-                    clip_end_in_tl = min(sl.end, clip_start_in_tl + clip_dur)
-                    clip_dur = clip_end_in_tl - clip_start_in_tl
+            _rv_rnd.shuffle(_rv_all_clips)
+            print(f"[clip_mix] {len(_rv_all_clips)} trailer clips ready (randomized)")
 
-                    new_slides: list[Slide] = []
+            # Assign clips to slides (cycle if more slides than clips).
+            # First split any slides longer than clip_secs so every clip
+            # fully covers its slide — no frozen last-frame padding.
+            if _rv_all_clips:
+                _split_slides: list = []
+                for _sl in slides:
+                    _sdur = _sl.end - _sl.start
+                    if _sdur > _rv_clip_secs + 0.05:
+                        # Split into sub-slides of at most _rv_clip_secs each
+                        _t = _sl.start
+                        while _sl.end - _t > 0.05:
+                            _sub_end = min(_t + _rv_clip_secs, _sl.end)
+                            _split_slides.append(Slide(
+                                start=_t, end=_sub_end,
+                                image_path=_sl.image_path, query=_sl.query,
+                                headline=_sl.headline, subhead=_sl.subhead,
+                                source_page=_sl.source_page, image_url=_sl.image_url,
+                                license_name=_sl.license_name, license_url=_sl.license_url,
+                                attribution=_sl.attribution, motion=_sl.motion,
+                                window_text=_sl.window_text, window_keywords=_sl.window_keywords,
+                                queries_tried=_sl.queries_tried,
+                            ))
+                            _t += _rv_clip_secs
+                    else:
+                        _split_slides.append(_sl)
+                slides = _split_slides
 
-                    # Image part before the clip.
-                    if clip_start_in_tl - sl.start > 0.5:
-                        new_slides.append(Slide(
-                            start=sl.start, end=clip_start_in_tl,
-                            image_path=sl.image_path, query=sl.query,
-                            headline=sl.headline, subhead=sl.subhead,
-                            source_page=sl.source_page, image_url=sl.image_url,
-                            license_name=sl.license_name, license_url=sl.license_url,
-                            attribution=sl.attribution, motion=sl.motion,
-                            window_text=sl.window_text, window_keywords=sl.window_keywords,
-                            queries_tried=sl.queries_tried,
-                        ))
-
-                    # Video clip slide.
-                    new_slides.append(Slide(
-                        start=clip_start_in_tl, end=clip_end_in_tl,
-                        image_path=sl.image_path, query=sl.query,
-                        headline=sl.headline, subhead=sl.subhead,
-                        source_page=sl.source_page, image_url=sl.image_url,
-                        license_name=sl.license_name, license_url=sl.license_url,
-                        attribution=sl.attribution, motion=sl.motion,
-                        window_text=sl.window_text, window_keywords=sl.window_keywords,
-                        queries_tried=sl.queries_tried,
-                        video_clip_path=str(pc.path),
+                _ci = 0
+                for _si in range(len(slides)):
+                    _sl = slides[_si]
+                    _cp = _rv_all_clips[_ci % len(_rv_all_clips)]
+                    _ci += 1
+                    _actual_dur = min(_rv_clip_dur(_cp), _sl.end - _sl.start)
+                    slides[_si] = Slide(
+                        start=_sl.start, end=_sl.end,
+                        image_path=_sl.image_path, query=_sl.query,
+                        headline=_sl.headline, subhead=_sl.subhead,
+                        source_page=_sl.source_page, image_url=_sl.image_url,
+                        license_name=_sl.license_name, license_url=_sl.license_url,
+                        attribution=_sl.attribution, motion=_sl.motion,
+                        window_text=_sl.window_text, window_keywords=_sl.window_keywords,
+                        queries_tried=_sl.queries_tried,
+                        video_clip_path=str(_cp),
                         video_clip_start=0.0,
-                        video_clip_end=clip_dur,
-                        video_clip_mute=pc.muted,
-                    ))
+                        video_clip_end=_actual_dur,
+                        video_clip_mute=True,
+                    )
 
-                    # Image part after the clip.
-                    if sl.end - clip_end_in_tl > 0.5:
-                        new_slides.append(Slide(
-                            start=clip_end_in_tl, end=sl.end,
-                            image_path=sl.image_path, query=sl.query,
-                            headline=sl.headline, subhead=sl.subhead,
-                            source_page=sl.source_page, image_url=sl.image_url,
-                            license_name=sl.license_name, license_url=sl.license_url,
-                            attribution=sl.attribution, motion=sl.motion,
-                            window_text=sl.window_text, window_keywords=sl.window_keywords,
-                            queries_tried=sl.queries_tried,
-                        ))
-
-                    # Replace the original slide with the split parts.
-                    slides[best_idx:best_idx + 1] = new_slides
-
+            # Write prepared_clips.json for reuse compatibility.
             write_json(out_dir / "prepared_clips.json", [
-                {"path": str(pc.path), "timeline_start": pc.timeline_start,
-                 "timeline_end": pc.timeline_end, "source_url": pc.source_url,
-                 "source_title": pc.source_title, "search_query": pc.search_query,
-                 "muted": pc.muted}
-                for pc in prepared_clips
+                {"path": str(_cp), "timeline_start": 0.0, "timeline_end": _rv_clip_secs,
+                 "source_url": "", "source_title": "", "search_query": f"{_clip_topic} official trailer",
+                 "muted": True}
+                for _cp in _rv_all_clips
             ])
+
+            # ── Legacy reuse path kept for back-compat (never reached now) ──
+            if False:
+                _prior_clips_json = None  # dead code sentinel
+                _prior_data: list = []
+                for _pc_d in (_prior_data or []):
+                    _src_p = Path(str(_pc_d.get("path", "")))
         except Exception as exc:
             # Video clip mixing is best-effort; don't fail the whole pipeline.
             import traceback
@@ -2670,6 +2795,74 @@ def run(
 # Scripted Short — user provides a timestamped script + audio; we search
 # one image per section and output a timeline.json (portrait 9:16).
 # ---------------------------------------------------------------------------
+
+
+def fetch_review_image_pool(
+    topic: str,
+    out_dir: str | Path,
+    *,
+    max_results: int = 25,
+    min_image_width: int = 900,
+    image_provider: str = "google_images",
+    serpapi_api_key: str | None = None,
+    progress_cb=None,
+) -> list[Path]:
+    """Fetch a pool of images for *topic* and return the downloaded paths.
+
+    Called by the UI before the main pipeline so the user can pick which
+    images to keep.  Images are saved into *out_dir*/assets/ with the
+    ``pool##_`` prefix.
+    """
+    from .playwright_images import playwright_google_image_search
+
+    out_dir = Path(out_dir)
+    assets_dir = out_dir / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    # Search
+    try:
+        candidates = playwright_google_image_search(
+            topic, max_results=max_results, min_width=min_image_width,
+        )
+    except Exception as e:
+        print(f"[fetch_pool] search failed: {e}")
+        candidates = []
+
+    # Download
+    downloaded: list[Path] = []
+    seen_hashes: set[str] = set()
+    for idx, cand in enumerate(candidates[:max_results]):
+        if progress_cb:
+            progress_cb(idx, len(candidates[:max_results]))
+        img_url = cand.get("url") or cand.get("image_url") or cand.get("img_url")
+        if not img_url:
+            continue
+        try:
+            from .playwright_images import _download_image_bytes
+            raw = _download_image_bytes(img_url, min_width=min_image_width)
+        except Exception:
+            try:
+                import urllib.request
+                with urllib.request.urlopen(img_url, timeout=10) as resp:
+                    raw = resp.read()
+            except Exception:
+                continue
+        if not raw or len(raw) < 5000:
+            continue
+        h = hashlib.md5(raw).hexdigest()
+        if h in seen_hashes:
+            continue
+        seen_hashes.add(h)
+        ext = ".jpg"
+        if raw[:4] == b"\x89PNG":
+            ext = ".png"
+        dst = assets_dir / f"pool{len(downloaded):02d}_{int(time.time() * 1000)}{ext}"
+        dst.write_bytes(raw)
+        downloaded.append(dst)
+
+    print(f"[fetch_pool] Downloaded {len(downloaded)} images for {topic!r}")
+    return downloaded
+
 
 def run_scripted_short(
     *,
@@ -3509,111 +3702,34 @@ def run_scripted_short(
 
     # ── 3b. Video Short: fill video entirely with YouTube clips ─────────
     #
-    # Strategy:
-    # 1) LLM generates scene-specific clip queries from the transcript
-    #    (e.g. "sinners vampire attack scene", "smoke stack sinners movie clip")
-    # 2) Search YouTube for trailers / movie clips / scene compilations
-    # 3) Download longer source videos; extract multiple distinct ~6-8s segments
-    # 4) Split each section into sub-slides so clips fill the entire video
-    # 5) Keep each individual clip ≤ 8 s for copyright safety
+    # Strategy — SHUFFLED TRAILERS:
+    # 1) Download 2-3 official HD trailers for the topic
+    # 2) Split each into ~6-8s segments, skip first 10s and last 5s
+    # 3) Shuffle segments independently per trailer, then interleave
+    #    round-robin so consecutive sub-slides use different trailers
+    # 4) Keep each clip ≤ 8 s for copyright safety
     #
     if use_clips:
-        import json as _clip_json
         import math as _clip_math
+        import random as _clip_rng
         from .clip_tools import (
             search_video_clips,
             download_clip,
             download_clip_section,
             trim_clip,
-            find_best_clip_segment,
             get_video_duration,
         )
-        from .llm_storyboard import _openai_chat_completions
 
         clip_dir = ensure_dir(out_dir / "clips")
-        _seen_clip_urls: set[str] = set()
 
         # ── Copyright-safe bounds ──
         _MAX_CLIP_S = 8.0   # max seconds per individual clip
         _MIN_CLIP_S = 3.0   # don't bother with clips shorter than this
 
-        # ── Step A: LLM generates scene-specific clip queries ─────────
-        _clip_api_key = os.getenv("OPENAI_API_KEY")
-        _clip_queries: dict[int, list[str]] = {}  # section index → list of queries
-
         # Use the short topic slug (e.g. "sinners") for cleaner queries.
         _clip_topic = _topic_slug or effective_topic or "unknown"
 
-        if _clip_api_key:
-            _sections_for_llm = []
-            for si, sec in enumerate(sections):
-                _sections_for_llm.append({
-                    "index": si,
-                    "label": sec.label or "",
-                    # Only narration text — OSD bullet points are conceptual, not visual.
-                    "narration": (sec.text or "")[:400],
-                })
-
-            _clip_sys = (
-                "You are generating YouTube search queries to find SHORT MOVIE/TV CLIPS.\n\n"
-                f"Topic (movie/show title): \"{_clip_topic}\"\n\n"
-                "For each script section, generate 2-3 search queries that will find "
-                "ACTUAL FOOTAGE from this movie/show on YouTube — trailers, official scene "
-                "clips, scene compilations, or behind-the-scenes.\n\n"
-                "CRITICAL RULES:\n"
-                "1. Every query MUST start with the movie/show title: \"" + _clip_topic + " ...\"\n"
-                "2. Pick CONCRETE VISUAL or PHYSICAL things from the narration that would "
-                "actually appear on camera: characters by name, locations, actions, objects, "
-                "creatures. NOT abstract concepts or themes.\n"
-                "   ✓ GOOD: \"sinners vampire dance scene\", \"sinners juke joint fight\", "
-                "\"sinners twin brothers scene\", \"sinners cotton field\"\n"
-                "   ✗ BAD: \"sinners colonizers clip\", \"sinners assimilation scene\", "
-                "\"sinners individuality trailer\"\n"
-                "3. Queries must be 3-6 words total.\n"
-                "4. End each query with: scene / clip / trailer / footage / official\n\n"
-                "Return ONLY valid JSON — an array:\n"
-                '[{"index": 0, "queries": ["query1", "query2"]}, ...]'
-            )
-
-            try:
-                _clip_resp = _openai_chat_completions(
-                    api_key=_clip_api_key,
-                    model=llm_model,
-                    messages=[
-                        {"role": "system", "content": _clip_sys},
-                        {"role": "user", "content": _clip_json.dumps(_sections_for_llm, ensure_ascii=False)},
-                    ],
-                    timeout_s=30,
-                )
-                _stripped = _clip_resp.strip()
-                import re as _cre
-                _fence = _cre.search(r"```(?:json)?\s*\n?(.*?)```", _stripped, _cre.DOTALL)
-                if _fence:
-                    _stripped = _fence.group(1).strip()
-                _parsed_queries = _clip_json.loads(_stripped)
-                for item in _parsed_queries:
-                    idx = int(item.get("index", -1))
-                    qs = item.get("queries", [])
-                    if 0 <= idx < len(sections) and qs:
-                        _clip_queries[idx] = [str(q) for q in qs]
-                print(f"[video_short] LLM generated clip queries for {len(_clip_queries)} sections")
-                for idx, qs in _clip_queries.items():
-                    print(f"  [s{idx:02d}] {qs}")
-            except Exception as _llm_err:
-                print(f"[video_short] LLM query generation failed: {_llm_err} — using fallback queries")
-
-        # Fallback: build queries from existing search_query + topic
-        _topic_name = effective_topic or ""
-        for si in range(len(sections)):
-            if si not in _clip_queries:
-                base = sections[si].search_query or sections[si].label or ""
-                q1 = f"{_clip_topic} {base} scene".strip() if base else f"{_clip_topic} trailer"
-                q2 = f"{_clip_topic} clip"
-                _clip_queries[si] = [q1, q2]
-
         # ── Topic keyword set for relevance filtering ─────────────────
-        # Build a set of lowercased words from the topic to filter results.
-        # e.g. "The Sinners 2025 movie" → {"sinners"}
         _topic_kw_set: set[str] = set()
         if _clip_topic and _clip_topic != "unknown":
             _stop = {"the", "a", "an", "of", "in", "to", "and", "or", "for", "is",
@@ -3623,26 +3739,33 @@ def run_scripted_short(
                 if len(w) >= 3 and w.lower() not in _stop
             }
 
-        def _rank_by_relevance(results: list) -> list:
-            """Re-order results so those whose title contains topic keywords come first."""
-            if not _topic_kw_set:
-                return results
-            def _score(r) -> int:
-                title_lower = (r.title or "").lower()
-                return sum(1 for kw in _topic_kw_set if kw in title_lower)
-            return sorted(results, key=_score, reverse=True)
+        # Words that indicate commentary / reaction / review channels.
+        _REJECT_WORDS = {
+            "reaction", "react", "review", "explained", "breakdown", "analysis",
+            "commentary", "opinion", "discuss", "theory", "theories", "ranking",
+            "tier list", "video essay", "response", "rant", "hot take",
+            "why i", "why you", "what i think", "unpopular opinion",
+        }
 
-        # ── Step B: Download source videos (trailers / clips) ─────────
-        #    Cache downloaded raw files so the same YouTube video can provide
-        #    multiple different segments to different sub-slides.
-        _raw_cache: dict[str, Path | None] = {}  # url → raw file path
+        def _is_official_clip(title: str) -> bool:
+            """Return True only if the title looks like an official clip/trailer."""
+            t = title.lower()
+            if _topic_kw_set and not any(kw in t for kw in _topic_kw_set):
+                return False
+            for rw in _REJECT_WORDS:
+                if rw in t:
+                    return False
+            return True
+
+        # ── Download + cache raw clip files ───────────────────────────
+        _raw_cache: dict[str, Path | None] = {}
 
         def _download_raw(url: str, prefix: str) -> Path | None:
             if url in _raw_cache:
                 return _raw_cache[url]
             raw = download_clip_section(
                 url, clip_dir / "raw",
-                start=0.0, end=180.0,  # grab up to 3 min from trailers
+                start=0.0, end=180.0,
                 prefix=prefix,
             )
             if raw is None:
@@ -3654,140 +3777,177 @@ def run_scripted_short(
             _raw_cache[url] = raw
             return raw
 
-        # ── Step C: Build clip sub-slides for every section ───────────
+        # ── Download 2-3 official trailers ────────────────────────────
+        _trailer_paths: list[tuple[Path, float]] = []
+        _trailer_urls_seen: set[str] = set()
+
+        # ── Reuse raw trailers from a prior run if available ──────────
+        _reuse_clips_done = False
+        if _reuse_src is not None:
+            _prior_raw = _reuse_src / "clips" / "raw"
+            if _prior_raw.is_dir():
+                import shutil as _clip_reuse_shutil
+                _raw_dst = clip_dir / "raw"
+                _raw_dst.mkdir(parents=True, exist_ok=True)
+                for _tf in sorted(_prior_raw.glob("trailer_*.mp4")):
+                    _dst = _raw_dst / _tf.name
+                    if not _dst.exists():
+                        _clip_reuse_shutil.copy2(_tf, _dst)
+                    try:
+                        _dur = get_video_duration(_dst)
+                    except Exception:
+                        _dur = 0.0
+                    if _dur >= 10.0:
+                        _trailer_paths.append((_dst, _dur))
+                        print(f"  [trailer] ✓ reused from prior run: {_tf.name} ({_dur:.0f}s)")
+                if _trailer_paths:
+                    _reuse_clips_done = True
+                    print(f"[video_short] Reused {len(_trailer_paths)} trailers from: {_reuse_src.name}")
+
+        if not _reuse_clips_done:
+            print(f"\n[video_short] Searching for official trailers of '{_clip_topic}'…")
+
+            for tq in [f"{_clip_topic} official trailer",
+                        f"{_clip_topic} trailer HD",
+                        f"{_clip_topic} trailer"]:
+                if len(_trailer_paths) >= 3:
+                    break
+                try:
+                    results = search_video_clips(
+                        tq, max_results=10, preferred_max_duration=600.0,
+                        sort_by_views=False,
+                    )
+                    results = [r for r in results if _is_official_clip(r.title)]
+                    for chosen in results:
+                        if len(_trailer_paths) >= 3:
+                            break
+                        if chosen.url in _trailer_urls_seen:
+                            continue
+                        _trailer_urls_seen.add(chosen.url)
+                        raw = _download_raw(chosen.url, f"trailer_{len(_trailer_paths)}")
+                        if raw and get_video_duration(raw) >= 10.0:
+                            _trailer_paths.append((raw, get_video_duration(raw)))
+                            print(f"  [trailer] ✓ {chosen.title[:60]} "
+                                  f"({get_video_duration(raw):.0f}s)")
+                except Exception as _tq_err:
+                    print(f"  [trailer_search] Error: {_tq_err}")
+
+        # Build shuffled segment pool — interleave trailers round-robin.
+        # (path, start, end, trailer_index) — index tracks which trailer each seg is from.
+        _per_trailer_segs: list[list[tuple[Path, float, float, int]]] = []
+        for ti, (tpath, tdur) in enumerate(_trailer_paths):
+            segs: list[tuple[Path, float, float, int]] = []
+            usable_start = min(10.0, tdur * 0.15)
+            usable_end = max(usable_start + _MIN_CLIP_S, tdur - 5.0)
+            cursor = usable_start
+            while cursor + _MIN_CLIP_S <= usable_end:
+                seg_end = min(cursor + _MAX_CLIP_S, usable_end)
+                segs.append((tpath, cursor, seg_end, ti))
+                cursor = seg_end
+            if not segs and tdur >= _MIN_CLIP_S:
+                segs.append((tpath, 0.0, min(tdur, _MAX_CLIP_S), ti))
+            _clip_rng.shuffle(segs)
+            if segs:
+                _per_trailer_segs.append(segs)
+
+        # Interleave: pick one segment from each trailer in turn so
+        # consecutive sub-slides come from different trailers.
+        _segment_pool: list[tuple[Path, float, float, int]] = []
+        if _per_trailer_segs:
+            max_len = max(len(s) for s in _per_trailer_segs)
+            for i in range(max_len):
+                for tsegs in _per_trailer_segs:
+                    if i < len(tsegs):
+                        _segment_pool.append(tsegs[i])
+        _seg_idx = 0
+
+        print(f"[video_short] {len(_trailer_paths)} trailers → "
+              f"{len(_segment_pool)} shuffled segments ready")
+
+        # ── Reuse cache: avoid re-trimming the same trailer segment ──
+        import shutil as _clip_shutil
+        _trim_cache: dict[tuple[str, float, float, int, int], Path] = {}
+
+        def _get_or_trim(src: Path, start: float, duration: float,
+                         dest: Path) -> Path | None:
+            """Return a trimmed clip, reusing a cached file when possible."""
+            cache_key = (str(src), round(start, 2), round(duration, 2),
+                         video_width, video_height)
+            cached = _trim_cache.get(cache_key)
+            if cached and cached.exists():
+                _clip_shutil.copy2(cached, dest)
+                return dest
+            trim_clip(
+                src, dest,
+                start=start, duration=duration,
+                width=video_width, height=video_height,
+                mute=True,
+            )
+            _trim_cache[cache_key] = dest
+            return dest
+
+        # ── Build clip sub-slides per section ─────────────────────────
         new_slides: list[Slide] = []
-        _sub_counter = 0
-        _used_segments: dict[str, list[tuple[float, float]]] = {}  # path → list of (start, end)
-
-        def _segment_overlaps(path: str, start: float, dur: float) -> bool:
-            """Check if a segment overlaps with any already-used segment from the same source."""
-            for (s, e) in _used_segments.get(path, []):
-                if start < e and (start + dur) > s:
-                    return True
-            return False
-
-        def _mark_segment(path: str, start: float, dur: float) -> None:
-            _used_segments.setdefault(path, []).append((start, start + dur))
-
-        print(f"\n[video_short] Building clips for {len(slides)} sections (clips only, no images)…")
+        print(f"\n[video_short] Building clips for {len(slides)} sections…")
 
         for si, slide in enumerate(slides):
             section_dur = slide.end - slide.start
             if section_dur < _MIN_CLIP_S:
-                # Tiny section — single clip
                 new_slides.append(slide)
                 continue
 
-            # How many sub-clips needed to fill this section?
             n_subclips = max(1, _clip_math.ceil(section_dur / _MAX_CLIP_S))
-            sub_dur = section_dur / n_subclips  # even split
-
-            queries = _clip_queries.get(si, [f"{_topic_name} clip"])
+            sub_dur = section_dur / n_subclips
             section_clips_ok = 0
 
             for sub_i in range(n_subclips):
                 sub_start = slide.start + sub_i * sub_dur
                 sub_end = sub_start + sub_dur
                 if sub_i == n_subclips - 1:
-                    sub_end = slide.end  # absorb rounding
+                    sub_end = slide.end
 
                 actual_sub_dur = sub_end - sub_start
                 clip_tag = f"s{si:02d}c{sub_i}"
                 got_clip = False
 
-                # Try each query in order until one produces a clip.
-                for qi, q in enumerate(queries):
-                    if got_clip:
-                        break
+                if _segment_pool:
+                    pool_idx = _seg_idx % len(_segment_pool)
+                    # Reshuffle when we wrap around for fresh ordering.
+                    if _seg_idx > 0 and pool_idx == 0:
+                        _clip_rng.shuffle(_segment_pool)
+                    tpath, seg_s, seg_e, t_idx = _segment_pool[pool_idx]
+                    _seg_idx += 1
+
+                    seg_dur = min(seg_e - seg_s, actual_sub_dur)
+                    trimmed = clip_dir / f"prepared_{clip_tag}.mp4"
                     try:
-                        results = search_video_clips(
-                            q,
-                            max_results=8,
-                            preferred_max_duration=600.0,
-                            sort_by_views=False,  # use YouTube relevance ranking
-                        )
-                        # Re-rank: results whose title contains topic keywords first.
-                        results = _rank_by_relevance(results)
-                        # Try each result until download succeeds.
-                        for ri, chosen in enumerate(results):
-                            raw_path = _download_raw(chosen.url, prefix=f"{clip_tag}_r{ri}")
-                            if raw_path is None:
-                                continue
+                        _get_or_trim(tpath, seg_s, seg_dur, trimmed)
+                        actual_dur = get_video_duration(trimmed)
+                        if actual_dur <= 0:
+                            actual_dur = seg_dur
 
-                            raw_dur = get_video_duration(raw_path)
-                            if raw_dur < _MIN_CLIP_S:
-                                continue
-
-                            # Find a segment that doesn't overlap with already-used parts.
-                            seg_start, seg_dur = find_best_clip_segment(
-                                raw_path,
-                                target_duration=min(actual_sub_dur, _MAX_CLIP_S),
-                                model=llm_model,
-                                search_query=q,
-                                video_title=chosen.title,
-                            )
-
-                            # Avoid reusing the same exact part of a video.
-                            raw_key = str(raw_path)
-                            if _segment_overlaps(raw_key, seg_start, seg_dur):
-                                # Try an offset segment instead.
-                                alt_start = seg_start + seg_dur + 2.0
-                                if alt_start + seg_dur <= raw_dur:
-                                    seg_start = alt_start
-                                else:
-                                    # Try from beginning area
-                                    alt_start = max(0.0, seg_start - seg_dur - 2.0)
-                                    if not _segment_overlaps(raw_key, alt_start, seg_dur):
-                                        seg_start = alt_start
-                                    else:
-                                        continue  # fully used up, try next result
-
-                            # Trim to portrait.
-                            trimmed = clip_dir / f"prepared_{clip_tag}.mp4"
-                            trim_clip(
-                                raw_path,
-                                trimmed,
-                                start=seg_start,
-                                duration=min(seg_dur, actual_sub_dur),
-                                width=video_width,
-                                height=video_height,
-                                mute=True,
-                            )
-
-                            actual_dur = get_video_duration(trimmed)
-                            if actual_dur <= 0:
-                                actual_dur = seg_dur
-
-                            _mark_segment(raw_key, seg_start, seg_dur)
-
-                            new_slides.append(Slide(
-                                start=sub_start,
-                                end=sub_end,
-                                image_path=slide.image_path,  # kept as render fallback
-                                query=q,
-                                video_clip_path=str(trimmed),
-                                video_clip_start=0.0,
-                                video_clip_end=min(actual_dur, actual_sub_dur),
-                                video_clip_mute=True,
-                            ))
-                            got_clip = True
-                            section_clips_ok += 1
-                            print(f"  [{clip_tag}] ✓ {chosen.title[:50]} "
-                                  f"@{seg_start:.1f}s ({min(seg_dur, actual_sub_dur):.1f}s)")
-                            break
-
-                    except Exception as _clip_err:
-                        import traceback; traceback.print_exc()
-                        print(f"  [{clip_tag}] query {qi} error: {_clip_err}")
+                        new_slides.append(Slide(
+                            start=sub_start, end=sub_end,
+                            image_path=slide.image_path,
+                            query=f"{_clip_topic} trailer",
+                            video_clip_path=str(trimmed),
+                            video_clip_start=0.0,
+                            video_clip_end=min(actual_dur, actual_sub_dur),
+                            video_clip_mute=True,
+                        ))
+                        got_clip = True
+                        section_clips_ok += 1
+                        print(f"  [{clip_tag}] ✓ trailer#{t_idx} "
+                              f"@{seg_s:.1f}-{seg_s + seg_dur:.1f}s ({seg_dur:.1f}s)")
+                    except Exception as _trim_err:
+                        print(f"  [{clip_tag}] trim error: {_trim_err}")
 
                 if not got_clip:
-                    # Last resort: insert the sub-slide without a clip (image shows).
-                    # In a clips-only short this shouldn't happen often.
                     new_slides.append(Slide(
                         start=sub_start, end=sub_end,
                         image_path=slide.image_path, query=slide.query,
                     ))
-                    print(f"  [{clip_tag}] ✗ no clip found — image fallback")
+                    print(f"  [{clip_tag}] ✗ no clip — image fallback")
 
             print(f"  [section {si:02d}] {section_clips_ok}/{n_subclips} sub-clips filled")
 
@@ -3812,7 +3972,7 @@ def run_scripted_short(
             "audio_size": int(audio_stat.st_size),
             "audio_mtime": float(audio_stat.st_mtime),
             "render_audio_path": None,
-            "video_type": "video_short" if use_clips else "scripted_short",
+            "video_type": ("video_short" if use_clips else "scripted_short") if int(video_height) > int(video_width) else ("video_long" if use_clips else "scripted_long"),
             "video_width": int(video_width),
             "video_height": int(video_height),
             "topic": effective_topic,
@@ -3825,4 +3985,1187 @@ def run_scripted_short(
         pass
 
     print(f"[scripted_short] timeline.json written with {len(slides)} slides")
+    return out_dir
+
+
+# =====================================================================
+# Top-N List Short
+# =====================================================================
+
+def run_top_list(
+    *,
+    audio_path: str | Path,
+    out_dir: str | Path,
+    title: str,
+    list_count: int,
+    item_images: dict[int, str],
+    item_titles: dict[int, str] | None = None,
+    video_width: int = 1080,
+    video_height: int = 1920,
+    cta_text: str = "SUBSCRIBE 👇",
+    cta_seconds: float = 3.0,
+) -> Path:
+    """Build a timeline for a **Top-N List** short.
+
+    Parameters
+    ----------
+    title : str
+        Title displayed as the first text-only slide (e.g. "5 Bad movies from 2025").
+    list_count : int
+        How many items in the list (e.g. 5, 10).
+    item_images : dict[int, str]
+        Mapping of item number → image file path.  E.g. ``{5: "/path/img5.png", 4: ...}``.
+    cta_text : str
+        Text for the subscribe/CTA end screen.
+    cta_seconds : float
+        Duration of the CTA end screen in seconds.
+
+    Flow
+    ----
+    1. Transcribe audio (Whisper, word-level timestamps).
+    2. Detect "number N" utterances to segment the timeline.
+    3. Build slides:
+       - Title card (black bg + title text) — from start until narrator says "number <count>"
+       - For each number detected:
+         * Number card (text-only, e.g. "5") — from "number N" until narrator starts
+           talking about the item
+         * Item image — from when narrator starts talking until next "number N-1"
+       - CTA card ("SUBSCRIBE") — last ``cta_seconds`` of the video
+    4. Write ``timeline.json`` and ``run_meta.json``.
+
+    Returns *out_dir*.
+    """
+    import re as _re
+
+    from .slide_cards import render_text_card, burn_title_on_image
+
+    _item_titles = item_titles or {}
+
+    audio_path = Path(audio_path)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    assets_dir = ensure_dir(out_dir / "assets")
+
+    audio_stat = audio_path.stat()
+    audio_duration = get_audio_duration_seconds(audio_path)
+
+    # ── Swipe transition helper ──
+    SWIPE_DURATION = 0.35  # seconds
+
+    def _create_swipe_clip(
+        img_from: str, img_to: str, out_path: str,
+        w: int, h: int, dur: float = SWIPE_DURATION, fps: int = 30,
+    ) -> str:
+        """Render a short slide-left xfade transition video between two images."""
+        import imageio_ffmpeg
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        # Each input loops for dur*2 so xfade has enough frames.
+        # xfade offset=dur means transition starts at dur into the first stream.
+        # Output duration = dur*2 + dur*2 - dur = 3*dur, but we trim to dur.
+        scale_crop = (
+            f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+            f"crop={w}:{h}:(in_w-out_w)/2:(in_h-out_h)/2,"
+            f"format=yuv420p,fps={fps}"
+        )
+        fc = (
+            f"[0:v]{scale_crop},trim=duration={dur:.3f},setpts=PTS-STARTPTS[a];"
+            f"[1:v]{scale_crop},trim=duration={dur:.3f},setpts=PTS-STARTPTS[b];"
+            f"[a][b]xfade=transition=slideleft:duration={dur:.3f}:offset=0[out]"
+        )
+        cmd = [
+            ffmpeg, "-y",
+            "-loop", "1", "-i", img_from,
+            "-loop", "1", "-i", img_to,
+            "-filter_complex", fc,
+            "-map", "[out]",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+            "-t", f"{dur:.3f}",
+            "-an",
+            out_path,
+        ]
+        subprocess.run(cmd, capture_output=True, timeout=30)
+        return out_path
+
+    # ── 1. Transcribe ──
+    from .transcribe import ensure_word_timestamps
+
+    words = ensure_word_timestamps(audio_path, model_name="small")
+    if not words:
+        raise RuntimeError("Whisper returned no word-level timestamps")
+
+    # ── 2. Detect "number N" utterances ──
+    import re as _re
+
+    _WORD_TO_NUM = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+        "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+        "nineteen": 19, "twenty": 20,
+    }
+    _ORDINAL_TO_NUM = {
+        "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+        "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+    }
+
+    def _clean(w: str) -> str:
+        return w.strip().lower().strip(".,!?:;\"'()[]#")
+
+    # Print first 40 words for debugging.
+    _dbg_words = [_clean(w["word"]) for w in words[:40]]
+    print(f"[top_list] First 40 words: {_dbg_words}")
+
+    number_markers: list[dict] = []  # {"number": int, "start": float, "end": float}
+
+    for i, w in enumerate(words):
+        word_clean = _clean(w["word"])
+
+        # Pattern 1: "number" followed by a digit or number-word.
+        if word_clean == "number" and i + 1 < len(words):
+            next_word = _clean(words[i + 1]["word"])
+            num = None
+            if next_word.isdigit():
+                num = int(next_word)
+            elif next_word in _WORD_TO_NUM:
+                num = _WORD_TO_NUM[next_word]
+            if num is not None and 1 <= num <= list_count:
+                number_markers.append({
+                    "number": num,
+                    "start": float(w["start"]),
+                    "end": float(words[i + 1]["end"]),
+                })
+                continue
+
+        # Pattern 2: Standalone "#5" or "number5" as single token.
+        m = _re.match(r"(?:#|number)(\d+)$", word_clean)
+        if m:
+            num = int(m.group(1))
+            if 1 <= num <= list_count:
+                number_markers.append({
+                    "number": num,
+                    "start": float(w["start"]),
+                    "end": float(w["end"]),
+                })
+                continue
+
+        # Pattern 3: Ordinals — "first", "second", "fifth", etc.
+        if word_clean in _ORDINAL_TO_NUM:
+            num = _ORDINAL_TO_NUM[word_clean]
+            if 1 <= num <= list_count:
+                number_markers.append({
+                    "number": num,
+                    "start": float(w["start"]),
+                    "end": float(w["end"]),
+                })
+                continue
+
+        # Pattern 4: Standalone digit ("5", "4", …) used as a countdown marker.
+        # The narrator says the number by itself, followed by a noticeable pause
+        # before describing the item.  We require ≥0.5 s gap AFTER the digit to
+        # filter out digits embedded in sentences ("here are 5 of the worst",
+        # "Nezha 1", "Superman 2").
+        if word_clean.isdigit():
+            num = int(word_clean)
+            if 1 <= num <= list_count:
+                gap_after = (
+                    float(words[i + 1]["start"]) - float(w["end"])
+                    if i + 1 < len(words) else 999.0
+                )
+                if gap_after >= 0.5:
+                    number_markers.append({
+                        "number": num,
+                        "start": float(w["start"]),
+                        "end": float(w["end"]),
+                    })
+                    continue
+
+    # Deduplicate: keep only the *last* occurrence of each number.
+    # In countdown scripts the narrator may mention a number in passing
+    # ("Nezha 2 was bad") before reaching the actual countdown marker;
+    # keeping the last hit gives us the real marker position.
+    last_by_num: dict[int, dict] = {}
+    for m in number_markers:
+        last_by_num[m["number"]] = m  # overwrites earlier hits
+    number_markers = list(last_by_num.values())
+
+    # Sort by start time.
+    number_markers.sort(key=lambda m: m["start"])
+
+    print(f"[top_list] Detected {len(number_markers)} number markers: {[m['number'] for m in number_markers]}")
+
+    # ── Fallback: evenly split the timeline if no markers found ──
+    if not number_markers:
+        print("[top_list] No markers detected — falling back to even timeline split")
+        # Use last word end as total duration.
+        total_dur = max(float(w["end"]) for w in words)
+        # Reserve ~3 s at start for title card and cta_seconds at end.
+        intro_pad = min(3.0, total_dur * 0.08)
+        body_dur = total_dur - intro_pad - cta_seconds
+        if body_dur < list_count * 1.0:
+            body_dur = total_dur - intro_pad  # drop CTA reservation
+        seg_dur = body_dur / list_count
+        for idx in range(list_count):
+            num = list_count - idx  # countdown: 5, 4, 3, 2, 1
+            seg_start = intro_pad + idx * seg_dur
+            number_markers.append({
+                "number": num,
+                "start": seg_start,
+                "end": seg_start + min(1.5, seg_dur * 0.25),
+            })
+        print(f"[top_list] Fallback markers: {[m['number'] for m in number_markers]}")
+
+    # ── 3. Find where narrator starts talking after each number ──
+    # After "number 5" is spoken (end of that phrase), the next word is the
+    # start of the description — that's when we switch to the item image.
+
+    def _find_next_word_after(end_time: float) -> float | None:
+        """Find the start time of the first word after *end_time*."""
+        for w in words:
+            if float(w["start"]) > end_time + 0.05:
+                return float(w["start"])
+        return None
+
+    # ── 4. Build slides ──
+    slides: list[Slide] = []
+
+    # 4a. Title card — from 0 until the first "number N" is spoken.
+    title_card_path = str(assets_dir / "title_card.png")
+    render_text_card(
+        out_path=title_card_path,
+        text=title,
+        width=video_width,
+        height=video_height,
+        font_size_ratio=0.10,
+        text_color=(255, 255, 0),
+    )
+
+    title_end = float(number_markers[0]["start"])
+    if title_end < 0.3:
+        title_end = 0.3  # Ensure at least a brief flash
+    slides.append(Slide(
+        start=0.0,
+        end=title_end,
+        image_path=title_card_path,
+        query="title",
+        headline=title,
+        motion="hold",
+    ))
+
+    # 4b. Number cards + item images.
+    for mi, marker in enumerate(number_markers):
+        num = marker["number"]
+        num_start = float(marker["start"])
+        num_end = float(marker["end"])
+
+        # When does the narrator start describing the item? (first word after "number N")
+        desc_start = _find_next_word_after(num_end)
+        if desc_start is None:
+            desc_start = num_end + 0.5  # fallback
+
+        # When does this item end? At the next number marker or near end of audio.
+        if mi + 1 < len(number_markers):
+            item_end = float(number_markers[mi + 1]["start"])
+        else:
+            # Last item — ends at audio_duration minus CTA time.
+            item_end = max(desc_start + 1.0, audio_duration - cta_seconds)
+
+        # Number card (text-only, e.g. "5.").
+        num_card_path = str(assets_dir / f"num_card_{num:02d}.png")
+        render_text_card(
+            out_path=num_card_path,
+            text=f"{num}.",
+            width=video_width,
+            height=video_height,
+            font_size_ratio=0.35,
+        )
+
+        slides.append(Slide(
+            start=num_start,
+            end=desc_start,
+            image_path=num_card_path,
+            query=f"number {num}",
+            headline=str(num),
+            motion="hold",
+        ))
+
+        # Item image — display the user-provided image.
+        img_path = item_images.get(num)
+        if img_path and Path(img_path).exists():
+            # Copy to assets dir for portability.
+            dst = assets_dir / f"item_{num:02d}{Path(img_path).suffix}"
+            if not dst.exists():
+                shutil.copy2(img_path, dst)
+            item_img = str(dst)
+        else:
+            # Fallback: render a placeholder card.
+            item_img = str(assets_dir / f"item_placeholder_{num:02d}.png")
+            render_text_card(
+                out_path=item_img,
+                text=f"#{num}",
+                width=video_width,
+                height=video_height,
+                font_size_ratio=0.25,
+            )
+
+        # Portrait pre-processing (blur-behind for landscape images).
+        _is_portrait = int(video_height) > int(video_width) * 1.1
+        if _is_portrait:
+            try:
+                from PIL import Image as _PILImage, ImageFilter, ImageEnhance
+
+                im = _PILImage.open(item_img).convert("RGB")
+                src_w, src_h = im.size
+                src_ratio = src_w / src_h
+                tgt_ratio = int(video_width) / max(1, int(video_height))
+
+                if src_ratio / max(0.01, tgt_ratio) > 1.4:
+                    tw, th = int(video_width), int(video_height)
+                    bg_scale = max(tw / src_w, th / src_h)
+                    bg_w, bg_h = int(src_w * bg_scale + 0.5), int(src_h * bg_scale + 0.5)
+                    bg = im.resize((bg_w, bg_h), _PILImage.LANCZOS)
+                    bx, by = (bg_w - tw) // 2, (bg_h - th) // 2
+                    bg = bg.crop((bx, by, bx + tw, by + th))
+                    bg = bg.filter(ImageFilter.GaussianBlur(radius=30))
+                    bg = ImageEnhance.Brightness(bg).enhance(0.35)
+                    fg_scale = min(tw / src_w, th / src_h)
+                    fg_w, fg_h = int(src_w * fg_scale + 0.5), int(src_h * fg_scale + 0.5)
+                    fg = im.resize((fg_w, fg_h), _PILImage.LANCZOS)
+                    fx, fy = (tw - fg_w) // 2, (th - fg_h) // 2
+                    canvas = bg.copy()
+                    canvas.paste(fg, (fx, fy))
+                    portrait_path = str(assets_dir / f"item_{num:02d}_portrait.jpg")
+                    canvas.save(portrait_path, quality=95)
+                    item_img = portrait_path
+            except Exception:
+                pass
+
+        # Burn yellow title heading onto the item image if provided.
+        _item_title = _item_titles.get(num, "").strip()
+        if _item_title:
+            titled_path = str(assets_dir / f"item_{num:02d}_titled.png")
+            burn_title_on_image(
+                image_path=item_img,
+                out_path=titled_path,
+                title=_item_title,
+                width=video_width,
+                height=video_height,
+                text_color=(255, 255, 0),
+                position="top",
+            )
+            item_img = titled_path
+
+        # ── Swipe transition: number card slides left to reveal item image ──
+        _swipe_ok = False
+        if (desc_start - num_start) > SWIPE_DURATION + 0.1:
+            swipe_path = str(assets_dir / f"swipe_{num:02d}.mp4")
+            try:
+                _create_swipe_clip(
+                    num_card_path, item_img, swipe_path,
+                    w=video_width, h=video_height, dur=SWIPE_DURATION,
+                )
+                if Path(swipe_path).exists() and Path(swipe_path).stat().st_size > 1000:
+                    # Shorten the number card to end before the swipe.
+                    swipe_start = desc_start - SWIPE_DURATION
+                    slides[-1] = Slide(
+                        start=num_start,
+                        end=swipe_start,
+                        image_path=num_card_path,
+                        query=f"number {num}",
+                        headline=str(num),
+                        motion="hold",
+                    )
+                    # Insert swipe transition as a video clip slide.
+                    slides.append(Slide(
+                        start=swipe_start,
+                        end=desc_start,
+                        image_path=item_img,
+                        query=f"swipe {num}",
+                        video_clip_path=swipe_path,
+                        video_clip_start=0.0,
+                        video_clip_end=SWIPE_DURATION,
+                        video_clip_mute=True,
+                        motion="hold",
+                    ))
+                    _swipe_ok = True
+                    print(f"[top_list] Swipe transition for #{num}: {swipe_start:.2f}s–{desc_start:.2f}s")
+            except Exception as _sw_err:
+                print(f"[top_list] Swipe generation failed for #{num}: {_sw_err}")
+
+        slides.append(Slide(
+            start=desc_start,
+            end=item_end,
+            image_path=item_img,
+            query=f"item {num} image",
+            headline=_item_title or None,
+            motion="zoom_in",
+        ))
+
+    # 4c. CTA / Subscribe card.
+    cta_start = max(0.0, audio_duration - cta_seconds)
+    cta_card_path = str(assets_dir / "cta_card.png")
+    render_text_card(
+        out_path=cta_card_path,
+        text=cta_text,
+        width=video_width,
+        height=video_height,
+        font_size_ratio=0.12,
+        text_color=(255, 255, 0),
+    )
+
+    # Adjust last item slide to end before CTA.
+    if slides and slides[-1].end > cta_start:
+        last = slides[-1]
+        slides[-1] = Slide(
+            start=last.start,
+            end=cta_start,
+            image_path=last.image_path,
+            query=last.query,
+            headline=last.headline,
+            motion=last.motion,
+        )
+
+    slides.append(Slide(
+        start=cta_start,
+        end=audio_duration,
+        image_path=cta_card_path,
+        query="cta",
+        headline=cta_text,
+        motion="hold",
+    ))
+
+    # ── 5. Write timeline + meta ──
+    write_json(out_dir / "timeline.json", [asdict(s) for s in slides])
+
+    try:
+        write_json(out_dir / "run_meta.json", {
+            "audio_name": audio_path.name,
+            "audio_stem": audio_path.stem,
+            "audio_size": int(audio_stat.st_size),
+            "audio_mtime": float(audio_stat.st_mtime),
+            "render_audio_path": None,
+            "video_type": "top_list",
+            "video_width": int(video_width),
+            "video_height": int(video_height),
+            "topic": title,
+            "topic_type": None,
+            "list_count": int(list_count),
+            "image_provider": "user",
+            "created_at": time.time(),
+            "cwd": os.getcwd(),
+        })
+    except Exception:
+        pass
+
+    print(f"[top_list] timeline.json written with {len(slides)} slides")
+    return out_dir
+
+
+def run_top_list_silent(
+    *,
+    out_dir: str | Path,
+    title: str,
+    list_count: int,
+    item_images: dict[int, str],
+    item_titles: dict[int, str] | None = None,
+    video_width: int = 1080,
+    video_height: int = 1920,
+    image_seconds: float = 4.0,
+    number_seconds: float = 1.5,
+    title_seconds: float = 3.0,
+    cta_text: str = "SUBSCRIBE 👇",
+) -> Path:
+    """Build a timeline for a **silent Top-N List** (no narration).
+
+    Each number card is shown for *number_seconds*, each item image for
+    *image_seconds*.  A silent WAV is generated at the total duration so the
+    renderer has an audio track to work with (BGM can be layered on top).
+
+    Returns *out_dir*.
+    """
+    from .slide_cards import render_text_card, burn_title_on_image
+
+    _item_titles = item_titles or {}
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    assets_dir = ensure_dir(out_dir / "assets")
+
+    SWIPE_DURATION = 0.35
+
+    def _create_swipe_clip(
+        img_from: str, img_to: str, out_path: str,
+        w: int, h: int, dur: float = SWIPE_DURATION, fps: int = 30,
+    ) -> str:
+        import imageio_ffmpeg
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        scale_crop = (
+            f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+            f"crop={w}:{h}:(in_w-out_w)/2:(in_h-out_h)/2,"
+            f"format=yuv420p,fps={fps}"
+        )
+        fc = (
+            f"[0:v]{scale_crop},trim=duration={dur:.3f},setpts=PTS-STARTPTS[a];"
+            f"[1:v]{scale_crop},trim=duration={dur:.3f},setpts=PTS-STARTPTS[b];"
+            f"[a][b]xfade=transition=slideleft:duration={dur:.3f}:offset=0[out]"
+        )
+        cmd = [
+            ffmpeg, "-y",
+            "-loop", "1", "-i", img_from,
+            "-loop", "1", "-i", img_to,
+            "-filter_complex", fc,
+            "-map", "[out]",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+            "-t", f"{dur:.3f}",
+            "-an",
+            out_path,
+        ]
+        subprocess.run(cmd, capture_output=True, timeout=30)
+        return out_path
+
+    # ── Build slides ──
+    slides: list[Slide] = []
+    t = 0.0  # running clock
+
+    # 1. Title card
+    title_card_path = str(assets_dir / "title_card.png")
+    render_text_card(
+        out_path=title_card_path,
+        text=title,
+        width=video_width,
+        height=video_height,
+        font_size_ratio=0.10,
+        text_color=(255, 255, 0),
+    )
+    slides.append(Slide(start=t, end=t + title_seconds, image_path=title_card_path,
+                        query="title", headline=title, motion="hold"))
+    t += title_seconds
+
+    # 2. Number cards + item images (countdown: list_count → 1)
+    for num in range(list_count, 0, -1):
+        # Number card
+        num_card_path = str(assets_dir / f"num_card_{num:02d}.png")
+        render_text_card(
+            out_path=num_card_path,
+            text=f"{num}.",
+            width=video_width,
+            height=video_height,
+            font_size_ratio=0.35,
+        )
+
+        num_start = t
+        num_end = t + number_seconds
+        slides.append(Slide(start=num_start, end=num_end, image_path=num_card_path,
+                            query=f"number {num}", headline=str(num), motion="hold"))
+        t = num_end
+
+        # Item image
+        img_path = item_images.get(num)
+        if img_path and Path(img_path).exists():
+            dst = assets_dir / f"item_{num:02d}{Path(img_path).suffix}"
+            if not dst.exists():
+                shutil.copy2(img_path, dst)
+            item_img = str(dst)
+        else:
+            item_img = str(assets_dir / f"item_placeholder_{num:02d}.png")
+            render_text_card(out_path=item_img, text=f"#{num}",
+                             width=video_width, height=video_height, font_size_ratio=0.25)
+
+        # Portrait pre-processing
+        if int(video_height) > int(video_width) * 1.1:
+            try:
+                from PIL import Image as _PILImage, ImageFilter, ImageEnhance
+                im = _PILImage.open(item_img).convert("RGB")
+                src_w, src_h = im.size
+                src_ratio = src_w / src_h
+                tgt_ratio = int(video_width) / max(1, int(video_height))
+                if src_ratio / max(0.01, tgt_ratio) > 1.4:
+                    tw, th = int(video_width), int(video_height)
+                    bg_scale = max(tw / src_w, th / src_h)
+                    bg_w, bg_h = int(src_w * bg_scale + 0.5), int(src_h * bg_scale + 0.5)
+                    bg = im.resize((bg_w, bg_h), _PILImage.LANCZOS)
+                    bx, by = (bg_w - tw) // 2, (bg_h - th) // 2
+                    bg = bg.crop((bx, by, bx + tw, by + th))
+                    bg = bg.filter(ImageFilter.GaussianBlur(radius=30))
+                    bg = ImageEnhance.Brightness(bg).enhance(0.35)
+                    fg_scale = min(tw / src_w, th / src_h)
+                    fg_w, fg_h = int(src_w * fg_scale + 0.5), int(src_h * fg_scale + 0.5)
+                    fg = im.resize((fg_w, fg_h), _PILImage.LANCZOS)
+                    fx, fy = (tw - fg_w) // 2, (th - fg_h) // 2
+                    canvas = bg.copy()
+                    canvas.paste(fg, (fx, fy))
+                    portrait_path = str(assets_dir / f"item_{num:02d}_portrait.jpg")
+                    canvas.save(portrait_path, quality=95)
+                    item_img = portrait_path
+            except Exception:
+                pass
+
+        # Burn title heading
+        _item_title = _item_titles.get(num, "").strip()
+        if _item_title:
+            titled_path = str(assets_dir / f"item_{num:02d}_titled.png")
+            burn_title_on_image(
+                image_path=item_img, out_path=titled_path, title=_item_title,
+                width=video_width, height=video_height,
+                text_color=(255, 255, 0), position="top",
+            )
+            item_img = titled_path
+
+        # Burn subscribe text on the last item image (num == 1)
+        if num == 1:
+            sub_path = str(assets_dir / f"item_{num:02d}_subscribe.png")
+            burn_title_on_image(
+                image_path=item_img, out_path=sub_path, title=cta_text,
+                width=video_width, height=video_height,
+                text_color=(255, 255, 0), position="bottom",
+            )
+            item_img = sub_path
+
+        # Swipe transition
+        if number_seconds > SWIPE_DURATION + 0.1:
+            swipe_path = str(assets_dir / f"swipe_{num:02d}.mp4")
+            try:
+                _create_swipe_clip(num_card_path, item_img, swipe_path,
+                                   w=video_width, h=video_height, dur=SWIPE_DURATION)
+                if Path(swipe_path).exists() and Path(swipe_path).stat().st_size > 1000:
+                    swipe_start = num_end - SWIPE_DURATION
+                    slides[-1] = Slide(start=num_start, end=swipe_start,
+                                       image_path=num_card_path, query=f"number {num}",
+                                       headline=str(num), motion="hold")
+                    slides.append(Slide(
+                        start=swipe_start, end=num_end, image_path=item_img,
+                        query=f"swipe {num}",
+                        video_clip_path=swipe_path, video_clip_start=0.0,
+                        video_clip_end=SWIPE_DURATION, video_clip_mute=True,
+                        motion="hold",
+                    ))
+            except Exception:
+                pass
+
+        img_start = t
+        img_end = t + image_seconds
+        slides.append(Slide(start=img_start, end=img_end, image_path=item_img,
+                            query=f"item {num} image", headline=_item_title or None,
+                            motion="zoom_in"))
+        t = img_end
+
+    total_duration = t
+
+    # 4. Generate silent WAV so the renderer has an audio track.
+    silent_audio = out_dir / "silence.wav"
+    try:
+        import imageio_ffmpeg
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        subprocess.run([
+            ffmpeg, "-y",
+            "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
+            "-t", f"{total_duration:.3f}",
+            "-c:a", "pcm_s16le",
+            str(silent_audio),
+        ], capture_output=True, timeout=30)
+    except Exception:
+        pass
+
+    # 5. Write timeline + meta
+    write_json(out_dir / "timeline.json", [asdict(s) for s in slides])
+
+    try:
+        write_json(out_dir / "run_meta.json", {
+            "audio_name": "silence.wav",
+            "audio_stem": "silence",
+            "audio_size": int(silent_audio.stat().st_size) if silent_audio.exists() else 0,
+            "audio_mtime": 0.0,
+            "render_audio_path": str(silent_audio),
+            "video_type": "top_list_silent",
+            "video_width": int(video_width),
+            "video_height": int(video_height),
+            "topic": title,
+            "topic_type": None,
+            "list_count": int(list_count),
+            "image_provider": "user",
+            "created_at": time.time(),
+            "cwd": os.getcwd(),
+            "total_duration": total_duration,
+        })
+    except Exception:
+        pass
+
+    print(f"[top_list_silent] timeline.json written with {len(slides)} slides, total {total_duration:.1f}s")
+    return out_dir
+
+
+def run_top_list_clips(
+    *,
+    out_dir: str | Path,
+    title: str,
+    list_count: int,
+    item_titles: dict[int, str],
+    clip_seconds: float = 7.0,
+    number_seconds: float = 2.5,
+    title_seconds: float = 4.0,
+    video_width: int = 1080,
+    video_height: int = 1920,
+    cta_text: str = "SUBSCRIBE 👇",
+    reuse_clips_from: str | Path | None = None,
+    force_fresh: bool = False,
+    tts_intro: bool = True,
+    tts_clip_titles: bool = True,
+) -> Path:
+    """Build a **silent Top-N List** with auto-searched trailer clips.
+
+    No audio input required.  Each number card is shown for
+    *number_seconds* and each trailer clip for *clip_seconds*.
+    A silent WAV is generated so the renderer has an audio track.
+
+    Parameters
+    ----------
+    item_titles : dict[int, str]
+        Mapping of item number → search query (movie/show name).
+        E.g. ``{5: "Ne Zha 2", 4: "Bugonia", ...}``.
+    clip_seconds : float
+        Duration per trailer clip (default 7 s).
+    number_seconds : float
+        Duration per number card (default 2.5 s).
+    force_fresh : bool
+        If True, skip reusing clips from prior runs (re-download everything).
+    """
+    from .slide_cards import render_text_card, burn_title_on_image
+    from .clip_tools import (
+        search_video_clips,
+        download_clip,
+        download_clip_section,
+        trim_clip,
+        get_video_duration,
+    )
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    assets_dir = ensure_dir(out_dir / "assets")
+    clip_dir = ensure_dir(out_dir / "clips")
+
+    # ── Swipe transition helper ──
+    SWIPE_DURATION = 0.35
+
+    def _create_swipe_clip(
+        img_from: str, img_to: str, out_path: str,
+        w: int, h: int, dur: float = SWIPE_DURATION, fps: int = 30,
+    ) -> str:
+        import imageio_ffmpeg
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        scale_crop = (
+            f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+            f"crop={w}:{h}:(in_w-out_w)/2:(in_h-out_h)/2,"
+            f"format=yuv420p,fps={fps}"
+        )
+        fc = (
+            f"[0:v]{scale_crop},trim=duration={dur:.3f},setpts=PTS-STARTPTS[a];"
+            f"[1:v]{scale_crop},trim=duration={dur:.3f},setpts=PTS-STARTPTS[b];"
+            f"[a][b]xfade=transition=slideleft:duration={dur:.3f}:offset=0[out]"
+        )
+        cmd = [
+            ffmpeg, "-y",
+            "-loop", "1", "-i", img_from,
+            "-loop", "1", "-i", img_to,
+            "-filter_complex", fc,
+            "-map", "[out]",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+            "-t", f"{dur:.3f}",
+            "-an",
+            out_path,
+        ]
+        subprocess.run(cmd, capture_output=True, timeout=30)
+        return out_path
+
+    # ── 1. Download trailer clips for each item ──
+    _REJECT_WORDS = {
+        "reaction", "react", "review", "explained", "breakdown", "analysis",
+        "commentary", "opinion", "discuss", "theory", "theories", "ranking",
+        "tier list", "video essay", "response", "rant", "hot take",
+    }
+
+    def _is_official_clip(title_str: str, query_kws: set[str]) -> bool:
+        t = title_str.lower()
+        if query_kws and not any(kw in t for kw in query_kws):
+            return False
+        for rw in _REJECT_WORDS:
+            if rw in t:
+                return False
+        return True
+
+    all_raw_trailers: dict[int, list[tuple[Path, float]]] = {}  # number → list of (raw_path, duration)
+
+    def _burn_title_on_clip(
+        clip_in: Path, clip_out: Path, title_text: str,
+        w: int, h: int, clip_dur: float = 6.0,
+        position: str = "top",
+    ) -> Path:
+        """Burn a yellow title with dark band onto a video clip using ffmpeg drawtext.
+
+        Title text slowly zooms in (~15 %) over the clip duration.
+        position: 'top' or 'bottom'.
+        """
+        import imageio_ffmpeg
+        _ff = imageio_ffmpeg.get_ffmpeg_exe()
+
+        # Font: prefer bold system fonts, fall back to bundled Asap.
+        _fonts = [
+            r"C\\:/Windows/Fonts/segoeuib.ttf",
+            r"C\\:/Windows/Fonts/arialbd.ttf",
+            r"C\\:/Windows/Fonts/impact.ttf",
+        ]
+        fontfile = _fonts[0]
+        for _fp in _fonts:
+            _real = _fp.replace("C\\:", "C:").replace("/", "\\")
+            if Path(_real).exists():
+                fontfile = _fp
+                break
+        else:
+            # Bundled font
+            _bundled = Path(__file__).resolve().parent.parent / "assets" / "fonts" / "Asap-Variable.ttf"
+            if _bundled.exists():
+                fontfile = str(_bundled).replace("\\", "/").replace(":", "\\:")
+
+        font_size = max(32, int(w * 0.07))
+        band_h = int(font_size * 2.5)
+        if position == "bottom":
+            band_y = int(h * 0.88)
+        else:
+            band_y = int(h * 0.06)
+        # Escape special chars for ffmpeg drawtext
+        safe_title = title_text.replace("'", "\u2019").replace(":", "\\:").replace("%", "%%")
+
+        # Dark semi-transparent band (top) + static yellow text
+        drawtext = (
+            f"drawbox=y={band_y}:x=0:w={w}:h={band_h}:color=black@0.6:t=fill,"
+            f"drawtext=fontfile='{fontfile}':"
+            f"text='{safe_title}':"
+            f"fontsize={font_size}:"
+            f"fontcolor=yellow:"
+            f"borderw=3:bordercolor=black:"
+            f"x=(w-text_w)/2:"
+            f"y={band_y}+(({band_h}-text_h)/2)"
+        )
+
+        cmd = [
+            _ff, "-y", "-i", str(clip_in),
+            "-vf", drawtext,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-an",
+            str(clip_out),
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=60)
+            if clip_out.exists() and clip_out.stat().st_size > 1000:
+                return clip_out
+        except Exception as _e:
+            print(f"[burn_title_clip] ffmpeg drawtext failed: {_e}")
+        return clip_in  # fallback: untitled clip
+
+    # ── Find prior output dir with same title to reuse clips ──
+    _prior_clips_dir: Path | None = None
+    if not force_fresh and reuse_clips_from is None:
+        # Normalise the title into a lowercase slug for matching.
+        import re as _re_slug
+        _title_slug = _re_slug.sub(r'[^a-z0-9]+', '_', title.strip().lower()).strip('_')
+        _cwd = Path.cwd()
+        _best_prior: Path | None = None
+        _best_mtime: float = 0.0
+        for _d in _cwd.iterdir():
+            if not _d.is_dir() or not _d.name.startswith("output_"):
+                continue
+            if _d.resolve() == Path(out_dir).resolve():
+                continue
+            _d_slug = _re_slug.sub(r'[^a-z0-9]+', '_', _d.name.lower()).strip('_')
+            if _title_slug not in _d_slug:
+                continue
+            _prior_raw = _d / "clips" / "raw"
+            if not _prior_raw.is_dir():
+                continue
+            if not list(_prior_raw.glob("item_*")):
+                continue
+            _m = _d.stat().st_mtime
+            if _m > _best_mtime:
+                _best_mtime = _m
+                _best_prior = _d
+        if _best_prior:
+            _prior_clips_dir = _best_prior / "clips"
+            print(f"[top_list_clips] Found prior clips in: {_best_prior.name}")
+
+    # ── Reuse raw clips from prior run, explicit reuse dir, or own raw dir ──
+    _reuse_raw_dir = Path(reuse_clips_from) / "raw" if reuse_clips_from else None
+    _prior_raw_dir = _prior_clips_dir / "raw" if _prior_clips_dir else None
+    _own_raw_dir = clip_dir / "raw"
+
+    # Directories to check for existing raw clips (in priority order).
+    _raw_check_dirs: list[Path | None] = [_own_raw_dir, _reuse_raw_dir, _prior_raw_dir]
+    if force_fresh:
+        _raw_check_dirs = []  # skip all reuse
+
+    MAX_TRAILERS_PER_ITEM = 1  # one official HD trailer per item is enough
+
+    for num in range(list_count, 0, -1):
+        item_title = item_titles.get(num, "").strip()
+        if not item_title:
+            print(f"[top_list_clips] No title for #{num} — skipping clip search")
+            continue
+
+        # Collect up to MAX_TRAILERS_PER_ITEM raw trailer paths with their durations.
+        raw_trailers: list[tuple[Path, float]] = []
+        _seen_filenames: set[str] = set()
+
+        # Try reusing raw clips already downloaded (collect up to MAX_TRAILERS_PER_ITEM).
+        for _check_dir in _raw_check_dirs:
+            if len(raw_trailers) >= MAX_TRAILERS_PER_ITEM:
+                break
+            if _check_dir and _check_dir.is_dir():
+                for _rf in sorted(_check_dir.glob(f"item_{num:02d}_*")):
+                    if _rf.name in _seen_filenames:
+                        continue
+                    _rd = get_video_duration(_rf)
+                    if _rd >= 5.0:
+                        _local_raw = clip_dir / "raw"
+                        _local_raw.mkdir(parents=True, exist_ok=True)
+                        _local_copy = _local_raw / _rf.name
+                        if not _local_copy.exists() and _rf.resolve() != _local_copy.resolve():
+                            import shutil as _sh_cp
+                            _sh_cp.copy2(_rf, _local_copy)
+                            _dest = _local_copy
+                        else:
+                            _dest = _rf
+                        raw_trailers.append((_dest, _rd))
+                        _seen_filenames.add(_rf.name)
+                        print(f"  [clip #{num}] ✓ reused trailer {len(raw_trailers)} from {_check_dir.parent.name} ({_rd:.0f}s)")
+                        if len(raw_trailers) >= MAX_TRAILERS_PER_ITEM:
+                            break
+
+        # If we still need more trailers, search + download.
+        if len(raw_trailers) < MAX_TRAILERS_PER_ITEM:
+            _stop = {"the", "a", "an", "of", "in", "to", "and", "or", "for", "is",
+                     "movie", "film", "show", "series", "tv", "part", "season"}
+            kw_set = {
+                w.lower() for w in item_title.split()
+                if len(w) >= 3 and w.lower() not in _stop
+            }
+            _seen_urls: set[str] = set()
+
+            for tq in [
+                f"{item_title} official trailer",
+                f"{item_title} official trailer 2",
+                f"{item_title} trailer HD",
+                f"{item_title} trailer",
+            ]:
+                if len(raw_trailers) >= MAX_TRAILERS_PER_ITEM:
+                    break
+                try:
+                    results = search_video_clips(
+                        tq, max_results=10, preferred_max_duration=600.0,
+                        sort_by_views=False,
+                    )
+                    results = [
+                        r for r in results
+                        if _is_official_clip(r.title, kw_set) and r.url not in _seen_urls
+                    ]
+                    for chosen in results:
+                        if len(raw_trailers) >= MAX_TRAILERS_PER_ITEM:
+                            break
+                        tidx = len(raw_trailers) + 1
+                        raw_path = download_clip_section(
+                            chosen.url, clip_dir / "raw",
+                            start=0.0, end=180.0,
+                            prefix=f"item_{num:02d}_t{tidx}",
+                        )
+                        if raw_path is None:
+                            raw_path = download_clip(
+                                chosen.url, clip_dir / "raw",
+                                prefix=f"item_{num:02d}_t{tidx}",
+                                max_duration=300.0,
+                            )
+                        if raw_path and get_video_duration(raw_path) >= 5.0:
+                            _seen_urls.add(chosen.url)
+                            _rd = get_video_duration(raw_path)
+                            raw_trailers.append((raw_path, _rd))
+                            print(f"  [clip #{num}] ✓ trailer {tidx}: {chosen.title[:60]} ({_rd:.0f}s)")
+                except Exception as _err:
+                    print(f"  [clip #{num}] search error: {_err}")
+
+        if not raw_trailers:
+            print(f"  [clip #{num}] ✗ no trailers found for '{item_title}'")
+            continue
+
+        # Store raw trailers — clipping is done in batch below.
+        all_raw_trailers[num] = raw_trailers
+
+    print(f"[top_list_clips] Trailers downloaded for items: {sorted(all_raw_trailers.keys())}")
+
+    # ── 2. Extract two 5s clips per item from its trailers (skip first 12s). ──
+    import imageio_ffmpeg as _iff_mod
+    _ff_exe = _iff_mod.get_ffmpeg_exe()
+    _thumb_vf = (
+        f"split=2[tbg][tfg];"
+        f"[tbg]scale={video_width}:{video_height}:force_original_aspect_ratio=increase,"
+        f"crop={video_width}:{video_height}:(in_w-out_w)/2:(in_h-out_h)/2,"
+        f"gblur=sigma=20,setsar=1[tblurred];"
+        f"[tfg]scale={video_width}:{video_height}:force_original_aspect_ratio=decrease,"
+        f"setsar=1[tcontent];"
+        f"[tblurred][tcontent]overlay=(W-w)/2:(H-h)/2,format=rgb24[tout]"
+    )
+
+    # item_clips[num] = clip_path
+    item_clips: dict[int, Path] = {}
+
+    for num in range(list_count, 0, -1):
+        trailers = all_raw_trailers.get(num, [])
+        if not trailers:
+            print(f"  [clip #{num}] ✗ no trailers — skipping")
+            continue
+
+        found_clip: Path | None = None
+
+        for tidx, (raw_path, raw_dur) in enumerate(trailers):
+            seg = 12.0
+            end_limit = raw_dur - 2.0
+
+            if seg + clip_seconds <= end_limit:
+                out_clip = clip_dir / f"item_{num:02d}_t{tidx+1}_c1.mp4"
+                if not (out_clip.exists() and get_video_duration(out_clip) > 0):
+                    try:
+                        trim_clip(raw_path, out_clip, start=seg, duration=clip_seconds,
+                                  width=video_width, height=video_height, mute=True)
+                    except Exception as _te:
+                        print(f"  [clip #{num}] trim error: {_te}")
+
+                if out_clip.exists() and get_video_duration(out_clip) > 0:
+                    found_clip = out_clip
+                    print(f"  [clip #{num}] t{tidx+1}: {seg:.1f}s–{seg+clip_seconds:.1f}s")
+                    break
+
+        if found_clip:
+            item_clips[num] = found_clip
+        else:
+            print(f"  [clip #{num}] ✗ could not extract a clip")
+
+    # ── 3. Build slides: title card → (number card → clip) per item ──
+    slides: list[Slide] = []
+    t = 0.0
+
+    def _make_thumb(clip_path: Path) -> str:
+        _thumb = str(assets_dir / f"{clip_path.stem}_thumb.png")
+        if not Path(_thumb).exists():
+            try:
+                subprocess.run([
+                    _ff_exe, "-y", "-i", str(clip_path),
+                    "-vframes", "1", "-filter_complex", _thumb_vf, "-map", "[tout]",
+                    _thumb,
+                ], capture_output=True, timeout=15)
+            except Exception:
+                pass
+        return _thumb if Path(_thumb).exists() else str(clip_path)
+
+    # Title card
+    title_card_path = str(assets_dir / "title_card.png")
+    render_text_card(
+        out_path=title_card_path,
+        text=title,
+        width=video_width,
+        height=video_height,
+        font_size_ratio=0.10,
+        text_color=(255, 255, 0),
+    )
+    slides.append(Slide(start=t, end=t + title_seconds, image_path=title_card_path,
+                        query="title", headline=title, motion="hold"))
+    t += title_seconds
+
+    # Countdown: number card → clip (with title; subscribe on last)
+    for num in range(list_count, 0, -1):
+        clip_path = item_clips.get(num)
+        if clip_path is None:
+            continue
+        _item_title = item_titles.get(num, "").strip()
+
+        # Number card
+        num_card_path = str(assets_dir / f"num_card_{num:02d}.png")
+        render_text_card(
+            out_path=num_card_path,
+            text=f"{num}.",
+            width=video_width,
+            height=video_height,
+            font_size_ratio=0.35,
+        )
+        slides.append(Slide(start=t, end=t + number_seconds, image_path=num_card_path,
+                            query=f"number {num}", headline=str(num), motion="hold"))
+        t += number_seconds
+
+        # Burn item title onto clip
+        if _item_title:
+            titled_clip = clip_dir / f"item_{num:02d}_titled.mp4"
+            clip_path = _burn_title_on_clip(
+                clip_path, titled_clip, _item_title,
+                w=video_width, h=video_height, clip_dur=clip_seconds,
+            )
+
+        # Burn subscribe CTA onto clip of last item (num == 1)
+        if num == 1:
+            sub_clip = clip_dir / f"item_{num:02d}_subscribe.mp4"
+            clip_path = _burn_title_on_clip(
+                clip_path, sub_clip, cta_text,
+                w=video_width, h=video_height, clip_dur=clip_seconds,
+                position="bottom",
+            )
+
+        # Clip slide
+        dur_c = min(get_video_duration(clip_path), clip_seconds)
+        slides.append(Slide(
+            start=t, end=t + clip_seconds,
+            image_path=_make_thumb(clip_path),
+            query="trailer clip",
+            headline=_item_title or None,
+            video_clip_path=str(clip_path),
+            video_clip_start=0.0,
+            video_clip_end=dur_c,
+            video_clip_mute=True,
+            motion="hold",
+        ))
+        t += clip_seconds
+
+    total_duration = t
+
+    # 3. Generate silent WAV.
+    silent_audio = out_dir / "silence.wav"
+    try:
+        import imageio_ffmpeg
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        subprocess.run([
+            ffmpeg, "-y",
+            "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
+            "-t", f"{total_duration:.3f}",
+            "-c:a", "pcm_s16le",
+            str(silent_audio),
+        ], capture_output=True, timeout=30)
+    except Exception:
+        pass
+
+    # 4. Write timeline + meta.
+    write_json(out_dir / "timeline.json", [asdict(s) for s in slides])
+
+    try:
+        write_json(out_dir / "run_meta.json", {
+            "audio_name": "silence.wav",
+            "audio_stem": "silence",
+            "audio_size": int(silent_audio.stat().st_size) if silent_audio.exists() else 0,
+            "audio_mtime": 0.0,
+            "render_audio_path": str(silent_audio),
+            "video_type": "top_list_clips",
+            "video_width": int(video_width),
+            "video_height": int(video_height),
+            "topic": title,
+            "topic_type": None,
+            "list_count": int(list_count),
+            "image_provider": "youtube_clips",
+            "created_at": time.time(),
+            "cwd": os.getcwd(),
+            "total_duration": total_duration,
+        })
+    except Exception:
+        pass
+
+    print(f"[top_list_clips] timeline.json written with {len(slides)} slides, total {total_duration:.1f}s")
     return out_dir

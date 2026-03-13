@@ -49,28 +49,40 @@ _SHADOW = _ass_color("#000000", alpha=0x60)
 def _group_words_into_phrases(
     words: list[dict[str, Any]],
     *,
-    max_words: int = 4,
+    max_words: int = 12,
     max_gap: float = 0.7,
+    max_chars: int = 0,
 ) -> list[list[dict[str, Any]]]:
-    """Group word-level timestamps into short display phrases.
+    """Group word-level timestamps into display phrases.
 
-    Rules:
-    - At most *max_words* per phrase.
+    Rules (applied in order):
+    - If *max_chars* > 0, a phrase is broken when adding the next word would
+      exceed *max_chars* characters (spaces included). This keeps lines
+      within the visible width of the video.
+    - At most *max_words* per phrase (safety cap).
     - A gap > *max_gap* seconds between consecutive words forces a new phrase.
     - Sentence-ending punctuation (``.?!``) ends the current phrase.
     """
     phrases: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
+    current_len = 0  # character count of current phrase line
 
     for w in words:
+        w_text = str(w.get("word", "")).strip()
+        w_len = len(w_text)
+
         if current:
             gap = float(w["start"]) - float(current[-1]["end"])
             prev_text = str(current[-1].get("word", "")).strip()
             ends_sentence = bool(prev_text and prev_text[-1] in ".?!…")
-            if len(current) >= max_words or gap > max_gap or ends_sentence:
+            would_overflow = max_chars > 0 and (current_len + 1 + w_len) > max_chars
+            if len(current) >= max_words or gap > max_gap or ends_sentence or would_overflow:
                 phrases.append(current)
                 current = []
+                current_len = 0
+
         current.append(w)
+        current_len += (1 if current_len > 0 else 0) + w_len
 
     if current:
         phrases.append(current)
@@ -100,11 +112,18 @@ def fix_caption_spelling(
     word_data: list[dict[str, Any]],
     script_sections: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Fix misspelled Whisper words using the ground-truth script as reference.
+    """Replace Whisper caption words with ground-truth script words.
 
-    This is a **text-only** correction — Whisper's timestamps and word count
-    are never modified.  For each Whisper word, if a close match exists in
-    the script vocabulary, the text is replaced.
+    Since the narrated audio follows the script exactly, this performs a
+    **sequential alignment** — each Whisper word is replaced with the
+    corresponding script word in order.  Whisper's timestamps are kept
+    unchanged; only the displayed text is swapped.
+
+    When the word counts differ (Whisper may merge or split tokens), a
+    simple pointer walk aligns them: if the next script word is a close
+    match it's used directly; otherwise a small look-ahead finds the
+    best match.  Any leftover Whisper words beyond the script length
+    are kept as-is.
 
     Parameters
     ----------
@@ -116,75 +135,79 @@ def fix_caption_spelling(
     Returns
     -------
     corrected:
-        Same length as *word_data*, same timestamps, just text fixes.
+        Same length as *word_data*, same timestamps, script text.
     corrections:
         Human-readable list of ``"whisper → script"`` changes.
     """
     import difflib
-    import re
 
     if not word_data:
         return list(word_data), []
 
-    # Build script vocabulary (unique lower-case → preferred casing).
-    # Split on whitespace first, then further split on punctuation like
-    # slashes, em-dashes, etc. so compound tokens ("assimilation/colonization")
-    # become individual vocab entries.
-    _split_re = re.compile(r"[/—–\-]+")
-    vocab: dict[str, str] = {}
+    # Flatten script sections into an ordered word list.
+    _PUNCT = ".,!?…;:'\"\u2018\u2019\u201c\u201d()—–"
+    script_words: list[str] = []
     for sec in script_sections:
-        for raw_w in (sec.get("text") or "").split():
-            parts = _split_re.split(raw_w)
-            for p in parts:
-                clean = p.strip(".,!?…;:'\"\u2018\u2019\u201c\u201d()")
-                key = clean.lower()
-                if key and len(key) >= 2 and key not in vocab:
-                    vocab[key] = clean  # keep first occurrence's casing
+        for w in (sec.get("text") or "").split():
+            script_words.append(w.strip(_PUNCT))
 
-    if not vocab:
+    if not script_words:
         return list(word_data), []
-
-    _PUNCT = ".,!?…;:'\"\u2018\u2019\u201c\u201d()"
 
     corrected: list[dict[str, Any]] = []
     corrections: list[str] = []
+    si = 0  # script pointer
 
     for wd in word_data:
         original = str(wd.get("word", ""))
         stripped = original.strip()
-        key = stripped.lower().strip(_PUNCT)
+        wkey = stripped.lower().strip(_PUNCT)
 
-        if not key or key in vocab:
-            # Exact match or empty — keep original word unchanged.
+        if si >= len(script_words) or not wkey:
+            # Past end of script or empty word — keep as-is.
             corrected.append(dict(wd))
-        elif len(key) < 5:
-            # Short words (< 5 chars) are almost never misspelled by
-            # Whisper in a meaningful way and cause too many false
-            # positives (e.g. "four" → "for", "fan" → "Fans").
-            corrected.append(dict(wd))
+            continue
+
+        # Try direct alignment: current script word.
+        skey = script_words[si].lower()
+
+        if skey == wkey:
+            # Exact match — use the script's casing.
+            leading = original[: len(original) - len(stripped)]
+            corrected.append({
+                "word": leading + script_words[si],
+                "start": wd["start"],
+                "end": wd["end"],
+            })
+            si += 1
         else:
-            # No exact match — find closest word in script vocab.
-            # Only consider vocab entries of similar length (±2 chars).
-            close = [
-                v for v in vocab
-                if abs(len(v) - len(key)) <= 2
-            ]
-            candidates = difflib.get_close_matches(key, close, n=1, cutoff=0.82)
-            if candidates:
-                best = candidates[0]
-                # Preserve leading whitespace and trailing punctuation
-                # from the original Whisper word.
+            # Look ahead up to 3 script words for a better match
+            # (handles Whisper merging/splitting tokens).
+            best_j = -1
+            best_ratio = 0.0
+            lookahead = min(4, len(script_words) - si)
+            for j in range(lookahead):
+                candidate = script_words[si + j].lower()
+                ratio = difflib.SequenceMatcher(None, wkey, candidate).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_j = j
+
+            if best_ratio >= 0.5:
+                # Skip any script words we jumped over.
+                si += best_j
                 leading = original[: len(original) - len(stripped)]
-                trail_start = len(stripped) - len(stripped.rstrip(_PUNCT))
-                trailing = stripped[-trail_start:] if trail_start else ""
-                new_word = leading + vocab[best] + trailing
+                new_text = script_words[si]
+                if new_text.lower() != wkey:
+                    corrections.append(f"{stripped} → {new_text}")
                 corrected.append({
-                    "word": new_word,
+                    "word": leading + new_text,
                     "start": wd["start"],
                     "end": wd["end"],
                 })
-                corrections.append(f"{stripped} → {vocab[best]}")
+                si += 1
             else:
+                # No reasonable match — keep Whisper word, don't advance script.
                 corrected.append(dict(wd))
 
     return corrected, corrections
@@ -198,12 +221,12 @@ def generate_ass_captions(
     *,
     width: int = 1080,
     height: int = 1920,
-    font_name: str = "Arial Black",
+    font_name: str = "Asap",
     font_size: int | None = None,
     highlight_color: str = "#FFFF00",
     text_color: str = "#FFFFFF",
     outline_px: int | None = None,
-    max_phrase_words: int = 3,
+    max_phrase_words: int = 0,
     style: str = "word_highlight",   # word_highlight | pop
     offset_seconds: float = 0.0,
 ) -> Path:
@@ -251,14 +274,25 @@ def generate_ass_captions(
     # Auto-scale defaults.
     is_portrait = height > width
     if font_size is None:
-        font_size = max(48, int(height * 0.043))  # ~82 for 1920
+        font_size = 41
     if outline_px is None:
         outline_px = max(3, font_size // 16)
+
+    # Estimate how many characters fit on one line.  For bold sans-serif fonts
+    # the average glyph width ≈ 0.6 × font_size.  We leave ~10 % side margin.
+    usable_width = int(width * 0.90)
+    avg_char_w = font_size * 0.58
+    max_chars_per_line = max(10, int(usable_width / avg_char_w))
+
+    # If caller explicitly set a word cap, honour it; otherwise use char-based.
+    _max_words = max_phrase_words if max_phrase_words > 0 else 14
 
     hi_col = _ass_color(highlight_color)
     txt_col = _ass_color(text_color)
 
-    phrases = _group_words_into_phrases(words, max_words=max_phrase_words)
+    phrases = _group_words_into_phrases(
+        words, max_words=_max_words, max_chars=max_chars_per_line,
+    )
 
     # Y-position: lower area for portrait to avoid blocking image center,
     # lower-third for landscape.
@@ -273,9 +307,20 @@ def generate_ass_captions(
 
     _off = float(offset_seconds)
 
-    for phrase in phrases:
+    # Pre-compute each phrase's effective end: extend to the start of the next
+    # phrase so captions stay visible during natural speech pauses (no blank gap).
+    phrase_list = list(phrases)
+    phrase_ends: list[float] = []
+    for _pi, _ph in enumerate(phrase_list):
+        _p_end = float(_ph[-1]["end"])
+        if _pi + 1 < len(phrase_list):
+            _next_start = float(phrase_list[_pi + 1][0]["start"])
+            _p_end = max(_p_end, _next_start - 0.02)
+        phrase_ends.append(_p_end)
+
+    for phrase_idx, phrase in enumerate(phrase_list):
         phrase_start = float(phrase[0]["start"]) + _off
-        phrase_end = float(phrase[-1]["end"]) + _off
+        phrase_end = phrase_ends[phrase_idx] + _off
         if phrase_end <= phrase_start:
             continue
 

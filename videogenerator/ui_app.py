@@ -143,21 +143,21 @@ with col_left:
         "Image provider",
         options=["google_images", "serpapi", "wikimedia"],
         index=0,
-        help="google_images uses SerpAPI Google Images results directly (no license validation).",
+        help="Uses Playwright (headless browser) as primary search. SerpAPI/Wikimedia used as fallback.",
     )
 
     video_type = st.selectbox(
         "Video type",
-        options=["review (images only)", "short review (9:16, images only)", "explainer (text + images)", "commentary (clip insertion)", "clip review (9:16, full clips)", "shorts (9:16)", "shorts review (9:16, retention)", "scripted short (9:16, from script)", "video short (9:16, clips from script)", "auto"],
+        options=["review (images only)", "short review (9:16, images only)", "explainer (text + images)", "commentary (clip insertion)", "clip review (9:16, full clips)", "shorts (9:16)", "shorts review (9:16, retention)", "scripted short (9:16, from script)", "video short (9:16, clips from script)", "video long (16:9, clips from script)", "top list (9:16, countdown)", "top list silent (9:16, no narration)", "top list clips (9:16, trailer clips)", "auto"],
         index=0,
-        help="Explainer/shorts use LLM-planned text-on-slide storyboards. Commentary auto-inserts referenced clips and compilations. Clip review fills entire video with muted movie clips. Scripted short uses a timestamped script you paste to search one image per section. Video short is like scripted short but uses YouTube clips instead of images.",
+        help="Explainer/shorts use LLM-planned text-on-slide storyboards. Commentary auto-inserts referenced clips and compilations. Clip review fills entire video with muted movie clips. Scripted short uses a timestamped script you paste to search one image per section. Video short/long uses YouTube trailer clips instead of images (short=9:16, long=16:9). Top list builds a countdown video from user-provided images.",
     )
 
     # When creating Shorts, retention usually improves with faster cuts and more images.
     # We set dynamic defaults when the user switches video_type.
     # ── Scripted Short: script text area ──
     scripted_short_script = ""
-    if video_type.startswith("scripted short") or video_type.startswith("video short"):
+    if video_type.startswith("scripted short") or video_type.startswith("video short") or video_type.startswith("video long"):
         scripted_short_script = st.text_area(
             "Paste your timestamped script",
             value="",
@@ -201,9 +201,103 @@ with col_left:
 
         st.divider()
 
+    # ── Top List: title, count, per-item images ──
+    _top_list_title = ""
+    _top_list_count = 5
+    _top_list_uploads: dict[int, object] = {}  # number → UploadedFile
+    _top_list_titles: dict[int, str] = {}  # number → item title
+    _top_list_also_instagram = False
+    _is_top_list_any = video_type.startswith("top list")
+    if _is_top_list_any:
+        _top_list_title = st.text_input(
+            "List title (displayed as first screen)",
+            value="",
+            placeholder="5 Bad movies from 2025",
+            help="This text is shown full-screen as the opening title card.",
+        )
+        _top_list_count = st.number_input(
+            "How many items?",
+            min_value=2,
+            max_value=30,
+            value=5,
+            step=1,
+            help="Number of items in your list (e.g. 5 for a Top 5, 10 for a Top 10).",
+        )
+        _is_top_list_clips = video_type.startswith("top list clips")
+        if _is_top_list_clips:
+            st.markdown("**Enter the movie/show name for each item** — the program will search for official trailers.")
+        else:
+            st.markdown("**Upload an image for each item** — numbered from highest to lowest (the order you say them).")
+        _top_list_titles: dict[int, str] = {}
+        for _n in range(int(_top_list_count), 0, -1):
+            if _is_top_list_clips:
+                _item_title = st.text_input(
+                    f"Title for #{_n}",
+                    value="",
+                    key=f"top_list_title_{_n}",
+                    placeholder=f"e.g. Ne Zha 2",
+                )
+                if _item_title.strip():
+                    _top_list_titles[_n] = _item_title.strip()
+            else:
+                _c1, _c2 = st.columns([2, 3])
+                with _c1:
+                    _uf = st.file_uploader(
+                        f"Image for #{_n}",
+                        type=["jpg", "jpeg", "png", "webp", "bmp"],
+                        key=f"top_list_img_{_n}",
+                    )
+                    if _uf is not None:
+                        _top_list_uploads[_n] = _uf
+                with _c2:
+                    _item_title = st.text_input(
+                        f"Title for #{_n}",
+                        value="",
+                        key=f"top_list_title_{_n}",
+                        placeholder=f"e.g. Movie Name",
+                    )
+                    if _item_title.strip():
+                        _top_list_titles[_n] = _item_title.strip()
+        if _top_list_uploads:
+            st.caption(f"{len(_top_list_uploads)}/{int(_top_list_count)} images provided.")
+        _top_list_also_instagram = st.checkbox(
+            "Also create Instagram version (4:5)",
+            value=False,
+            help="Renders a second video at 1080×1350 (4:5) for Instagram Reels alongside the 9:16 YouTube Shorts version.",
+        )
+        if _is_top_list_clips:
+            _tts_col1, _tts_col2 = st.columns(2)
+            with _tts_col1:
+                _tts_intro_enabled = st.checkbox(
+                    "\U0001f50a TTS: Announce intro title",
+                    value=True,
+                    help="Generate a voice-over that reads the video title aloud during the intro card.",
+                )
+            with _tts_col2:
+                _tts_clips_enabled = st.checkbox(
+                    "\U0001f50a TTS: Announce clip titles",
+                    value=True,
+                    help="Generate a voice-over that reads each movie/show name when its clip starts.",
+                )
+        else:
+            _tts_intro_enabled = False
+            _tts_clips_enabled = False
+        st.divider()
+
+    # ── Optional narration script for caption correction (any video type) ──
+    narration_script_text = ""
+    if not (video_type.startswith("scripted short") or video_type.startswith("video short") or video_type.startswith("video long") or video_type.startswith("top list")):
+        narration_script_text = st.text_area(
+            "Paste narration script (optional — fixes caption words)",
+            value="",
+            height=150,
+            placeholder="Paste the exact narration text here. Captions will use these words instead of Whisper's guesses.",
+            help="If your audio follows a written script, paste it here so caption words match exactly. Timing is not affected — only the displayed words.",
+        )
+
     last_vt = st.session_state.get("_last_video_type")
     if last_vt != video_type:
-        if video_type.startswith("shorts") or video_type.startswith("clip review") or video_type.startswith("short review") or video_type.startswith("scripted short"):
+        if video_type.startswith("shorts") or video_type.startswith("clip review") or video_type.startswith("short review") or video_type.startswith("scripted short") or video_type.startswith("top list"):
             st.session_state["max_images_slider"] = 20
             st.session_state["min_images_slider"] = 10
             st.session_state["min_seg_seconds_slider"] = 1.8
@@ -280,7 +374,7 @@ with col_left:
 
     animated_captions = st.checkbox(
         "Animated captions (word-by-word)",
-        value=video_type.startswith("short review") or video_type.startswith("scripted short"),
+        value=video_type.startswith("short review") or video_type.startswith("scripted short") or video_type.startswith("video short") or video_type.startswith("video long") or (video_type.startswith("top list") and not video_type.startswith("top list silent") and not video_type.startswith("top list clips")),
         help="Overlay word-by-word highlighted captions (CapCut style). Best for 9:16 shorts.",
     )
     caption_highlight = st.checkbox(
@@ -292,7 +386,7 @@ with col_left:
     st.subheader("3) Audio mix")
     bgm_preset = st.selectbox(
         "BGM preset",
-        options=["(none)", "elevator", "ambient", "creepy", "hiphop", "rnb", "clown", "cylinder_five", "dark_walk"],
+        options=["(none)", "elevator", "ambient", "creepy", "hiphop", "rnb", "clown", "cylinder_five", "dark_walk", "midnight_trace"],
         index=0,
     )
 
@@ -461,50 +555,62 @@ with col_right:
         help="Leave blank to auto-name a fresh output folder.",
     )
 
-    if audio_file is None:
+    _is_top_list_silent = video_type.startswith("top list silent")
+    _is_top_list_clips_ui = video_type.startswith("top list clips")
+    if audio_file is None and not _is_top_list_silent and not _is_top_list_clips_ui:
         st.info("Upload an audio file to enable Run.")
         st.stop()
 
     tmp_dir = workspace / ".cache" / "ui_uploads"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    saved_audio = tmp_dir / audio_file.name
 
-    # IMPORTANT: transcript caching keys on (audio_name, size, mtime).
-    # Streamlit's uploader provides bytes each rerun; if we rewrite the file every time,
-    # its mtime changes and we will re-transcribe. So: only write when content changed.
-    uploaded_bytes = audio_file.getvalue()
-    uploaded_sha = hashlib.sha256(uploaded_bytes).hexdigest()
-    sha_path = tmp_dir / f"{audio_file.name}.sha256"
+    saved_audio: Path | None = None
+    uploaded_sha = ""
 
-    prev_sha = ""
-    if sha_path.exists():
-        try:
-            prev_sha = sha_path.read_text(encoding="utf-8").strip()
-        except Exception:
-            prev_sha = ""
+    if audio_file is not None:
+        saved_audio = tmp_dir / audio_file.name
 
-    if (not saved_audio.exists()) or (prev_sha != uploaded_sha):
-        saved_audio.write_bytes(uploaded_bytes)
-        try:
-            sha_path.write_text(uploaded_sha + "\n", encoding="utf-8")
-        except Exception:
-            pass
+        # IMPORTANT: transcript caching keys on (audio_name, size, mtime).
+        # Streamlit's uploader provides bytes each rerun; if we rewrite the file every time,
+        # its mtime changes and we will re-transcribe. So: only write when content changed.
+        uploaded_bytes = audio_file.getvalue()
+        uploaded_sha = hashlib.sha256(uploaded_bytes).hexdigest()
+        sha_path = tmp_dir / f"{audio_file.name}.sha256"
+
+        prev_sha = ""
+        if sha_path.exists():
+            try:
+                prev_sha = sha_path.read_text(encoding="utf-8").strip()
+            except Exception:
+                prev_sha = ""
+
+        if (not saved_audio.exists()) or (prev_sha != uploaded_sha):
+            saved_audio.write_bytes(uploaded_bytes)
+            try:
+                sha_path.write_text(uploaded_sha + "\n", encoding="utf-8")
+            except Exception:
+                pass
 
     if not out_name.strip():
-        # Re-use the folder from the last successful pipeline run (same audio)
-        # so that post-run actions (Generate Short, thumbnail regen) still
-        # point at the correct output even after page reruns.
-        _ss_key = f"last_out_dir_{uploaded_sha}"
-        if _ss_key in st.session_state:
-            out_name = st.session_state[_ss_key]
+        if (_is_top_list_silent or _is_top_list_clips_ui) and saved_audio is None:
+            # No audio — use the list title for the folder name.
+            _silent_stem = _top_list_title.strip() or "top_list"
+            out_name = f"output_{_silent_stem}_{datetime.now():%Y%m%d_%H%M%S}"
         else:
-            out_name = _default_output_dir(saved_audio)
+            # Re-use the folder from the last successful pipeline run (same audio)
+            # so that post-run actions (Generate Short, thumbnail regen) still
+            # point at the correct output even after page reruns.
+            _ss_key = f"last_out_dir_{uploaded_sha}"
+            if _ss_key in st.session_state:
+                out_name = st.session_state[_ss_key]
+            else:
+                out_name = _default_output_dir(saved_audio)
 
     out_dir = workspace / out_name
     st.code(str(out_dir), language="text")
 
     # Show whether we have prior outputs for this MP3 stem (image reuse).
-    stem = saved_audio.stem.strip().lower()
+    stem = saved_audio.stem.strip().lower() if saved_audio else ""
     if stem:
         prior = []
         for d in workspace.iterdir():
@@ -526,15 +632,105 @@ with col_right:
         else:
             st.caption("No prior output folders detected for this MP3 stem (yet).")
 
-    b1, b2, b3 = st.columns([1, 1, 1])
+    # Determine if review type (only review has image picker)
+    _is_review_type = (
+        video_type.startswith("review")
+        or video_type.startswith("short review")
+        or video_type == "auto"
+    ) and not (
+        video_type.startswith("scripted short")
+        or video_type.startswith("video short")
+        or video_type.startswith("video long")
+    )
+
+    b1, b2, b3, b4 = st.columns([1, 1, 1, 1])
     with b1:
         run_clicked = st.button("Run", type="primary")
     with b2:
-        thumb_only_clicked = st.button("Thumbnail only", type="secondary", help="Generate thumbnail.png from the audio (transcribe → pick image + crop + text). Skips MP4 rendering.")
+        fetch_images_clicked = st.button(
+            "Fetch images", type="secondary",
+            help="Fetch images from Google and let you pick which ones to use before running.",
+            disabled=not _is_review_type,
+        )
     with b3:
+        thumb_only_clicked = st.button("Thumbnail only", type="secondary", help="Generate thumbnail.png from the audio (transcribe → pick image + crop + text). Skips MP4 rendering.")
+    with b4:
         short_only_clicked = st.button("Short only", type="secondary", help="Create a YouTube Short from an existing video.mp4 in the output folder. Skips pipeline + rendering.")
 
-    action = "run" if run_clicked else ("thumbnail_only" if thumb_only_clicked else ("short_only" if short_only_clicked else None))
+    # ── Image picker state ──────────────────────────────────────────────
+    _audio_stem = saved_audio.stem if saved_audio else "none"
+    _picker_key = f"_img_pool_{_audio_stem}"
+    _picker_selected_key = f"_img_selected_{_audio_stem}"
+
+    if fetch_images_clicked and _is_review_type:
+        _fetch_topic = (str(image_subject).strip() or str(topic).strip() or "")
+        if not _fetch_topic:
+            st.warning("Enter an image subject / topic before fetching.")
+        else:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            _prog = st.progress(0, text="Fetching images from Google…")
+            def _fetch_cb(done, total):
+                _prog.progress(min(1.0, done / max(total, 1)), text=f"Fetching images… {done}/{total}")
+            try:
+                from videogenerator.pipeline import fetch_review_image_pool
+                _fetched = fetch_review_image_pool(
+                    _fetch_topic, out_dir,
+                    max_results=25,
+                    min_image_width=900,
+                    progress_cb=_fetch_cb,
+                )
+                st.session_state[_picker_key] = [str(p) for p in _fetched]
+                st.session_state[_picker_selected_key] = [True] * len(_fetched)
+                _prog.empty()
+                st.success(f"Fetched {len(_fetched)} images. Select which to keep, then click **Run with selected**.")
+            except Exception as _fe:
+                _prog.empty()
+                st.error(f"Image fetch failed: {_fe}")
+
+    # Show picker if pool exists in session state
+    _pool_paths = st.session_state.get(_picker_key, [])
+    _pool_selected = st.session_state.get(_picker_selected_key, [])
+    _run_with_selected = False
+    if _pool_paths:
+        st.divider()
+        st.markdown("**Pick images to use** — uncheck any you want to exclude, then click Run with selected.")
+        _cols_per_row = 5
+        _valid_pool = [p for p in _pool_paths if Path(p).exists()]
+        # Ensure selection list matches current pool
+        if len(_pool_selected) != len(_valid_pool):
+            _pool_selected = [True] * len(_valid_pool)
+            st.session_state[_picker_selected_key] = _pool_selected
+
+        _new_selected = list(_pool_selected)
+        for row_start in range(0, len(_valid_pool), _cols_per_row):
+            row_paths = _valid_pool[row_start:row_start + _cols_per_row]
+            cols = st.columns(len(row_paths))
+            for ci, (col, img_path) in enumerate(zip(cols, row_paths)):
+                gi = row_start + ci
+                with col:
+                    st.image(img_path, use_container_width=True)
+                    _new_selected[gi] = st.checkbox(
+                        "✓", value=_pool_selected[gi], key=f"_imgpick_{_picker_key}_{gi}"
+                    )
+        st.session_state[_picker_selected_key] = _new_selected
+
+        _n_chosen = sum(_new_selected)
+        _run_with_selected = st.button(
+            f"Run with selected ({_n_chosen} images)", type="primary", key="_run_with_sel"
+        )
+        if st.button("Clear selection", key="_clear_img_pool"):
+            st.session_state.pop(_picker_key, None)
+            st.session_state.pop(_picker_selected_key, None)
+            st.rerun()
+        st.divider()
+
+    action = (
+        "run_with_selected" if _run_with_selected else
+        "run" if run_clicked else
+        "thumbnail_only" if thumb_only_clicked else
+        "short_only" if short_only_clicked else
+        None
+    )
 
     # ------------------------------------------------------------------
     # Short-only mode: skip pipeline, jump straight to short creation
@@ -607,14 +803,30 @@ with col_right:
 
         st.stop()
 
-    if action is not None:
+    if action in ("run", "run_with_selected", "thumbnail_only"):
         thumbnail_only = action == "thumbnail_only"
+
+        # Resolve which pool images to pass (for run_with_selected)
+        _selected_pool_images: list[str] = []
+        if action == "run_with_selected":
+            _cur_pool = st.session_state.get(_picker_key, [])
+            _cur_sel = st.session_state.get(_picker_selected_key, [])
+            _selected_pool_images = [
+                p for p, keep in zip(_cur_pool, _cur_sel) if keep and Path(p).exists()
+            ]
+            if not _selected_pool_images:
+                st.error("No images selected. Check at least one image before running.")
+                st.stop()
         out_dir.mkdir(parents=True, exist_ok=True)
 
         vt = "review"
         _is_short_review_images = video_type.startswith("short review")
-        _is_scripted_short = video_type.startswith("scripted short") or video_type.startswith("video short")
-        _is_video_short = video_type.startswith("video short")
+        _is_scripted_short = video_type.startswith("scripted short") or video_type.startswith("video short") or video_type.startswith("video long")
+        _is_video_short = video_type.startswith("video short") or video_type.startswith("video long")
+        _is_video_long = video_type.startswith("video long")
+        _is_top_list = video_type.startswith("top list") and not video_type.startswith("top list silent") and not video_type.startswith("top list clips")
+        _is_top_list_silent = video_type.startswith("top list silent")
+        _is_top_list_clips = video_type.startswith("top list clips")
         if video_type.startswith("explainer"):
             vt = "explainer"
         elif video_type.startswith("commentary"):
@@ -624,7 +836,13 @@ with col_right:
         elif video_type.startswith("shorts review"):
             vt = "shorts_review"
         elif _is_scripted_short:
-            vt = "video_short" if _is_video_short else "scripted_short"
+            vt = "video_long" if _is_video_long else ("video_short" if _is_video_short else "scripted_short")
+        elif _is_top_list_silent:
+            vt = "top_list_silent"
+        elif _is_top_list_clips:
+            vt = "top_list_clips"
+        elif _is_top_list:
+            vt = "top_list"
         elif video_type.startswith("shorts"):
             vt = "shorts"
         elif _is_short_review_images:
@@ -634,14 +852,16 @@ with col_right:
 
         # Render sizing preset.
         vid_w, vid_h = (1920, 1080)
-        if vt in {"shorts", "shorts_review", "clip_review", "scripted_short", "video_short"} or _is_short_review_images:
+        if vt in {"shorts", "shorts_review", "clip_review", "scripted_short", "video_short", "top_list", "top_list_silent", "top_list_clips"} or _is_short_review_images:
             vid_w, vid_h = (1080, 1920)
+        if vt == "video_long":
+            vid_w, vid_h = (1920, 1080)
 
         # Shorts defaults: no transitions.
         run_max_images = int(max_images) if max_images is not None else None
         run_transition = transition
         run_transition_seconds = float(transition_seconds)
-        if vt in {"shorts", "shorts_review", "clip_review", "scripted_short", "video_short"} or _is_short_review_images:
+        if vt in {"shorts", "shorts_review", "clip_review", "scripted_short", "video_short", "video_long", "top_list", "top_list_silent", "top_list_clips"} or _is_short_review_images:
             run_transition = "none"
             run_transition_seconds = 0.0
 
@@ -652,64 +872,231 @@ with col_right:
             if fresh_images_this_run:
                 st.caption("Fresh images enabled: not reusing prior output assets for this run.")
 
-            if _is_scripted_short:
-                # ── Scripted Short pipeline ──
-                if not scripted_short_script.strip():
-                    st.error("Paste a timestamped script in the left panel first.")
+            if _is_top_list_silent:
+                # ── Top List Silent pipeline (no narration) ──
+                if not _top_list_title.strip():
+                    st.error("Enter a list title (e.g. '5 Bad movies from 2025').")
                     st.stop()
-                from videogenerator.script_parser import parse_script as _parse_script
-                try:
-                    _sections = _parse_script(scripted_short_script)
-                except ValueError as _pe:
-                    st.error(f"Script parse error: {_pe}")
-                    st.stop()
-                st.caption(f"Parsed {len(_sections)} sections from script")
-                # Save raw script for debugging.
-                try:
-                    (out_dir / "script_raw.txt").write_text(scripted_short_script, encoding="utf-8")
-                except Exception:
-                    pass
-                # Show parsed on-screen text count.
-                _n_osd_parsed = sum(1 for s in _sections if (s.on_screen_text or "").strip())
-                if _n_osd_parsed:
-                    st.caption(f"  → {_n_osd_parsed} section(s) have on-screen text")
-                else:
-                    st.caption("  → No on-screen text found (add 'On-screen text: …' lines to script)")
 
-                # ── Save user-uploaded reference images to disk ──
-                _user_images_for_pipeline: list[dict] = []
-                if _user_image_titles:
-                    _ref_dir = out_dir / "user_images"
-                    _ref_dir.mkdir(parents=True, exist_ok=True)
-                    for _uf, _title in _user_image_titles:
-                        if not _title:
-                            continue
-                        _ext = Path(_uf.name).suffix or ".jpg"
-                        _safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in _title)
-                        _dest = _ref_dir / f"{_safe}{_ext}"
-                        _dest.write_bytes(_uf.getvalue())
-                        _user_images_for_pipeline.append({
-                            "title": _title,
-                            "path": str(_dest),
-                        })
-                    if _user_images_for_pipeline:
-                        st.caption(f"  → {len(_user_images_for_pipeline)} reference image(s) uploaded")
+                _tl_image_map: dict[int, str] = {}
+                _tl_ref_dir = out_dir / "user_images"
+                _tl_ref_dir.mkdir(parents=True, exist_ok=True)
+                for _n, _uf in _top_list_uploads.items():
+                    _ext = Path(_uf.name).suffix or ".jpg"
+                    _dest = _tl_ref_dir / f"item_{_n:02d}{_ext}"
+                    _dest.write_bytes(_uf.getvalue())
+                    _tl_image_map[_n] = str(_dest)
 
-                run_scripted_short(
-                    audio_path=str(saved_audio),
+                if not _tl_image_map:
+                    st.warning("No images uploaded — placeholders will be used.")
+
+                from videogenerator.pipeline import run_top_list_silent
+
+                run_top_list_silent(
                     out_dir=out_dir,
-                    script_sections=_sections,
-                    topic=(str(image_subject).strip() or str(topic).strip() or None),
-                    image_provider=image_provider,
-                    serpapi_api_key=os.getenv("SERPAPI_API_KEY"),
-                    min_image_width=900,
+                    title=_top_list_title.strip(),
+                    list_count=int(_top_list_count),
+                    item_images=_tl_image_map,
+                    item_titles=_top_list_titles or None,
                     video_width=int(vid_w),
                     video_height=int(vid_h),
-                    llm_model="gpt-4o-mini",
-                    user_images=_user_images_for_pipeline or None,
-                    reuse_images=bool(effective_reuse_images),
-                    use_clips=_is_video_short,
                 )
+
+                # Instagram version (4:5, 1080×1350)
+                if _top_list_also_instagram:
+                    _ig_dir = out_dir / "instagram"
+                    _ig_dir.mkdir(parents=True, exist_ok=True)
+                    st.write("Building Instagram (4:5) timeline…")
+                    run_top_list_silent(
+                        out_dir=_ig_dir,
+                        title=_top_list_title.strip(),
+                        list_count=int(_top_list_count),
+                        item_images=_tl_image_map,
+                        item_titles=_top_list_titles or None,
+                        video_width=1080,
+                        video_height=1350,
+                    )
+
+            elif _is_top_list_clips:
+                # ── Top List Clips pipeline (silent, auto-search trailers) ──
+                if not _top_list_title.strip():
+                    st.error("Enter a list title (e.g. 'Top 5 movies of the decade').")
+                    st.stop()
+
+                if not _top_list_titles:
+                    st.error("Enter at least one item title (movie/show name) so the program can search for trailers.")
+                    st.stop()
+
+                from videogenerator.pipeline import run_top_list_clips
+
+                st.write("Searching YouTube for trailers and building clips…")
+                run_top_list_clips(
+                    out_dir=out_dir,
+                    title=_top_list_title.strip(),
+                    list_count=int(_top_list_count),
+                    item_titles=_top_list_titles,
+                    video_width=int(vid_w),
+                    video_height=int(vid_h),
+                    force_fresh=bool(fresh_images_this_run),
+                    tts_intro=_tts_intro_enabled,
+                    tts_clip_titles=_tts_clips_enabled,
+                )
+
+                # Instagram version (4:5, 1080×1350)
+                if _top_list_also_instagram:
+                    _ig_dir = out_dir / "instagram"
+                    _ig_dir.mkdir(parents=True, exist_ok=True)
+                    st.write("Building Instagram (4:5) timeline (reusing downloaded clips)…")
+                    run_top_list_clips(
+                        out_dir=_ig_dir,
+                        title=_top_list_title.strip(),
+                        list_count=int(_top_list_count),
+                        item_titles=_top_list_titles,
+                        video_width=1080,
+                        video_height=1350,
+                        reuse_clips_from=str(out_dir / "clips"),
+                        tts_intro=_tts_intro_enabled,
+                        tts_clip_titles=_tts_clips_enabled,
+                    )
+
+            elif _is_top_list:
+                # ── Top List pipeline ──
+                if not _top_list_title.strip():
+                    st.error("Enter a list title (e.g. '5 Bad movies from 2025').")
+                    st.stop()
+
+                # Save uploaded images to disk.
+                _tl_image_map: dict[int, str] = {}
+                _tl_ref_dir = out_dir / "user_images"
+                _tl_ref_dir.mkdir(parents=True, exist_ok=True)
+                for _n, _uf in _top_list_uploads.items():
+                    _ext = Path(_uf.name).suffix or ".jpg"
+                    _dest = _tl_ref_dir / f"item_{_n:02d}{_ext}"
+                    _dest.write_bytes(_uf.getvalue())
+                    _tl_image_map[_n] = str(_dest)
+
+                if not _tl_image_map:
+                    st.warning("No images uploaded — placeholders will be used.")
+
+                from videogenerator.pipeline import run_top_list
+
+                run_top_list(
+                    audio_path=str(saved_audio),
+                    out_dir=out_dir,
+                    title=_top_list_title.strip(),
+                    list_count=int(_top_list_count),
+                    item_images=_tl_image_map,
+                    item_titles=_top_list_titles or None,
+                    video_width=int(vid_w),
+                    video_height=int(vid_h),
+                )
+
+                # Instagram version (4:5, 1080×1350)
+                if _top_list_also_instagram:
+                    _ig_dir = out_dir / "instagram"
+                    _ig_dir.mkdir(parents=True, exist_ok=True)
+                    st.write("Building Instagram (4:5) timeline…")
+                    run_top_list(
+                        audio_path=str(saved_audio),
+                        out_dir=_ig_dir,
+                        title=_top_list_title.strip(),
+                        list_count=int(_top_list_count),
+                        item_images=_tl_image_map,
+                        item_titles=_top_list_titles or None,
+                        video_width=1080,
+                        video_height=1350,
+                    )
+
+            elif _is_scripted_short:
+                # ── Scripted Short / Video Short pipeline ──
+                # Script is optional for video short types — if omitted the
+                # regular audio-driven pipeline runs with use_clips enabled.
+                if not scripted_short_script.strip() and not _is_video_short:
+                    st.error("Paste a timestamped script in the left panel first.")
+                    st.stop()
+                if not scripted_short_script.strip() and _is_video_short:
+                    # No script: use the standard pipeline with clip mode.
+                    run(
+                        audio_path=str(saved_audio),
+                        out_dir=out_dir,
+                        topic=(str(image_subject).strip() or str(topic).strip() or None),
+                        video_type=vt,
+                        image_provider=image_provider,
+                        serpapi_api_key=os.getenv("SERPAPI_API_KEY"),
+                        max_images=(int(run_max_images) if run_max_images is not None else 12),
+                        min_images=int(min_images),
+                        min_seg_seconds=float(min_seg_seconds),
+                        max_slide_seconds=float(max_slide_seconds),
+                        whisper_model="small",
+                        min_image_width=900,
+                        video_width=int(vid_w),
+                        video_height=int(vid_h),
+                        cache_transcript=True,
+                        cache_dir=None,
+                        storyboard="auto",
+                        llm_model="gpt-4o-mini",
+                        llm_pick_images=True,
+                        reuse_images=bool(effective_reuse_images),
+                        pool_image_paths=_selected_pool_images or None,
+                        mix_video_clips=True,
+                        max_video_clips=int(max_video_clips),
+                        clip_queries=clip_queries,
+                        clip_research=bool(clip_research),
+                    )
+                else:
+                    from videogenerator.script_parser import parse_script as _parse_script
+                    try:
+                        _sections = _parse_script(scripted_short_script)
+                    except ValueError as _pe:
+                        st.error(f"Script parse error: {_pe}")
+                        st.stop()
+                    st.caption(f"Parsed {len(_sections)} sections from script")
+                    # Save raw script for debugging.
+                    try:
+                        (out_dir / "script_raw.txt").write_text(scripted_short_script, encoding="utf-8")
+                    except Exception:
+                        pass
+                    # Show parsed on-screen text count.
+                    _n_osd_parsed = sum(1 for s in _sections if (s.on_screen_text or "").strip())
+                    if _n_osd_parsed:
+                        st.caption(f"  → {_n_osd_parsed} section(s) have on-screen text")
+                    else:
+                        st.caption("  → No on-screen text found (add 'On-screen text: …' lines to script)")
+
+                    # ── Save user-uploaded reference images to disk ──
+                    _user_images_for_pipeline: list[dict] = []
+                    if _user_image_titles:
+                        _ref_dir = out_dir / "user_images"
+                        _ref_dir.mkdir(parents=True, exist_ok=True)
+                        for _uf, _title in _user_image_titles:
+                            if not _title:
+                                continue
+                            _ext = Path(_uf.name).suffix or ".jpg"
+                            _safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in _title)
+                            _dest = _ref_dir / f"{_safe}{_ext}"
+                            _dest.write_bytes(_uf.getvalue())
+                            _user_images_for_pipeline.append({
+                                "title": _title,
+                                "path": str(_dest),
+                            })
+                        if _user_images_for_pipeline:
+                            st.caption(f"  → {len(_user_images_for_pipeline)} reference image(s) uploaded")
+
+                    run_scripted_short(
+                        audio_path=str(saved_audio),
+                        out_dir=out_dir,
+                        script_sections=_sections,
+                        topic=(str(image_subject).strip() or str(topic).strip() or None),
+                        image_provider=image_provider,
+                        serpapi_api_key=os.getenv("SERPAPI_API_KEY"),
+                        min_image_width=900,
+                        video_width=int(vid_w),
+                        video_height=int(vid_h),
+                        llm_model="gpt-4o-mini",
+                        user_images=_user_images_for_pipeline or None,
+                        reuse_images=bool(effective_reuse_images),
+                        use_clips=_is_video_short,
+                    )
             else:
                 run(
                     audio_path=str(saved_audio),
@@ -732,6 +1119,7 @@ with col_right:
                     llm_model="gpt-4o-mini",
                     llm_pick_images=True,
                     reuse_images=bool(effective_reuse_images),
+                    pool_image_paths=_selected_pool_images or None,
                     mix_video_clips=bool(mix_video_clips),
                     max_video_clips=int(max_video_clips),
                     clip_queries=clip_queries,
@@ -823,7 +1211,7 @@ with col_right:
             outro_s = max(0.0, float(outro_seconds))
 
             # Shorts / clip_review / short review images / scripted short: no channel intro/outro branding slates.
-            if vt in {"shorts", "clip_review", "scripted_short", "video_short"} or _is_short_review_images:
+            if vt in {"shorts", "clip_review", "scripted_short", "video_short", "top_list", "top_list_silent", "top_list_clips"} or _is_short_review_images:
                 intro_s = 0.0
                 outro_s = 0.0
 
@@ -1012,11 +1400,12 @@ with col_right:
                 st.success("Thumbnail generated")
                 st.stop()
 
-            st.write("Rendering MP4…")
+            # ── Render MP4 with progress bar + ETA ──
             out_mp4 = out_dir / "video.mp4"
 
             # Shorts Review may produce a padded narration track (with pivot silences).
-            audio_for_render: Path = saved_audio
+            # For silent top_list, the pipeline generates a silence.wav.
+            audio_for_render: Path = saved_audio if saved_audio else (out_dir / "silence.wav")
             try:
                 meta_path = out_dir / "run_meta.json"
                 if meta_path.exists():
@@ -1063,35 +1452,16 @@ with col_right:
                     st.warning(f"Could not generate captions: {_cap_err}")
                     caption_ass_path = None
 
-            # ── On-screen text overlays + spelling fix for scripted shorts ──
+            # ── Caption spelling fix — DISABLED ──
+            # Previously corrected Whisper words against the narration script.
+            # Turned off for all video types to avoid unwanted word replacements.
+
+            # ── On-screen text overlays for scripted shorts ──
             if _is_scripted_short:
                 try:
                     _ss_path = out_dir / "script_sections.json"
                     if _ss_path.exists():
                         _ss_data = json.loads(_ss_path.read_text(encoding="utf-8"))
-
-                        # ── Fix Whisper spelling mistakes using script vocab ──
-                        if word_data and caption_ass_path and animated_captions:
-                            try:
-                                from videogenerator.captions import (
-                                    fix_caption_spelling,
-                                    generate_ass_captions as _gen_ass,
-                                )
-                                _fixed, _fixes = fix_caption_spelling(word_data, _ss_data)
-                                if _fixes:
-                                    _cap_style = "pop" if caption_highlight else "static"
-                                    _gen_ass(
-                                        _fixed,
-                                        caption_ass_path,
-                                        width=int(vid_w),
-                                        height=int(vid_h),
-                                        style=_cap_style,
-                                        offset_seconds=float(intro_s),
-                                    )
-                                    word_data = _fixed
-                                    st.caption(f"Fixed {len(_fixes)} spelling mistake(s): {', '.join(_fixes[:10])}")
-                            except Exception as _sp_err:
-                                st.warning(f"Spelling fix failed: {_sp_err}")
 
                         # ── On-screen text overlays ──
                         _has_osd = any((s.get("on_screen_text") or "").strip() for s in _ss_data)
@@ -1120,6 +1490,21 @@ with col_right:
                 except Exception as _osd_err:
                     st.warning(f"On-screen text overlay failed: {_osd_err}")
 
+            _render_progress_bar = st.progress(0, text="Rendering MP4… 0%")
+
+            def _render_progress_cb(frac: float, elapsed: float, eta: float) -> None:
+                pct = int(frac * 100)
+                if eta > 0 and frac < 1.0:
+                    if eta >= 60:
+                        eta_str = f"{int(eta // 60)}m {int(eta % 60)}s"
+                    else:
+                        eta_str = f"{int(eta)}s"
+                    _render_progress_bar.progress(min(frac, 0.99), text=f"Rendering MP4… {pct}% — ETA {eta_str}")
+                elif frac >= 1.0:
+                    _render_progress_bar.progress(1.0, text="Rendering MP4… done")
+                else:
+                    _render_progress_bar.progress(min(frac, 0.99), text=f"Rendering MP4… {pct}%")
+
             render_slideshow(
                 slides_to_render,
                 str(audio_for_render),
@@ -1136,9 +1521,74 @@ with col_right:
                 outro_seconds=float(outro_s),
                 transition=None if run_transition == "none" else run_transition,
                 transition_seconds=float(run_transition_seconds),
-                ken_burns=(vt == "shorts_review"),
+                ken_burns=(vt in {"shorts_review", "top_list", "top_list_silent", "top_list_clips"} or _is_short_review_images),
                 subtitle_path=str(caption_ass_path) if caption_ass_path else None,
+                progress_callback=_render_progress_cb,
             )
+
+            # ── Instagram 4:5 render (top_list only) ──
+            if (_is_top_list or _is_top_list_silent or _is_top_list_clips) and _top_list_also_instagram:
+                _ig_dir = out_dir / "instagram"
+                _ig_timeline = _ig_dir / "timeline.json"
+                if _ig_timeline.exists():
+                    st.write("Rendering Instagram (4:5) video…")
+                    _ig_slides_raw = json.loads(_ig_timeline.read_text(encoding="utf-8"))
+                    _ig_slides = [Slide(**s) for s in _ig_slides_raw]
+                    _ig_mp4 = _ig_dir / "video_instagram.mp4"
+
+                    # Generate Instagram captions at 1080×1350.
+                    _ig_caption_path: Path | None = None
+                    if animated_captions and word_data:
+                        try:
+                            from videogenerator.captions import generate_ass_captions
+                            _ig_caption_path = _ig_dir / "captions.ass"
+                            _cap_style = "pop" if caption_highlight else "static"
+                            generate_ass_captions(
+                                word_data,
+                                _ig_caption_path,
+                                width=1080,
+                                height=1350,
+                                style=_cap_style,
+                                offset_seconds=float(intro_s),
+                            )
+                        except Exception:
+                            _ig_caption_path = None
+
+                    _ig_progress = st.progress(0, text="Rendering Instagram MP4… 0%")
+
+                    def _ig_progress_cb(frac: float, elapsed: float, eta: float) -> None:
+                        pct = int(frac * 100)
+                        if eta > 0 and frac < 1.0:
+                            eta_str = f"{int(eta // 60)}m {int(eta % 60)}s" if eta >= 60 else f"{int(eta)}s"
+                            _ig_progress.progress(min(frac, 0.99), text=f"Rendering Instagram MP4… {pct}% — ETA {eta_str}")
+                        elif frac >= 1.0:
+                            _ig_progress.progress(1.0, text="Rendering Instagram MP4… done")
+                        else:
+                            _ig_progress.progress(min(frac, 0.99), text=f"Rendering Instagram MP4… {pct}%")
+
+                    _ig_audio = _ig_dir / "silence.wav" if (_ig_dir / "silence.wav").exists() else audio_for_render
+
+                    render_slideshow(
+                        _ig_slides,
+                        str(_ig_audio),
+                        _ig_mp4,
+                        width=1080,
+                        height=1350,
+                        fps=30,
+                        bgm_path=None,
+                        bgm_volume=float(bgm_volume),
+                        bgm_duck=bool(bgm_duck),
+                        bgm_generate=False,
+                        bgm_preset=effective_bgm_preset,
+                        intro_seconds=float(intro_s),
+                        outro_seconds=float(outro_s),
+                        transition=None if run_transition == "none" else run_transition,
+                        transition_seconds=float(run_transition_seconds),
+                        ken_burns=(vt in {"shorts_review", "top_list", "top_list_silent", "top_list_clips"} or _is_short_review_images),
+                        subtitle_path=str(_ig_caption_path) if _ig_caption_path else None,
+                        progress_callback=_ig_progress_cb,
+                    )
+                    st.success("Instagram (4:5) video rendered")
 
             if youtube_metadata:
                 st.write("Generating YouTube metadata + thumbnail…")
@@ -1245,6 +1695,21 @@ with col_right:
 
         st.success("Finished")
 
+        # Windows toast notification
+        try:
+            from plyer import notification
+            notification.notify(
+                title="Video Generator",
+                message=f"Video render complete: {out_dir.name}",
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+        # Clear image picker state after a successful run.
+        st.session_state.pop(_picker_key, None)
+        st.session_state.pop(_picker_selected_key, None)
+
         # Persist the output folder name so that post-run actions (Generate Short,
         # thumbnail regen) survive page reruns even when the text input is blank.
         _ss_key = f"last_out_dir_{uploaded_sha}"
@@ -1265,6 +1730,14 @@ with col_right:
                 with left:
                     st.subheader("Full review")
                     st.video(video_path.read_bytes(), format="video/mp4")
+
+        # Instagram version preview
+        _ig_video = out_dir / "instagram" / "video_instagram.mp4"
+        if _ig_video.exists():
+            left_ig, _right_ig = st.columns([2, 1])
+            with left_ig:
+                st.subheader("Instagram (4:5)")
+                st.video(_ig_video.read_bytes(), format="video/mp4")
 
         cols = st.columns([1, 1, 2])
         with cols[0]:

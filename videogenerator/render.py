@@ -3,15 +3,61 @@ from __future__ import annotations
 import math
 import subprocess
 import shutil
+import time as _time_mod
 import wave
 import os
 import re
 from pathlib import Path
 from functools import lru_cache
+from typing import Callable
 
 import imageio_ffmpeg
 
 from .models import Slide
+
+
+def _run_ffmpeg_with_progress(
+    cmd: list[str],
+    total_duration: float,
+    progress_callback: Callable[[float, float, float], None] | None = None,
+) -> tuple[int, str]:
+    """Run an ffmpeg command, parse ``time=`` from stderr and call *progress_callback*.
+
+    *progress_callback* receives ``(fraction_done, elapsed_seconds, eta_seconds)``.
+    Returns ``(returncode, stderr_text)``.
+    """
+    if progress_callback is None:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        return proc.returncode, (proc.stderr or "")
+
+    _TIME_RE = re.compile(r"time=\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+    stderr_lines: list[str] = []
+    t0 = _time_mod.monotonic()
+
+    proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
+    assert proc.stderr is not None
+    buf = ""
+    for chunk in iter(lambda: proc.stderr.read(256), ""):  # type: ignore[union-attr]
+        buf += chunk
+        while "\r" in buf or "\n" in buf:
+            line, _, buf = buf.partition("\r") if "\r" in buf else buf.partition("\n")
+            stderr_lines.append(line)
+            m = _TIME_RE.search(line)
+            if m and total_duration > 0:
+                cur = float(m.group(1)) * 3600 + float(m.group(2)) * 60 + float(m.group(3))
+                frac = min(1.0, cur / total_duration)
+                elapsed = _time_mod.monotonic() - t0
+                eta = (elapsed / frac - elapsed) if frac > 0.01 else 0.0
+                try:
+                    progress_callback(frac, elapsed, eta)
+                except Exception:
+                    pass
+    proc.wait()
+    try:
+        progress_callback(1.0, _time_mod.monotonic() - t0, 0.0)
+    except Exception:
+        pass
+    return proc.returncode, "\n".join(stderr_lines)
 
 
 def _video_has_audio(path: str | Path) -> bool:
@@ -121,7 +167,13 @@ def _try_find_bgm_preset_audio_file(key: str) -> Path | None:
     return None
 
 
-def _convert_audio_file_to_wav(*, in_path: Path, out_wav: Path, seconds: float, sample_rate: int = 44100) -> None:
+def _convert_audio_file_to_wav(*, in_path: Path, out_wav: Path, seconds: float = 0, sample_rate: int = 44100) -> None:
+    """Convert *in_path* to a 16-bit stereo WAV.
+
+    If *seconds* is 0 (default) the **entire** source file is converted so that
+    file-backed BGM presets play their full duration.  A positive value truncates
+    to that many seconds (used by generated presets).
+    """
     out_wav.parent.mkdir(parents=True, exist_ok=True)
     ffmpeg = _ffmpeg_exe()
     cmd = [
@@ -129,8 +181,10 @@ def _convert_audio_file_to_wav(*, in_path: Path, out_wav: Path, seconds: float, 
         "-y",
         "-i",
         str(in_path.resolve()),
-        "-t",
-        str(max(1.0, float(seconds))),
+    ]
+    if seconds > 0:
+        cmd += ["-t", str(max(1.0, float(seconds)))]
+    cmd += [
         "-ac",
         "2",
         "-ar",
@@ -210,7 +264,10 @@ def ensure_bgm_preset_wav(*, preset: str, seconds: float = 32.0) -> Path:
         except Exception:
             pass
 
-        _convert_audio_file_to_wav(in_path=audio_file, out_wav=out, seconds=seconds)
+        # Convert the FULL file — no truncation.  The render loop uses
+        # -stream_loop -1 so ffmpeg will seamlessly loop if the video is
+        # longer than the track.
+        _convert_audio_file_to_wav(in_path=audio_file, out_wav=out)
         return out
 
     if key in ("elevator", "elevator_music"):
@@ -879,6 +936,7 @@ def render_slideshow(
     transition_seconds: float = 0.35,
     ken_burns: bool = False,
     subtitle_path: str | Path | None = None,
+    progress_callback: Callable[[float, float, float], None] | None = None,
 ) -> None:
     if not slides:
         raise ValueError("No slides to render")
@@ -1025,7 +1083,11 @@ def render_slideshow(
         )
         if subtitle_path and Path(subtitle_path).exists():
             ass_escaped = str(Path(subtitle_path).resolve()).replace("\\", "/").replace(":", "\\:")
-            vf_chain += f",fps={int(fps)},ass='{ass_escaped}'"
+            _fonts_dir = str((Path(__file__).resolve().parent.parent / "assets" / "fonts").resolve()).replace("\\", "/").replace(":", "\\:")
+            # fps + setpts before ass: concat demuxer can produce erratic PTS for
+            # still-image segments which causes libass to ignore colour override
+            # tags until the first segment boundary.  Resetting PTS fixes this.
+            vf_chain += f",fps={int(fps)},setpts=PTS-STARTPTS,ass='{ass_escaped}':fontsdir='{_fonts_dir}'"
 
         if bgm_path or bgm_generate:
             if bgm_path:
@@ -1118,8 +1180,9 @@ def render_slideshow(
         slide_is_clip: list[bool] = []
         for i, s in enumerate(slides):
             if s.video_clip_path and Path(s.video_clip_path).exists():
-                # Video clip input — no -loop.
-                cmd += ["-i", str(Path(s.video_clip_path).resolve())]
+                # Video clip input — loop so clip can fill the full slide
+                # duration (tpad stop_mode=clone is broken on many builds).
+                cmd += ["-stream_loop", "-1", "-i", str(Path(s.video_clip_path).resolve())]
                 slide_is_clip.append(True)
             else:
                 # Still image — loop to create infinite video stream.
@@ -1161,15 +1224,11 @@ def render_slideshow(
             # ── Video clip slide: trim from clip offset, scale, no Ken Burns ──
             if slide_is_clip[i]:
                 clip_start = float(slides[i].video_clip_start or 0.0)
-                # Use video_clip_end to limit trim duration (clip may be shorter than slide).
-                clip_end = float(slides[i].video_clip_end or dur_s)
-                clip_dur = min(dur_s, clip_end)
+                # Input uses -stream_loop -1, so trimming to full slide
+                # duration always produces enough frames (no tpad needed).
                 chain = (
                     f"[{in_label}]"
-                    f"trim=start={clip_start:.3f}:duration={clip_dur:.3f},setpts=PTS-STARTPTS,"
-                    # tpad pads with last frame if clip is slightly shorter than expected.
-                    f"tpad=stop_mode=clone:stop_duration={max(0.0, dur_s - clip_dur + 0.1):.3f},"
-                    f"trim=duration={dur_s:.3f},setpts=PTS-STARTPTS,"
+                    f"trim=start={clip_start:.3f}:duration={dur_s:.3f},setpts=PTS-STARTPTS,"
                     f"{scale_pad}"
                 )
                 if trans == "fade" and fade_s > 0.0 and dur_s > (2 * fade_s + 0.05):
@@ -1241,10 +1300,11 @@ def render_slideshow(
 
         # Concat all video segments.
         if subtitle_path and Path(subtitle_path).exists():
-            # Route through ASS overlay: concat → [vpre] → ass → [vout]
+            # Route through ASS overlay: concat → setpts → ass → [vout]
             ass_escaped = str(Path(subtitle_path).resolve()).replace("\\", "/").replace(":", "\\:")
-            v_filters.append("".join(v_labels) + f"concat=n={len(v_labels)}:v=1:a=0[vpre]")
-            v_filters.append(f"[vpre]ass='{ass_escaped}'[vout]")
+            _fonts_dir = str((Path(__file__).resolve().parent.parent / "assets" / "fonts").resolve()).replace("\\", "/").replace(":", "\\:")
+            v_filters.append("".join(v_labels) + f"concat=n={len(v_labels)}:v=1:a=0,setpts=PTS-STARTPTS[vpre]")
+            v_filters.append(f"[vpre]ass='{ass_escaped}':fontsdir='{_fonts_dir}'[vout]")
         else:
             v_filters.append("".join(v_labels) + f"concat=n={len(v_labels)}:v=1:a=0[vout]")
 
@@ -1264,15 +1324,17 @@ def render_slideshow(
         clip_audio_labels: list[str] = []
 
         if clip_ranges:
-            # 1) Mute narrator voice during clip playback ranges.
-            #    volume=0 is enabled only while any clip is playing; otherwise full volume.
-            between_parts = "+".join(
-                f"between(t,{ts:.3f},{ts + td:.3f})" for ts, td, _, _ in clip_ranges
-            )
-            pre_a_filters.append(
-                f"[{voice_label}]volume=0:enable='{between_parts}'[vduck]"
-            )
-            voice_label = "vduck"
+            # 1) Duck narrator voice only during NON-muted clips (clips with their own audio).
+            #    Muted clips have no audio, so narrator plays at full volume over them.
+            unmuted_ranges = [(ts, td) for ts, td, _, muted in clip_ranges if not muted]
+            if unmuted_ranges:
+                between_parts = "+".join(
+                    f"between(t,{ts:.3f},{ts + td:.3f})" for ts, td in unmuted_ranges
+                )
+                pre_a_filters.append(
+                    f"[{voice_label}]volume=0:enable='{between_parts}'[vduck]"
+                )
+                voice_label = "vduck"
 
             # 2) For non-muted clips, extract their audio and position on the timeline.
             for ci, (tl_start, tl_dur, inp_idx, muted) in enumerate(clip_ranges):
@@ -1392,11 +1454,11 @@ def render_slideshow(
         cur_base = base
         for _ in range(2):
             cmd = cur_base + extra + [str(out_mp4)]
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            if proc.returncode == 0:
+            rc, stderr_text = _run_ffmpeg_with_progress(cmd, total_duration, progress_callback)
+            if rc == 0:
                 return
 
-            last_stderr = proc.stderr or ""
+            last_stderr = stderr_text
 
             # If ducking was requested but ffmpeg lacks sidechaincompress, retry without ducking.
             if (bgm_path or bgm_generate) and bgm_duck and "sidechaincompress" in last_stderr and (
@@ -1408,7 +1470,7 @@ def render_slideshow(
 
             # If it's not an encoder issue, don't retry.
             if not _is_encoder_error(last_stderr):
-                raise RuntimeError(f"ffmpeg failed ({proc.returncode}):\n{last_stderr}")
+                raise RuntimeError(f"ffmpeg failed ({rc}):\n{last_stderr}")
             break
 
     raise RuntimeError(f"ffmpeg failed: could not find a working video encoder.\n{last_stderr}")
