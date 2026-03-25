@@ -274,7 +274,7 @@ def generate_ass_captions(
     # Auto-scale defaults.
     is_portrait = height > width
     if font_size is None:
-        font_size = 41
+        font_size = 54
     if outline_px is None:
         outline_px = max(3, font_size // 16)
 
@@ -729,7 +729,7 @@ def generate_on_screen_text_ass(
     _off = float(offset_seconds)
 
     # ── Title-card styling ──
-    font_size = max(52, int(height * 0.048))
+    font_size = max(64, int(height * 0.062))
     y_pos = int(height * 0.22) if is_portrait else int(height * 0.18)
     x_pos = width // 2
     max_chars_line = max(10, int(width * 0.78 / max(1, font_size * 0.52)))

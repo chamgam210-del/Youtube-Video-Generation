@@ -20,12 +20,35 @@ def playwright_google_image_search(
     max_results: int = 20,
     min_width: int = 800,
 ) -> list[dict[str, Any]]:
-    """Search Google Images via Playwright and return image candidates.
+    """Search images via Playwright and return image candidates.
+
+    Order: Bing (most reliable) -> Google -> DuckDuckGo HTTP API.
 
     Each result dict contains:
       - title, page_url, image_url, original_url, width, height,
         license_name, license_url, attribution
     """
+    # ── Primary: Bing Images (most reliable for headless browsers) ──
+    bing_results = _bing_image_playwright(query, max_results=max_results, min_width=min_width)
+    if bing_results:
+        return bing_results
+
+    # ── Fallback 1: Google Images ──
+    google_results = _google_image_playwright(query, max_results=max_results, min_width=min_width)
+    if google_results:
+        return google_results
+
+    # ── Fallback 2: DuckDuckGo HTTP API ──
+    return _ddg_image_fallback(query, max_results=max_results, min_width=min_width)
+
+
+def _google_image_playwright(
+    query: str,
+    *,
+    max_results: int = 20,
+    min_width: int = 800,
+) -> list[dict[str, Any]]:
+    """Search Google Images via Playwright. Returns [] if blocked/captcha."""
     try:
         from playwright.sync_api import sync_playwright
         import asyncio as _asyncio
@@ -216,16 +239,133 @@ def playwright_google_image_search(
             browser.close()
 
             if results:
-                print(f"[playwright_images] Found {len(results)} images for {query!r}")
+                print(f"[playwright_images] Google found {len(results)} images for {query!r}")
                 return results
+            else:
+                print(f"[playwright_images] Google returned 0 results for {query!r} — may be blocking.")
+                return []
 
     except ImportError:
-        print("[playwright_images] Playwright not installed — falling back to DuckDuckGo")
+        print("[playwright_images] Playwright not installed")
+        return []
     except Exception as e:
         print(f"[playwright_images] Google Images scrape failed for {query!r}: {e}")
+        return []
 
-    # ── Fallback: DuckDuckGo ──
-    return _ddg_image_fallback(query, max_results=max_results, min_width=min_width)
+
+def _bing_image_playwright(
+    query: str,
+    *,
+    max_results: int = 20,
+    min_width: int = 800,
+) -> list[dict[str, Any]]:
+    """Search Bing Images via Playwright — more permissive than Google for headless browsers."""
+    try:
+        from playwright.sync_api import sync_playwright
+        import re as _re
+
+        encoded_q = quote_plus(query)
+        print(f"[playwright_images] Trying Bing Images for {query!r}...")
+
+        import sys as _sys
+        import asyncio as _asyncio
+        if _sys.platform == "win32":
+            _asyncio.set_event_loop_policy(_asyncio.WindowsProactorEventLoopPolicy())
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1400, "height": 900},
+                locale="en-US",
+            )
+            page = ctx.new_page()
+            url = f"https://www.bing.com/images/search?q={encoded_q}&form=HDRSC2&first=1"
+            page.goto(url, timeout=20000, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+
+            results: list[dict[str, Any]] = []
+            seen_urls: set[str] = set()
+
+            import json as _json
+
+            # Strategy 1: Parse structured data from card elements.
+            cards = page.query_selector_all("a.iusc[m]")
+            for card in cards:
+                if len(results) >= max_results:
+                    break
+                try:
+                    m_attr = card.get_attribute("m") or ""
+                    m_data = _json.loads(m_attr)
+                    img_url = m_data.get("murl", "")
+                    if not img_url or not img_url.startswith("http"):
+                        continue
+                    if img_url in seen_urls:
+                        continue
+                    w = int(m_data.get("mw", 0) or 0)
+                    h = int(m_data.get("mh", 0) or 0)
+                    if min_width and w and w < min_width:
+                        continue
+                    seen_urls.add(img_url)
+                    results.append({
+                        "title": m_data.get("t", query),
+                        "page_url": m_data.get("purl", ""),
+                        "image_url": img_url,
+                        "original_url": img_url,
+                        "width": w or None,
+                        "height": h or None,
+                        "license_name": None,
+                        "license_url": None,
+                        "attribution": m_data.get("desc", query),
+                    })
+                except Exception:
+                    continue
+
+            # Strategy 2: Fall back to thumbnail src attributes.
+            if len(results) < 3:
+                thumbs = page.query_selector_all("img.mimg[src^='http']")
+                for thumb in thumbs:
+                    if len(results) >= max_results:
+                        break
+                    try:
+                        src = thumb.get_attribute("src") or ""
+                        if not src.startswith("http") or src in seen_urls:
+                            continue
+                        if "bing.com" in src or "bing.net" in src:
+                            continue
+                        seen_urls.add(src)
+                        results.append({
+                            "title": thumb.get_attribute("alt") or query,
+                            "page_url": "",
+                            "image_url": src,
+                            "original_url": src,
+                            "width": None,
+                            "height": None,
+                            "license_name": None,
+                            "license_url": None,
+                            "attribution": thumb.get_attribute("alt") or query,
+                        })
+                    except Exception:
+                        continue
+
+            browser.close()
+
+            if results:
+                print(f"[playwright_images] Bing found {len(results)} images for {query!r}")
+            return results
+
+    except ImportError:
+        return []
+    except Exception as e:
+        print(f"[playwright_images] Bing Images scrape failed for {query!r}: {e}")
+        return []
 
 
 def _ddg_image_fallback(

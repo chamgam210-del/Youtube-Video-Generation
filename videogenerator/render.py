@@ -1241,7 +1241,7 @@ def render_slideshow(
             # ── Still image slide (original logic) ──
             motion = str(getattr(slides[i], "motion", "") or "").strip().lower()
             if ken_burns and not motion:
-                motion = "zoom_in"
+                motion = "hold"
 
             if ken_burns and motion and motion not in {"hold", "none", "static"}:
                 frames = max(1, int(round(dur_s * float(fps))))

@@ -358,13 +358,8 @@ def run(
                     return f"{t} scene still"
 
                 def _motion_map(m: str) -> str:
-                    mm = (m or "").strip().lower()
-                    if mm in {"none", "minimal"}:
-                        return "hold"
-                    if mm == "snap_zoom":
-                        return "snap"
-                    # slow_zoom / slow_zoom_in
-                    return "zoom_in"
+                    # Always hold — no zoom/pan effects on shorts_review images.
+                    return "hold"
 
                 # Hook frame planned at [0, hook_s].
                 planned = [
@@ -1584,9 +1579,10 @@ def run(
         return str(p)
 
     # Seed image: try to download at least one image for the topic.
+    # Skip when pool images are already provided (no search needed).
     seed_topic = effective_topic or (topic or "").strip() or None
     _cached_seed_candidates: list[dict] = []  # reused by pool block below
-    if (reuse_source_dir is None) and seed_topic:
+    if (reuse_source_dir is None) and seed_topic and not pool_image_paths:
         try:
             seed_candidates = _search_candidates(seed_topic)
             seed_candidates = _rerank_candidates(seed_candidates, qstr=seed_topic)
@@ -1731,8 +1727,9 @@ def run(
         q_context = " ".join(([anchor] if anchor else []) + (keywords[:5] if keywords else [])).strip() if (anchor or keywords) else ""
 
         # Let the LLM propose a few concrete visual search phrases (e.g. "<movie> guitar scene").
+        # Skip when pool images are already provided — the queries won't be used.
         llm_suggested_queries: list[str] = []
-        if use_llm and anchor and debug_window_text:
+        if use_llm and anchor and debug_window_text and not reuse_image_paths:
             try:
                 from .llm_storyboard import suggest_image_search_queries_with_llm
 

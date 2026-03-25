@@ -708,7 +708,7 @@ with col_right:
             for ci, (col, img_path) in enumerate(zip(cols, row_paths)):
                 gi = row_start + ci
                 with col:
-                    st.image(img_path, use_container_width=True)
+                    st.image(img_path, width="stretch")
                     _new_selected[gi] = st.checkbox(
                         "✓", value=_pool_selected[gi], key=f"_imgpick_{_picker_key}_{gi}"
                     )
@@ -1856,7 +1856,7 @@ with col_right:
                                 crop=None,
                             )
                             st.success(f"Thumbnail saved: {thumb_out.name}")
-                            st.image(str(thumb_out), caption="thumbnail.png (from frame)", use_container_width=True)
+                            st.image(str(thumb_out), caption="thumbnail.png (from frame)", width="stretch")
                     except Exception as exc:
                         st.error(f"Frame extraction failed: {exc}")
 
