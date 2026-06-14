@@ -384,21 +384,30 @@ with col_left:
     ) if animated_captions else True
 
     st.subheader("3) Audio mix")
+    # Auto-load BGM options from assets/bgm/ folder
+    _bgm_dir = Path.cwd() / "assets" / "bgm"
+    _bgm_found = sorted(
+        f.stem for f in _bgm_dir.iterdir()
+        if f.suffix.lower() in {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
+        and not f.name.startswith(".")
+    ) if _bgm_dir.exists() else []
+    _bgm_builtin = [p for p in ["elevator", "ambient", "creepy", "hiphop", "rnb", "clown"] if p not in _bgm_found]
+    _bgm_options = ["(none)"] + _bgm_builtin + _bgm_found
     bgm_preset = st.selectbox(
         "BGM preset",
-        options=["(none)", "elevator", "ambient", "creepy", "hiphop", "rnb", "clown", "cylinder_five", "dark_walk", "midnight_trace"],
+        options=_bgm_options,
         index=0,
+        help="File-based presets load from assets/bgm/. Drop .mp3/.wav files there to add them.",
     )
 
     # Optional: upload a local BGM file and save it under the selected preset name.
-    # This avoids manual file copying/renaming for file-backed presets like `cylinder_five`.
     bgm_upload = st.file_uploader(
         "Upload BGM file (optional)",
         type=["mp3", "wav", "m4a", "aac", "flac", "ogg"],
-        help="If you upload a track while a file-backed preset is selected (e.g. cylinder_five), the UI saves it into assets/bgm/ so the preset can be used.",
+        help="Upload a track here — it will be saved into assets/bgm/ and appear in the preset list on the next rerun.",
     )
 
-    if bgm_upload is not None and bgm_preset not in {"(none)", "", "ambient", "elevator", "creepy", "hiphop", "rnb", "clown"}:
+    if bgm_upload is not None:
         try:
             assets_bgm_dir = Path.cwd() / "assets" / "bgm"
             assets_bgm_dir.mkdir(parents=True, exist_ok=True)
@@ -407,7 +416,8 @@ with col_left:
             if ext not in {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}:
                 ext = ".mp3"
 
-            target = assets_bgm_dir / f"{str(bgm_preset).strip().lower()}{ext}"
+            _preset_stem = str(bgm_preset).strip().lower() if bgm_preset not in {"(none)", ""} else Path(bgm_upload.name).stem.lower()
+            target = assets_bgm_dir / f"{_preset_stem}{ext}"
             data = bgm_upload.getvalue()
 
             # Only write if content changed.
@@ -504,19 +514,37 @@ with col_left:
             placeholder="e.g. Warfare Review",
             help="Text shown in the animated intro. Defaults to the topic.",
         ) or None
+        # SFX: auto-load from assets/sound_effects/ folder + optional upload
+        _sfx_dir = Path.cwd() / "assets" / "sound_effects"
+        _sfx_found = sorted(
+            f.name for f in _sfx_dir.iterdir()
+            if f.suffix.lower() in {".mp3", ".wav"} and not f.name.startswith(".")
+        ) if _sfx_dir.exists() else []
+        _sfx_options = ["(none)"] + _sfx_found
+        _sfx_choice = st.selectbox(
+            "Sound effect for intro",
+            options=_sfx_options,
+            index=0,
+            help="Select a sound effect from assets/sound_effects/ to play during the intro.",
+            key="_sfx_selectbox",
+        )
+        if _sfx_choice and _sfx_choice != "(none)":
+            _sfx_upload_path = str(_sfx_dir / _sfx_choice)
         _sfx_file = st.file_uploader(
-            "Sound effect (optional, .mp3/.wav)",
+            "Or upload a new sound effect (.mp3/.wav)",
             type=["mp3", "wav"],
-            help="Short sound effect to play during the intro (e.g. whoosh, boom). Leave blank for no SFX.",
+            help="Upload a new SFX — it is saved to assets/sound_effects/ and appears in the list above on the next rerun.",
             key="_sfx_uploader",
         )
         if _sfx_file is not None:
-            _sfx_tmp = Path.cwd() / ".cache" / "ui_uploads" / f"sfx_{_sfx_file.name}"
-            _sfx_tmp.parent.mkdir(parents=True, exist_ok=True)
+            _sfx_tmp = _sfx_dir / _sfx_file.name
+            _sfx_dir.mkdir(parents=True, exist_ok=True)
             _sfx_tmp.write_bytes(_sfx_file.getvalue())
             _sfx_upload_path = str(_sfx_tmp)
         if not (intro_seconds > 0):
             st.warning("⚠️ Set Intro seconds > 0 for the animated title to play.")
+
+    reuse_images = st.checkbox("Reuse images across reruns", value=True)
     fresh_images_this_run = st.checkbox(
         "Fetch fresh images this run",
         value=False,
