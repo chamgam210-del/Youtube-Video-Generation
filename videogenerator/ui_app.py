@@ -489,7 +489,34 @@ with col_left:
         key="outro_seconds_slider",
     )
 
-    reuse_images = st.checkbox("Reuse images across reruns", value=True)
+    # ── Animated title intro ──
+    flash_title_enable = st.checkbox(
+        "🎬 Animated title intro",
+        value=False,
+        help="Show a flashing, growing title for the intro seconds before the voice starts. Requires Intro seconds > 0.",
+    )
+    _flash_title_text: str | None = None
+    _sfx_upload_path: str | None = None
+    if flash_title_enable:
+        _flash_title_text = st.text_input(
+            "Title text for intro",
+            value=(topic or "").strip(),
+            placeholder="e.g. Warfare Review",
+            help="Text shown in the animated intro. Defaults to the topic.",
+        ) or None
+        _sfx_file = st.file_uploader(
+            "Sound effect (optional, .mp3/.wav)",
+            type=["mp3", "wav"],
+            help="Short sound effect to play during the intro (e.g. whoosh, boom). Leave blank for no SFX.",
+            key="_sfx_uploader",
+        )
+        if _sfx_file is not None:
+            _sfx_tmp = Path.cwd() / ".cache" / "ui_uploads" / f"sfx_{_sfx_file.name}"
+            _sfx_tmp.parent.mkdir(parents=True, exist_ok=True)
+            _sfx_tmp.write_bytes(_sfx_file.getvalue())
+            _sfx_upload_path = str(_sfx_tmp)
+        if not (intro_seconds > 0):
+            st.warning("⚠️ Set Intro seconds > 0 for the animated title to play.")
     fresh_images_this_run = st.checkbox(
         "Fetch fresh images this run",
         value=False,
@@ -695,7 +722,15 @@ with col_right:
         st.divider()
         st.markdown("**Pick images to use** — uncheck any you want to exclude, then click Run with selected.")
         _cols_per_row = 5
-        _valid_pool = [p for p in _pool_paths if Path(p).exists()]
+        def _is_valid_image(path: str) -> bool:
+            try:
+                from PIL import Image
+                Image.open(path).verify()
+                return True
+            except Exception:
+                return False
+
+        _valid_pool = [p for p in _pool_paths if Path(p).exists() and _is_valid_image(p)]
         # Ensure selection list matches current pool
         if len(_pool_selected) != len(_valid_pool):
             _pool_selected = [True] * len(_valid_pool)
@@ -817,6 +852,14 @@ with col_right:
             if not _selected_pool_images:
                 st.error("No images selected. Check at least one image before running.")
                 st.stop()
+        elif action == "run":
+            # Also pass currently checked pool images if a pool has been fetched
+            _cur_pool = st.session_state.get(_picker_key, [])
+            _cur_sel = st.session_state.get(_picker_selected_key, [])
+            if _cur_pool and _cur_sel:
+                _selected_pool_images = [
+                    p for p, keep in zip(_cur_pool, _cur_sel) if keep and Path(p).exists()
+                ]
         out_dir.mkdir(parents=True, exist_ok=True)
 
         vt = "review"
@@ -1523,6 +1566,9 @@ with col_right:
                 transition_seconds=float(run_transition_seconds),
                 ken_burns=(vt in {"shorts_review", "top_list", "top_list_silent", "top_list_clips"} or _is_short_review_images),
                 subtitle_path=str(caption_ass_path) if caption_ass_path else None,
+                sfx_path=_sfx_upload_path or None,
+                sfx_volume=0.9,
+                flash_title_text=_flash_title_text or None,
                 progress_callback=_render_progress_cb,
             )
 
@@ -1586,6 +1632,9 @@ with col_right:
                         transition_seconds=float(run_transition_seconds),
                         ken_burns=(vt in {"shorts_review", "top_list", "top_list_silent", "top_list_clips"} or _is_short_review_images),
                         subtitle_path=str(_ig_caption_path) if _ig_caption_path else None,
+                        sfx_path=_sfx_upload_path or None,
+                        sfx_volume=0.9,
+                        flash_title_text=_flash_title_text or None,
                         progress_callback=_ig_progress_cb,
                     )
                     st.success("Instagram (4:5) video rendered")

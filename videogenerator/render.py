@@ -917,6 +917,139 @@ def _generate_clown_music_wav(*, out_wav: Path, seconds: float, sample_rate: int
         wf.writeframes(b"")
 
 
+def _make_intro_animation_clip(
+    *,
+    text: str,
+    out_path: Path,
+    width: int,
+    height: int,
+    duration: float,
+    fps: int,
+    sfx_path: str | Path | None = None,
+    sfx_volume: float = 0.9,
+) -> Path:
+    """Render an animated title intro clip: title grows, flashes, then vanishes.
+
+    Uses PIL to generate per-frame PNGs then encodes with FFmpeg.
+    SFX audio (if provided) is baked into the clip.
+    """
+    import math
+    import shutil
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        raise RuntimeError("Pillow is required for animated title intro")
+
+    ffmpeg = _ffmpeg_exe()
+    n_frames = max(1, int(round(duration * fps)))
+
+    _font_candidates = [
+        r"C:\Windows\Fonts\impact.ttf",
+        r"C:\Windows\Fonts\arialbd.ttf",
+        r"C:\Windows\Fonts\ariblk.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ]
+    _font_path = next((p for p in _font_candidates if Path(p).exists()), None)
+
+    max_font = int(height * 0.14)
+    min_font = int(height * 0.04)
+    grow_end_t = duration * 0.80      # title reaches full size at 80% of duration
+    fade_start_t = duration * 0.75   # starts fading at 75%
+
+    frames_dir = out_path.parent / "_intro_frames"
+    frames_dir.mkdir(exist_ok=True)
+
+    try:
+        for fi in range(n_frames):
+            t = fi / fps
+
+            # Font size: grows from min to max over grow_end_t
+            size_prog = min(1.0, t / max(0.01, grow_end_t))
+            fsize = max(12, int(min_font + (max_font - min_font) * size_prog))
+
+            # Alpha: flashes (cosine wave) for first fade_start_t, then fades out
+            if t >= fade_start_t:
+                alpha_f = max(0.0, (duration - t) / max(0.01, duration - fade_start_t))
+            else:
+                alpha_f = 0.5 + 0.5 * math.cos(2 * math.pi * t * 6)  # 6 flashes/s
+            alpha_f = max(0.0, min(1.0, alpha_f))
+
+            img = Image.new("RGB", (width, height), (0, 0, 0))
+            overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(overlay)
+
+            try:
+                font = (
+                    ImageFont.truetype(_font_path, fsize) if _font_path
+                    else ImageFont.load_default()
+                )
+            except Exception:
+                font = ImageFont.load_default()
+
+            try:
+                bbox = draw.textbbox((0, 0), text, font=font)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            except Exception:
+                tw, th = fsize * len(text) // 2, fsize
+
+            x = max(0, (width - tw) // 2)
+            y = max(0, (height - th) // 2)
+            a_int = int(alpha_f * 255)
+            sw = max(2, fsize // 20)
+            draw.text(
+                (x, y), text, font=font,
+                fill=(255, 255, 255, a_int),
+                stroke_width=sw,
+                stroke_fill=(0, 0, 0, a_int),
+            )
+
+            img.paste(overlay, mask=overlay.split()[3])
+            img.save(str(frames_dir / f"f{fi:05d}.png"))
+
+        # Encode frames → video (with optional SFX audio baked in)
+        cmd: list[str] = [
+            ffmpeg, "-y",
+            "-framerate", str(fps),
+            "-i", str(frames_dir / "f%05d.png"),
+        ]
+        if sfx_path and Path(str(sfx_path)).exists():
+            cmd += [
+                "-i", str(Path(str(sfx_path)).resolve()),
+                "-filter_complex",
+                (
+                    f"[1:a]volume={sfx_volume:.2f},"
+                    f"atrim=duration={duration:.3f},"
+                    f"aformat=sample_fmts=fltp:sample_rates=44100[aout]"
+                ),
+                "-map", "0:v", "-map", "[aout]",
+                "-c:a", "aac",
+            ]
+        else:
+            cmd += ["-an"]
+
+        cmd += [
+            "-c:v", "libx264", "-preset", "ultrafast",
+            "-pix_fmt", "yuv420p",
+            "-t", f"{duration:.3f}",
+            str(out_path),
+        ]
+
+        rc, err = _run_ffmpeg_with_progress(cmd, duration, None)
+        if rc != 0 or not out_path.exists():
+            raise RuntimeError(f"Intro animation encoding failed:\n{err}")
+
+    finally:
+        try:
+            shutil.rmtree(frames_dir)
+        except Exception:
+            pass
+
+    return out_path
+
+
 def render_slideshow(
     slides: list[Slide],
     audio_path: str | Path,
@@ -936,6 +1069,9 @@ def render_slideshow(
     transition_seconds: float = 0.35,
     ken_burns: bool = False,
     subtitle_path: str | Path | None = None,
+    sfx_path: str | Path | None = None,
+    sfx_volume: float = 0.9,
+    flash_title_text: str | None = None,
     progress_callback: Callable[[float, float, float], None] | None = None,
 ) -> None:
     if not slides:
@@ -949,6 +1085,37 @@ def render_slideshow(
     def q(p: Path) -> str:
         # ffmpeg concat expects forward slashes; quote with single quotes
         return str(p.resolve()).replace("\\", "/")
+
+    # ── Animated title intro clip ──
+    # When flash_title_text is set and intro_seconds > 0, generate a 1.5s animated
+    # clip (title grows + flashes + vanishes) and prepend it as the first slide.
+    # SFX audio is baked into that clip; BGM plays from t=0 naturally.
+    # Voice audio is already delayed by intro_seconds via pre-padding.
+    if flash_title_text and flash_title_text.strip() and float(intro_seconds) > 0.0:
+        _intro_dur = float(intro_seconds)
+        _intro_clip = out_mp4.parent / "_intro_anim.mp4"
+        _make_intro_animation_clip(
+            text=flash_title_text.strip(),
+            out_path=_intro_clip,
+            width=width,
+            height=height,
+            duration=_intro_dur,
+            fps=fps,
+            sfx_path=sfx_path,
+            sfx_volume=sfx_volume,
+        )
+        _has_sfx = bool(sfx_path and Path(str(sfx_path)).exists())
+        _intro_slide = Slide(
+            start=0.0,
+            end=_intro_dur,
+            image_path=str(_intro_clip),
+            query="intro_title",
+            video_clip_path=str(_intro_clip),
+            video_clip_start=0.0,
+            video_clip_end=_intro_dur,
+            video_clip_mute=(not _has_sfx),
+        )
+        slides = [_intro_slide] + list(slides)
 
     lines: list[str] = []
     durations: list[float] = []
