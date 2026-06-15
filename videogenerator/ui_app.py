@@ -384,8 +384,9 @@ with col_left:
     ) if animated_captions else True
 
     st.subheader("3) Audio mix")
-    # Auto-load BGM options from assets/bgm/ folder
-    _bgm_dir = Path.cwd() / "assets" / "bgm"
+    # Auto-load BGM options from <repo_root>/assets/bgm/
+    _REPO_ROOT_UI = Path(__file__).resolve().parent.parent
+    _bgm_dir = _REPO_ROOT_UI / "assets" / "bgm"
     _bgm_found = sorted(
         f.stem for f in _bgm_dir.iterdir()
         if f.suffix.lower() in {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
@@ -397,7 +398,7 @@ with col_left:
         "BGM preset",
         options=_bgm_options,
         index=0,
-        help="File-based presets load from assets/bgm/. Drop .mp3/.wav files there to add them.",
+        help=f"File-based presets load from {_bgm_dir}. Drop .mp3/.wav files there to add them.",
     )
 
     # Optional: upload a local BGM file and save it under the selected preset name.
@@ -409,7 +410,7 @@ with col_left:
 
     if bgm_upload is not None:
         try:
-            assets_bgm_dir = Path.cwd() / "assets" / "bgm"
+            assets_bgm_dir = _REPO_ROOT_UI / "assets" / "bgm"
             assets_bgm_dir.mkdir(parents=True, exist_ok=True)
 
             ext = Path(bgm_upload.name).suffix.lower()
@@ -514,8 +515,8 @@ with col_left:
             placeholder="e.g. Warfare Review",
             help="Text shown in the animated intro. Defaults to the topic.",
         ) or None
-        # SFX: auto-load from assets/sound_effects/ folder + optional upload
-        _sfx_dir = Path.cwd() / "assets" / "sound_effects"
+        # SFX: auto-load from <repo_root>/assets/sound_effects/ + optional upload
+        _sfx_dir = _REPO_ROOT_UI / "assets" / "sound_effects"
         _sfx_found = sorted(
             f.name for f in _sfx_dir.iterdir()
             if f.suffix.lower() in {".mp3", ".wav"} and not f.name.startswith(".")
@@ -525,7 +526,7 @@ with col_left:
             "Sound effect for intro",
             options=_sfx_options,
             index=0,
-            help="Select a sound effect from assets/sound_effects/ to play during the intro.",
+            help=f"Select a sound effect from {_sfx_dir} to play during the intro.",
             key="_sfx_selectbox",
         )
         if _sfx_choice and _sfx_choice != "(none)":
@@ -1290,6 +1291,10 @@ with col_right:
             if vt == "shorts_review":
                 intro_s = 1.6
                 outro_s = 0.0
+
+            # Animated title intro: always force intro_s >= 1.5 regardless of video type
+            if flash_title_enable and _flash_title_text:
+                intro_s = max(1.5, float(intro_s))
 
             if (vt not in {"shorts", "shorts_review", "clip_review"}) and (not _is_short_review_images) and (intro_s > 0.0 or outro_s > 0.0):
                 try:
