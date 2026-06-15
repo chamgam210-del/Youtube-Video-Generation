@@ -927,10 +927,12 @@ def _make_intro_animation_clip(
     fps: int,
     sfx_path: str | Path | None = None,
     sfx_volume: float = 0.9,
+    background_image_path: str | Path | None = None,
 ) -> Path:
     """Render an animated title intro clip: title grows, flashes, then vanishes.
 
-    Uses PIL to generate per-frame PNGs then encodes with FFmpeg.
+    If background_image_path is provided, the animated title is overlaid on
+    that image (cover-fit) instead of a black background.
     SFX audio (if provided) is baked into the clip.
     """
     import math
@@ -962,6 +964,24 @@ def _make_intro_animation_clip(
     frames_dir = out_path.parent / "_intro_frames"
     frames_dir.mkdir(exist_ok=True)
 
+    # Pre-render background once: either solid black or a cover-fit copy of the
+    # first slide's image. Each frame copies this and overlays the title.
+    bg_base: "Image.Image"
+    if background_image_path and Path(str(background_image_path)).exists():
+        try:
+            src = Image.open(str(background_image_path)).convert("RGB")
+            sw_, sh_ = src.size
+            scale = max(width / max(1, sw_), height / max(1, sh_))
+            nw, nh = max(1, int(sw_ * scale)), max(1, int(sh_ * scale))
+            src = src.resize((nw, nh), Image.LANCZOS)
+            left = max(0, (nw - width) // 2)
+            top = max(0, (nh - height) // 2)
+            bg_base = src.crop((left, top, left + width, top + height))
+        except Exception:
+            bg_base = Image.new("RGB", (width, height), (0, 0, 0))
+    else:
+        bg_base = Image.new("RGB", (width, height), (0, 0, 0))
+
     try:
         for fi in range(n_frames):
             t = fi / fps
@@ -977,7 +997,7 @@ def _make_intro_animation_clip(
                 alpha_f = 0.5 + 0.5 * math.cos(2 * math.pi * t * 6)  # 6 flashes/s
             alpha_f = max(0.0, min(1.0, alpha_f))
 
-            img = Image.new("RGB", (width, height), (0, 0, 0))
+            img = bg_base.copy()
             overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
             draw = ImageDraw.Draw(overlay)
 
@@ -1094,6 +1114,16 @@ def render_slideshow(
     if flash_title_text and flash_title_text.strip() and float(intro_seconds) > 0.0:
         _intro_dur = float(intro_seconds)
         _intro_clip = out_mp4.parent / "_intro_anim.mp4"
+        # Use the first slide's image as the intro background (so the first
+        # frame the viewer sees is the same image that begins the video).
+        _intro_bg: str | None = None
+        if slides:
+            try:
+                _cand = Path(slides[0].image_path)
+                if _cand.exists() and _cand.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
+                    _intro_bg = str(_cand)
+            except Exception:
+                _intro_bg = None
         _make_intro_animation_clip(
             text=flash_title_text.strip(),
             out_path=_intro_clip,
@@ -1103,6 +1133,7 @@ def render_slideshow(
             fps=fps,
             sfx_path=sfx_path,
             sfx_volume=sfx_volume,
+            background_image_path=_intro_bg,
         )
         _has_sfx = bool(sfx_path and Path(str(sfx_path)).exists())
         _intro_slide = Slide(
